@@ -1,7 +1,12 @@
 # mujoco-robot-cell
 
 **一个 MuJoCo 机器人工作站，一站一站往上搭。**
+*A MuJoCo robot cell, built one station at a time.*
+
 现在跑通的是车床上下料：SO-101 抓起 Φ20 圆柱工件，送进三爪卡盘夹紧，7 项物理指标全部实测通过。
+
+> Station 1 online — lathe tending. A SO-101 picks a Φ20 cylinder and seats it in a 3-jaw chuck.
+> All 7 physics checks below were measured, not assumed.
 
 ![送料全过程](now_feed.gif)
 
@@ -16,6 +21,8 @@
 ```
 
 `verify_all.py` **7/7 PASS，20.5 秒**，纯 CPU。
+
+*Coaxiality 1.05 mm · tilt 0.0° · 6 contacts · 0.00 mm sink under gravity · 0.00 mm pull-out under 20 N · 21.2 N grip force · 2.5° grasp tilt.*
 
 ---
 
@@ -212,6 +219,16 @@ mujoco-robot-cell/
 - [ ] 变径工件（Φ15~Φ25）通用夹持
 
 想一起做，开 issue 就行。
+
+---
+
+## 语言 / Language
+
+正文用中文，**关键结论中英双写**（首屏定位、7 项指标、已知限制）。
+
+不做全文双语的原因很实际：这个仓库每天迭代，逐句翻译会拖慢速度，而机翻质量的英文比没有英文更劝退。哪一节需要英文，开 issue 说一声。
+
+Body text is Chinese; **key results are written in both languages**. Full bilingual docs would slow down daily iteration — if you need a section in English, open an issue and I'll add it.
 
 ---
 
