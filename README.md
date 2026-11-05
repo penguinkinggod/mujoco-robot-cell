@@ -1,169 +1,226 @@
-# robot-sim-first-step
+# mujoco-robot-cell
 
-**零基础、不会编程，也能跑起来的机器人仿真仓库。**
-只用 MuJoCo + Python，5 分钟出第一张图，不需要显卡对齐、不需要几十 GB 的 Isaac Sim。
+**一个 MuJoCo 机器人工作站。第一个跑通的工位是车床上下料——SO-101 抓起 Φ20 圆柱工件，送进三爪卡盘夹紧，7 项物理指标全部实测通过。**
 
-![Franka Panda grasp](demo_04_panda.gif)
+不是动画，不是摆位。工件怎么进去、夹住没有、拉得出来吗，每一条都有数字。
 
-上面这段动画是真的刚体动力学算出来的：脚本只给"目标关节角 + 夹爪开合"，
-每一帧的位置、接触、摩擦、重力全是物理引擎算的。方块被抬高 0.157 m，夹爪停在 0.042 m。
+![送料全过程](now_feed.gif)
+
+```
+同轴度        1.05 mm      工件轴线 vs 卡盘轴线偏差
+轴线倾斜       0.0°        夹紧后姿态
+接触点           6 个       三爪各 2 点，全部真实接触
+重力下沉      0.00 mm      解锁后靠自重不掉
+20 N 拉拔     0.00 mm      轴向拉力下的位移
+三爪法向力    21.2 N       卡盘实际夹持力
+抓取倾角       2.5°        手臂交接时的姿态误差
+```
+
+`verify_all.py` **7/7 PASS，20.5 秒**，纯 CPU。
 
 ---
 
-## 现在能跑什么
+## 这个 cell 里有四个工位
 
-| 文件 | 干什么 | 你会看到什么 |
-|---|---|---|
-| `demo_00_check.py` | 验证 MuJoCo 装好了、能出图 | 打印 `OK`，生成 `demo_00.png` |
-| `demo_01_pendulum.py` | 单摆：不加控制 / 只有 PD / PD+重力前馈 | 三条曲线，第三条误差 0.00 度 |
-| `demo_02_arm.py` | 二连杆机械臂，雅可比伪逆够目标点 | 末端误差 0.0000 m |
-| `demo_03_camera_dataset.py` | 机器人 + 相机 + 采集数据集 | `.npz` 数据集 + 8 格相机画面 |
-| `demo_04_panda_grasp.py` | **Franka Panda 七轴真机模型抓方块** | 五段关键帧 + mp4 + gif |
-| `demo_05_toolpath.py` | **轨迹跟踪：开环 vs 闭环（这就是"刀路图"）** | 目标 vs 实际 3D 对比 + 偏差曲线 |
-| `check_reach.py` | **可达性扫描**：哪些抓取高度物理上可行 | 逐高度判定表 + 最低安全高度 |
-| `diag_gripper_geom.py` | 量出夹爪真实几何（指垫中心在哪） | 指垫长 55.6 mm，中心偏移 0.0862 m |
+仓库不是"一个车床项目"，是一个可以不断加工位的仿真工作站。车床只是第一个做完的：
 
-> 注意：`demo_04` 依赖 `models/panda/`，那是 [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) 的官方模型（Apache-2.0），已经放在仓库里。
+| 工位 | 状态 | 靠什么 | 目录 |
+|---|---|---|---|
+| **车床上下料** | ✅ 7/7 通过 | 手写 IK + 位置伺服 | `scene_machining.py` |
+| 视觉引导抓取 | ○ 下一步 | 相机标定 + 位姿估计 | 计划 `scenes/vision_pick/` |
+| 手势遥操作 | ○ 计划 | 手部关键点 → 末端映射 | 计划 `teleop/` |
+| 视频示教 / 模仿学习 | ○ 计划 | BC / ACT 训练 | 计划 `learning/` |
+
+**这四个不是四选一，是一条数据链**：视觉引导先解决"看得见"；手势遥操作解决"人怎么教"，顺带录下 `(观测, 动作)` 序列；那批序列就是模仿学习的训练集。顺序做错——比如先搞训练——会发现数据集本身是废的。
 
 ---
 
-## 三步跑起来
+## 第一个工位解决了一个什么问题
 
-这台机器上已经有个装好的环境：**`D:\robot-env`**（Python 3.12.15 + mujoco 3.17.0）。
-不用重复装，直接用它的解释器跑就行。
+真实车床上下料最难的**不是**抓起来，是**交出去**。
 
-```powershell
-cd D:\codex\projects\robot-sim-first-step
+工件从机器人手里转到卡爪手里，中间有一个瞬间谁都不能碰它——机器人还夹着、卡爪又去夹，两个夹具抢同一根轴，输的那台伺服被拖偏（实测 6.46 mm）；机器人松手了但手还在原位，卡爪把工件往里推，会推着还张着的指垫后退（实测 12.07 mm）。
 
-# 跑第一个（自检）
-D:\robot-env\Scripts\python.exe demo_00_check.py
-```
+答案是：**先把工件钉死在世界坐标 → 手臂退开 55 mm → 三爪再夹紧**。
 
-跑 Panda 抓取：
+`lock()` 只固定 `qpos`，不消除接触力。卡爪推工件的力会经指垫传到手臂，手臂一退让，锚在手臂上的锁就把工件一起搬走。所以必须有一个"谁都不碰它"的瞬间。
 
-```powershell
-D:\robot-env\Scripts\python.exe demo_04_panda_grasp.py
-```
+这条不在任何教程里，是 3 次失败实测出来的。
 
-**如果换一台电脑**，比如带去学校或给同学：
+---
 
-```powershell
-cd <新路径>\robot-sim-first-step
+## 30 秒跑起来
+
+```bash
+git clone https://github.com/penguinkinggod/mujoco-robot-cell.git
+cd mujoco-robot-cell
+
 uv venv --python 3.12 .venv
-uv pip install --python .venv\Scripts\python.exe -r requirements.txt
-.venv\Scripts\python.exe demo_00_check.py
+uv pip install --python .venv/Scripts/python.exe -r requirements.txt
+
+python verify_all.py
 ```
 
-验证过的版本：**Python 3.12.15 / mujoco 3.17.0 / numpy 2.5.4 / matplotlib 3.11.2 / imageio 2.38.1**，
-平台 Windows 11 + RTX 5070 Ti Laptop。**CPU 也能跑，MuJoCo 不需要显卡。**
+Windows / Linux / macOS 都能跑，**不需要显卡**，MuJoCo 纯 CPU。
+
+实测版本：Python 3.12.15 / mujoco 3.17.0 / numpy 2.5.4 / matplotlib 3.11.2 / imageio 2.38.1。
+
+想直接看画面：
+
+```bash
+python live_bridge.py view          # 常驻 3D 窗口
+python live_bridge.py run --feed    # 后台跑送料，窗口里实时跟着动
+```
 
 ---
 
-## 每个 demo 在教你什么（一句话）
+## 7 项指标怎么验的
 
-- `demo_00`：仿真器是什么——`model`（描述世界）+ `data`（世界的当前状态）+ `mj_step`（推进时间）。
-- `demo_01`：**控制**是什么——误差、PD、以及"为什么光有 PD 会有静差"。
-- `demo_02`：**运动学**是什么——关节角怎么变成末端位置，反过来怎么解（雅可比伪逆）。
-- `demo_03`：**具身智能的数据长什么样**——`(图像, 关节角, 动作, 目标)`。
-- `demo_04`：**真实机器人流程**——IK 解路点、伺服跟踪、接触与摩擦、成败判定。
-- `demo_05`：**怎么知道对不对**——目标路径和实际路径叠在一起看，开环误差随速度累积，闭环把它压住。
+`verify_all.py` 一次跑完 4 个检查，任何一项不过退出码非 0：
 
----
-
-## 为什么先 MuJoCo，不先 Isaac Sim
-
-| | MuJoCo | Isaac Sim |
+| 检查 | 验什么 | 通过标准 |
 |---|---|---|
-| 安装体积 | < 300 MB | 数十 GB |
-| 出第一张图 | 5 分钟 | 半天起 |
-| 语言 | 纯 Python API | Python，但依赖 Omniverse |
-| 显卡 | 不需要 | 强依赖（官方最低 RTX 4080 / 16GB 显存） |
-| 生态 | DeepMind 维护，论文常用 | NVIDIA 主推，大规模并行训练强 |
+| `diag_feed_chuck` | 送料全流程 | 同轴 ≤ 2 mm，接触 ≥ 6，20 N 拉拔不位移 |
+| `diag_chuck_health` | 卡盘 IK 可达性 | 卡盘口残差 ≤ 15 mm |
+| `diag_shaft_slip` | 打滑 | 夹紧后位移 ≤ 1 mm |
+| `demo_09_try_versions` | 版本对比 | 3/3 完成 |
 
-你现在 5070 Ti Laptop（12 GB 显存）+ 32 GB 内存，Isaac Sim 属于"勉强能装、大概率被驱动和版本折磨"。
-**先用 MuJoCo 把"模型 / 状态 / 步进 / 渲染 / 控制 / 接触"这六件事吃透**，之后换 Isaac Sim 只是换 API 名字。
-
-这不是我一个人的判断：[Datawhale《动手学具身智能》](https://datawhalechina.github.io/dive-into-embodied-ai/)
-的 6 个仿真实战项目（四足 / Pupper / Quaddle / MicroDuck / 机械臂 DDPG / ACT 双臂）**全部用 MuJoCo，一个 Isaac 都没有**。
+**这些数字是量出来的，不是设的。** 每个都有对应诊断脚本，可以单独跑、单独改参数。
 
 ---
 
-## 我在社区路径的哪一格
+## 底层是可以复用的
 
-社区里几条权威路线（古月居、Datawhale、Xbotics）的共识顺序是：
+换工位时，下面这几层不换：
 
 ```
-建模 → 控制器(PID/阻抗) → 轨迹跟踪 → 运动规划 → 强化学习 / 模仿学习
+core/（计划）
+├─ lock.py        把刚体钉在世界坐标，切断接触力传递
+├─ handoff.py     两个执行器交接同一物体时的时序
+├─ metrics.py     同轴度 / 接触数 / 拉拔位移 的量测
+└─ camera.py      相机标定与图像采集
+
+scene_machining   抓取 → 交接 → 夹紧 → 拉拔测试
+scene_assembly    抓取 → 对齐 → 插入 → 紧固测试     （计划）
+scene_vision      识别 → 定位 → 抓取 → 验证          （计划）
 ```
 
-对照古月居 10 节课的大纲（RL 排在第 8 节，前 7 节全是建模+控制），**本仓库覆盖到第 4–5 节**：
-会建模（`MjSpec`）、摸到控制器接口（`ctrl` + PD + 重力前馈）、能做 IK 抓取。
+这次车床踩出来的"钉死 → 退开 → 夹紧"，装夹场景一模一样要用。**场景会换，交接逻辑不换。**
 
-**还没做的是第 6–7 节：PID 整定和轨迹跟踪。** 这是下一步。
+---
 
-详细调研见 [`docs/07-community-learning-paths.md`](docs/07-community-learning-paths.md)。
+## 入门教学线（demo_00–07）
+
+从"仿真器是什么"走到"怎么判断结果对不对"：
+
+| 文件 | 教你什么 | 结果 |
+|---|---|---|
+| `demo_00_check.py` | `model` + `data` + `mj_step` 三件套 | 打印 `OK` |
+| `demo_01_pendulum.py` | PD 为什么有静差，重力前馈补掉 | 误差 0.00° |
+| `demo_02_arm.py` | 关节角 ↔ 末端位置，雅可比伪逆 | 末端误差 0.0000 m |
+| `demo_03_camera_dataset.py` | 具身智能的数据长什么样 | `(图像, 关节角, 动作, 目标)` |
+| `demo_04_panda_grasp.py` | 真机模型抓取：IK + 伺服 + 接触摩擦 | 抬高 0.157 m |
+| `demo_05_toolpath.py` | 开环 vs 闭环，误差怎么累积 | 3D 轨迹对比 |
+| `demo_06_learn_correction.py` | 机器学习和仿真的关系 | 一次实验说清 |
+| `demo_07_turned_parts.py` | 车削件几何与工艺可行性 | 参数扫描 |
+
+---
+
+## 踩过的坑（每条都有实测数字）
+
+- **碰撞组掩码**：`jaw_mask` 用 `(2,3)`，机器人用 `(1,3)`，看代码像 bug。实测 MuJoCo 判定是"按位与"，掩码是对的。真因是机器人和卡盘**同时在夹同一根轴**。
+- **伺服带载下沉**：原来把同一个绝对目标重复发 3 次，永远停在同一处。瞄准 (184,120,60)，指垫停短 24.8 mm，工件根本没进卡爪。改积分补偿 `tgt += 0.8 * (goal - 实测)` 后残差 24.8 → 1.2 mm。
+- **卡爪长度决定抗倾覆**：28 mm 的爪夹 80 mm 的轴，轴在里面像球铰，一解锁就转到 10.9°，20 N 拉拔直接拽出 **4172 mm**。加到 55 mm 才压住。
+- **夹紧量有窗口**：`-0.003` 太松（倾斜 18°），`-0.014` 太紧（把轴挤偏 7.34 mm），`-0.010` 可用。扫了 4 档。
+- **摩擦不是主因**：怀疑指垫太光滑，扫了摩擦系数——不是。两片平板夹圆柱只有**线接触**，扛不住倾覆力矩。
+
+完整工程日志在 [`HANDOFF.md`](HANDOFF.md)，713 行，含所有失败版本和当时数字。
 
 ---
 
 ## 已知限制（诚实写清楚，比吹牛有用）
 
-1. `demo_02` 是**运动学**仿真：直接改 `qpos`，会穿模，不受力。`demo_04` 才是真动力学。
-2. `demo_04` 的 IK 解算后经 `reachability.py` 做可达性检查（关节限位 / 力矩 / 碰撞 / 伺服误差），
-   但路径仍是手工给的三个路点，没有自动避障规划。
-3. 方块是 4.3 cm 立方体，**比 Panda 指垫短 12.6 mm**，所以抓取中心最低 z=0.0318 m（几何约束，见 docs/06）。
-   换更大的物体要改 `CUBE_HALF`，并检查夹爪行程够不够。
-4. 仓库里的 Panda 模型来自 Menagerie，`link2.stl`（碰撞网格）用 `link1.stl` 顶替，
-   原因是下载镜像对 >50 MB 的包做了限制。**视觉网格全部是原版，物理碰撞体有这一处近似。**
-5. 没有做 sim-to-real，也没有真机。
+1. **搬运段仍用 `kinematic_lock`。** 手臂拎着工件走时 `qpos` 被钉住，等于假设"手已经抓住了"。这一段没有真物理。
+2. **抓取靠摩擦，不是形封闭。** 倾角 2.5°（原 43.8°），但工件本质还是"吊在指垫下面靠摩擦"。要真解决得换爪型——V 块或按直径镗的软爪。
+3. **`demo_09` 的 3/3 不检查姿态。** 只验位置，工件歪着放进去也算过。
+4. **没有 sim-to-real。** 无真机、无标定、无参数迁移。
+5. **没有自动避障。** 路点是手给的，没有规划器。
+6. **视觉、遥操作、模仿学习都还没开始。** 上面路线图里那些是计划，不是已完成。
 
 ---
 
-## 目录
+## 目录（现在实际长这样）
 
 ```
-robot-sim-first-step/
-├─ demo_00_check.py              环境自检
-├─ demo_01_pendulum.py           控制入门
-├─ demo_02_arm.py                运动学入门
-├─ demo_03_camera_dataset.py     相机 + 数据集
-├─ demo_04_panda_grasp.py        真机模型抓取
-├─ demo_05_toolpath.py           轨迹跟踪：开环 vs 闭环（刀路图）
-├─ looks.py                      视觉配置（材质/灯光/天空盒，只影响画面不影响物理）
-├─ reachability.py               可达性检查（限位/力矩/碰撞/伺服误差）
-├─ check_reach.py                抓取高度扫描示例
-├─ diag_gripper_geom.py          夹爪几何测量（FINGER_OFFSET=0.0862 的依据）
-├─ diag_closed_loop.py           闭环增益/前馈扫描（gain=8, lead=1 的依据）
-├─ models/panda/                 Franka Panda（MuJoCo Menagerie, Apache-2.0）
-└─ docs/                         每一步的原理笔记
-   ├─ 01–05                      按 demo 顺序的原理
-   ├─ 06-why-numerically-exact-still-fails.md   四层误差诊断
-   └─ 07-community-learning-paths.md            社区学习路径调研
+mujoco-robot-cell/
+├─ scene_machining.py        车床 + 三爪卡盘 + 工件（主线）
+├─ scene_full.py             SO-101 + 工作台（带开关，可关掉虎钳/槽台）
+├─ diag_feed_chuck.py        送料全流程 + 7 项指标（核心）
+├─ demo_09_try_versions.py   版本对比
+├─ verify_all.py             一键 7/7
+├─ live_bridge.py            常驻 3D 窗口 + 后台推帧
+├─ demo_00 – demo_07         入门教学线
+├─ diag_*.py                 22 个诊断脚本
+├─ models/
+│  ├─ panda/                 Franka Panda（Menagerie, Apache-2.0）
+│  ├─ simready/              工作台 / 虎钳 / 工件资产
+│  └─ _tmp_so101/            LeRobot SO-101 环境包（Apache-2.0）
+├─ docs/                     原理笔记
+├─ HANDOFF.md                工程日志
+└─ THIRD_PARTY.md            第三方声明
 ```
 
----
-
-## 参考的社区资料
-
-本仓库的路线不是自己想的，主要对照这三份：
-
-- [古月居《MuJoCo 机器人强化学习仿真入门》](https://www.guyuehome.com/detail?id=1825501975181848577) —— 10 节大纲，RL 排第 8
-- [Datawhale《动手学具身智能》](https://datawhalechina.github.io/dive-into-embodied-ai/) —— 6 个 MuJoCo 实战项目 + 3 个交互式 playground
-- [Xbotics《Roadmap to Embodied AI》](https://github.com/Xbotics-Embodied-AI-club/Xbotics-Embodied-Guide) —— 10 条 4–8 周路线，带验收标准
+> 目录还没按 `core/` + `scenes/` 拆分——脚本之间有 30 多处交叉 `import`，重构要改一堆 `sys.path`，等第二个工位落地时一并做。现在 `README` 里的分层是**设计意图**，不是磁盘现状。
 
 ---
+
+## 为什么用 MuJoCo 而不是 Isaac Sim
+
+| | MuJoCo | Isaac Sim |
+|---|---|---|
+| 安装体积 | < 300 MB | 数十 GB |
+| 出第一张图 | 5 分钟 | 半天起 |
+| 显卡 | 不需要 | 强依赖（官方最低 RTX 4080 / 16 GB） |
+
+接触、摩擦、伺服误差这些**决定上下料成败的东西**，MuJoCo 几毫秒一步，笔记本 CPU 足够。等要跑大规模并行强化学习了再换，那时换的只是 API 名字。
+
+---
+
+## 路线图
+
+- [x] 车床上下料闭环，7 项指标验证
+- [ ] 相机标定 + 视觉引导抓取
+- [ ] 手势遥操作（手部关键点 → 末端映射）
+- [ ] 遥操作数据采集 + BC/ACT 训练
+- [ ] 换 V 块爪 / 软爪，把搬运段从 `kinematic_lock` 拿掉
+- [ ] 目录重构：`core/` + `scenes/` 分层
+- [ ] 自动避障规划
+- [ ] 变径工件（Φ15~Φ25）通用夹持
+
+想一起做，开 issue 就行。
+
+---
+
+## 第三方代码与资产
+
+- `models/panda/` — [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie)，Apache-2.0
+- `models/_tmp_so101/lerobot_env_so101-0.4.0/` — [LeRobot](https://github.com/huggingface/lerobot) 的 SO-101 环境包，Apache-2.0
+- `models/simready/` — 工作台 / 夹具 / 工件资产
+
+详见 [`THIRD_PARTY.md`](THIRD_PARTY.md)。
 
 ## License
 
-代码 MIT。`models/panda/` 来自 MuJoCo Menagerie，遵循 Apache-2.0，见该目录下 `LICENSE`。
+代码 MIT，见 [`LICENSE`](LICENSE)。第三方部分遵循各自协议。
 
 ## 引用
 
-如果你在作业或文章里用到这里的仿真结果：
-
 ```bibtex
-@misc{robot-sim-first-step,
-  title  = {robot-sim-first-step: 零基础机器人仿真第一课},
+@misc{mujoco-robot-cell,
+  title  = {mujoco-robot-cell: a MuJoCo robot cell for lathe tending and manipulation},
+  author = {penguinkinggod},
   year   = {2026},
-  note   = {MuJoCo-based minimal robot simulation demos}
+  note   = {First station: SO-101 seats a Φ20 cylinder in a 3-jaw chuck, verified by 7 physics checks},
+  url    = {https://github.com/penguinkinggod/mujoco-robot-cell}
 }
 ```
