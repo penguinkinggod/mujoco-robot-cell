@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>现在仿真的样子 · 机械臂送料到三爪卡盘</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#f4f6f9;color:#1d2430;
+ font-family:"Microsoft YaHei","PingFang SC",system-ui,sans-serif;line-height:1.7}
+.wrap{max-width:1080px;margin:0 auto;padding:32px 24px 64px}
+header{position:relative;margin-bottom:24px}
+h1{font-size:30px;margin:0 0 6px}
+.sub{color:#5b6575;margin:0;font-size:14px}
+.badge{position:absolute;right:0;top:4px;padding:6px 18px;border-radius:20px;
+ font-weight:700;font-size:14px;letter-spacing:1px}
+.pass{background:#e4f6ea;color:#137333}
+.fail{background:#fde8e7;color:#b3261e}
+.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:26px}
+.m{background:#fff;border:1px solid #e3e8ef;border-radius:12px;padding:14px 16px}
+.mk{font-size:12px;color:#6b7686}
+.mv{font-size:24px;font-weight:700;color:#123a6b;margin:2px 0}
+.mh{font-size:11px;color:#8a94a3}
+.card{background:#fff;border:1px solid #e3e8ef;border-radius:14px;
+ padding:20px 22px;margin-bottom:22px;box-shadow:0 2px 10px rgba(20,40,80,.04)}
+.card h2{font-size:18px;margin:0 0 12px}
+.card img{display:block;width:100%;height:auto;border-radius:8px;
+ border:1px solid #e6eaf0;background:#0e1116}
+.cap{font-size:13px;color:#5b6575;margin:10px 0 0}
+.warn{background:#fffaf0;border-color:#f0d9a8}
+.warn h2{color:#8a5a00}
+.warn li{margin:6px 0;font-size:14px}
+pre{background:#111827;color:#d7e3f5;padding:14px 16px;border-radius:8px;
+ overflow-x:auto;font-size:13px;line-height:1.6}
+code{background:#eef1f6;padding:1px 5px;border-radius:4px;font-size:13px}
+.tag{display:inline-block;background:#eef2f8;color:#33507a;border-radius:5px;
+ padding:1px 7px;font-size:12px;margin-right:6px}
+footer{color:#8a94a3;font-size:12px;text-align:center;margin-top:28px}
+@media(max-width:720px){.metrics{grid-template-columns:repeat(2,1fr)}}
+</style></head><body><div class="wrap">
+<header><h1>现在的样子</h1>
+<p class="sub">SO-101 机械臂抓 Φ20 D 轴 → 送进二轴车三爪卡盘 → 夹紧 → 退出 ·
+ 生成于 2026-11-05 21:06 · 96 帧动图 / 12 个关键帧</p>
+<span class="badge pass">PASS</span></header>
+
+<section class="metrics"><div class="m"><div class="mk">同轴度</div><div class="mv">0.89 mm</div><div class="mh">轴心 vs 卡盘轴线</div></div>
+<div class="m"><div class="mk">倾斜</div><div class="mv">5.9°</div><div class="mh">相对原始轴向</div></div>
+<div class="m"><div class="mk">卡爪接触点</div><div class="mv">11</div><div class="mh">三爪合计</div></div>
+<div class="m"><div class="mk">三爪法向力</div><div class="mv">18.7 N</div><div class="mh">夹紧力</div></div>
+<div class="m"><div class="mk">重力下沉</div><div class="mv">0.01 mm</div><div class="mh">静置 800 步</div></div>
+<div class="m"><div class="mk">20 N 拉拔</div><div class="mv">0.62 mm</div><div class="mh">轴向拉动 700 步</div></div></section>
+
+<section class="card"><h2>① 全流程动图（点开即播放）</h2>
+<img src="now_feed.gif" alt="送料全流程动画">
+<p class="cap">从卡盘张开、机械臂接近抓取，到横移送入、三爪夹紧、机器人退出、20 N 拉拔。
+画面来自当次仿真逐帧离屏渲染，没有后期摆拍。</p></section>
+
+<section class="card"><h2>② 场景长什么样</h2>
+<img src="now_views.png" alt="合并场景三视图">
+<p class="cap">上排是起始状态（总览 / 卡盘端面三爪张开 / 台面上的 D 轴），
+下排是装夹完成状态（总览 / 卡盘端面三爪夹住轴 / 侧视轴伸进卡盘）。
+三爪按 120° 分布，长边朝径向，由单丝杠 + 2 条关节联动约束驱动。</p></section>
+
+<section class="card"><h2>③ 送料 12 个关键帧</h2>
+<img src="now_stages.png" alt="送料关键帧">
+<p class="cap">注意第 04 帧「真实抓取」里轴是歪的（约 41.5°），第 05 帧起搬运段接管为运动学锁；
+第 10 帧解锁，之后所有载荷测试都在真实物理下进行。</p></section>
+
+<section class="card warn"><h2>⚠ 别把画面当成「全物理通过」</h2>
+<ul>
+<li><b>搬运段是运动学锁</b>：从对中到夹紧，每步把轴位姿写回夹爪中心，等于假设夹爪完美形封闭。
+真实夹爪抓持姿态还没修好，轴在抓取阶段仍会歪约 41.5°。</li>
+<li><b>D 形铣扁是粗糙碰撞代理</b>：box 角点凸出 Φ20 包络约 3.1 mm，只用来阻止圆柱滚转，形状精度按你的要求留到后面优化。</li>
+<li>锁在所有负载测试前解除，<code>physics_after_clamp=1</code> 由 verify_all.py 强制断言，防止把锁延长到拉拔阶段造假。</li>
+</ul></section>
+
+<section class="card"><h2>想自己转着看：桌面图标 / 命令</h2>
+<p class="cap"><b>最省事：双击桌面上的「机器人仿真 3D 窗口」</b>，会弹出一个和 SolidWorks 一样的可交互 3D 窗口。
+按住鼠标左键转视角、滚轮缩放，右侧面板能开接触点 / 力 / 坐标系显示。</p>
+<p class="cap">也可以在 <code>D:\codex\projects\robot-sim-first-step</code> 里粘下面任意一条：</p>
+<pre>D:\robot-env\Scripts\python.exe show_live.py           :: 起始态，可拖着转
+D:\robot-env\Scripts\python.exe show_live.py --feed    :: 实时播放送料全过程
+D:\robot-env\Scripts\python.exe show_live.py --clamped :: 直接看装夹完成态
+D:\robot-env\Scripts\python.exe show_current.py        :: 重新生成本页的图 / 动图
+D:\robot-env\Scripts\python.exe verify_all.py          :: 复跑 7/7 回归</pre>
+</section>
+
+<footer>画面与指标同源：diag_feed_chuck.main(frame_hook=...) · 视觉配置不改物理</footer>
+</div></body></html>

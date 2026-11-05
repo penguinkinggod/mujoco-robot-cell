@@ -105,9 +105,26 @@ def build_model():
     return spec.compile()
 
 
-def main():
-    model = build_model()
-    data = mujoco.MjData(model)
+FRAME_EVERY = 60         # 每 N 步采一帧；仅 frame_hook 非 None 时生效
+
+
+def main(frame_hook=None, model=None, data=None):
+    """Run the feed sequence.
+
+    frame_hook(tag, model, data) is an OPTIONAL visualisation tap.
+    tag is a stage label (or None for in-between frames). It is never
+    called when frame_hook is None, so verify_all.py sees the exact same
+    numerical run as before. See show_current.py / show_live.py.
+
+    model / data may be injected so an external viewer can watch the very
+    same MjData being stepped. Defaults build fresh ones.
+    """
+    model = model if model is not None else build_model()
+    data = data if data is not None else mujoco.MjData(model)
+
+    def tick(tag=None):
+        if frame_hook is not None:
+            frame_hook(tag, model, data)
 
     def gid(kind, name):
         return mujoco.mj_name2id(model, kind, name)
@@ -182,7 +199,9 @@ def main():
             mujoco.mj_step(model, data)
             if locked:
                 lock()
-        for _ in range(260):
+            if frame_hook is not None and i % FRAME_EVERY == 0:
+                tick()
+        for j in range(260):
             for a, v in zip(arm.qadr, q_goal):
                 data.ctrl[a] = v
             data.ctrl[arm.grip_act] = grip
@@ -190,6 +209,8 @@ def main():
             mujoco.mj_step(model, data)
             if locked:
                 lock()
+            if frame_hook is not None and j % (FRAME_EVERY * 2) == 0:
+                tick()
         return float(np.linalg.norm(arm.pad_center() - np.asarray(target)))
 
     def move3(target, ns, grip, locked,
@@ -202,12 +223,14 @@ def main():
         return err
 
     def settle(n, jaw_ctrl, grip, locked=False):
-        for _ in range(n):
+        for i in range(n):
             data.ctrl[jaw_act] = jaw_ctrl
             data.ctrl[arm.grip_act] = grip
             mujoco.mj_step(model, data)
             if locked:
                 lock()
+            if frame_hook is not None and i % (FRAME_EVERY * 2) == 0:
+                tick()
 
     # ---------------- reset / home ----------------
     mujoco.mj_resetData(model, data)
@@ -220,6 +243,7 @@ def main():
             data.ctrl[k] = data.qpos[arm.qadr[k]]
         mujoco.mj_step(model, data)
 
+    tick("① 起始｜卡盘张开，工件在台面")
     home = shaft()
     R = F.SHAFT_D / 2
     g = home
@@ -245,6 +269,9 @@ def main():
                  np.linalg.norm(arm.pad_center() - shaft()) * 1000))
         if name == "夹紧":
             state["offset"] = arm.pad_center() - shaft()
+        tick("② 接近｜下降中" if name == "接近" else
+             "③ 下降｜pad 到轴心" if name == "下降" else
+             "④ 夹紧｜真实抓取（轴会歪）")
     print("  shaft_in_grip = %s mm（搬运锁的相对偏移）"
           % np.round(state["offset"] * 1000, 2))
     print("  ⚠ 真实抓取倾斜 %.1f deg：夹爪形封闭尚未解决，此处由搬运锁接管"
@@ -263,6 +290,10 @@ def main():
         print("  %-6s IK残差=%5.1f mm 轴=%s 同轴=%6.2f mm 倾斜=%4.1f deg"
               % (name, err * 1000, np.round(shaft(), 4), coax(),
                  tilt_deg(data.qpos[sq + 3:sq + 7])))
+        tick({"对中": "⑤ 对中｜搬运锁接管",
+              "抬起": "⑥ 抬起",
+              "高位横移": "⑦ 高位横移｜到卡盘上方",
+              "下到轴线": "⑧ 下到轴线｜送进卡盘"}[name])
 
     # ---------------- clamp: align friction solver with the chuck scene ----
     # scene_full.py sets no spec.option. Applying these from the start
@@ -275,6 +306,7 @@ def main():
     settle(700, SM.CHUCK_CLAMP_CTRL, GRIP_CLOSE, locked=True)
     print("  卡爪夹紧(锁) 轴=%s 同轴=%5.2f mm 接触=%d"
           % (np.round(shaft(), 4), coax(), jaw_state()[0]))
+    tick("⑨ 三爪夹紧｜单丝杠联动")
 
     # Hand the shaft back to PHYSICS before any load test.
     state["lock_active"] = False
@@ -282,6 +314,7 @@ def main():
     print("  解锁静置     轴=%s 同轴=%5.2f mm 倾斜=%5.1f deg 接触=%d"
           % (np.round(shaft(), 4), coax(),
              tilt_deg(data.qpos[sq + 3:sq + 7]), jaw_state()[0]))
+    tick("⑩ 解锁｜交还真实物理")
 
     # Retreat with the chuck STILL clamped (see evidence chain).
     move3(np.array([axis[0] - 0.08, axis[1] - 0.08, 0.15]),
@@ -295,16 +328,20 @@ def main():
           "接触=%d 三爪法向力=%.1f N"
           % (np.round(shaft(), 4), final_coax, final_tilt,
              contacts, force))
+    tick("⑪ 机器人退出｜装夹完成")
 
     z0 = shaft()[2]
     settle(800, SM.CHUCK_CLAMP_CTRL, GRIP_OPEN)
     slip = abs(z0 - shaft()[2]) * 1000
     x0 = shaft()[0]
-    for _ in range(700):
+    for i in range(700):
         data.ctrl[jaw_act] = SM.CHUCK_CLAMP_CTRL
         data.xfrc_applied[shaft_body, 0] = -20.0
         mujoco.mj_step(model, data)
+        if frame_hook is not None and i % (FRAME_EVERY * 2) == 0:
+            tick()
     pull = abs(shaft()[0] - x0) * 1000
+    tick("⑫ 20 N 拉拔｜夹得住")
     print("  重力下沉  %.2f mm      20 N 拉  %.2f mm" % (slip, pull))
     print()
 
