@@ -8,7 +8,7 @@
 > Station 1 online — lathe tending. A SO-101 picks a Φ20 cylinder and seats it in a 3-jaw chuck.
 > All 7 physics checks below were measured, not assumed.
 
-![送料全过程](now_feed.gif)
+![送料全过程](assets/now_feed.gif)
 
 ```
 同轴度        1.05 mm      工件轴线 vs 卡盘轴线偏差
@@ -28,7 +28,7 @@
 
 ## 最近在做什么
 
-> **2026-11-05** · 17 次提交 · 从 6/7 修回 7/7
+> **2026-11-05** · 21 次提交 · 从 6/7 修回 7/7
 
 - 虎钳和浅槽平台从场景里删掉，工件换成纯 Φ20 圆柱
 - 定位到**带载稳态下沉**：重复发同一个绝对目标是错的，改积分补偿（残差 24.8 → 1.2 mm）
@@ -36,6 +36,7 @@
 - 卡爪 28 → 55 mm；夹紧量扫 4 档，取 `-0.010`
 - 3D 窗口改成热重载，改场景不用重启
 - 加了常驻窗口 + 后台推帧，跑仿真能实时看到画面
+- 仓库重新分层：代码进 `src/`，生成物进 `_build/`，根目录从 70 项降到 13 项
 
 下一步：相机标定，做视觉引导抓取（详见[路线图](#路线图)）。
 
@@ -47,7 +48,7 @@
 
 | 工位 | 状态 | 靠什么 | 目录 |
 |---|---|---|---|
-| **车床上下料** | ✅ 7/7 通过 | 手写 IK + 位置伺服 | `scene_machining.py` |
+| **车床上下料** | ✅ 7/7 通过 | 手写 IK + 位置伺服 | `src/scene_machining.py` |
 | 视觉引导抓取 | ○ 下一步 | 相机标定 + 位姿估计 | 计划 `scenes/vision_pick/` |
 | 手势遥操作 | ○ 计划 | 手部关键点 → 末端映射 | 计划 `teleop/` |
 | 视频示教 / 模仿学习 | ○ 计划 | BC / ACT 训练 | 计划 `learning/` |
@@ -89,8 +90,8 @@ Windows / Linux / macOS 都能跑，**不需要显卡**，MuJoCo 纯 CPU。
 想直接看画面：
 
 ```bash
-python live_bridge.py view          # 常驻 3D 窗口
-python live_bridge.py run --feed    # 后台跑送料，窗口里实时跟着动
+python src/live_bridge.py view          # 常驻 3D 窗口
+python src/live_bridge.py run --feed    # 后台跑送料，窗口里实时跟着动
 ```
 
 ---
@@ -145,6 +146,8 @@ scene_vision      识别 → 定位 → 抓取 → 验证          （计划）
 | `demo_06_learn_correction.py` | 机器学习和仿真的关系 | 一次实验说清 |
 | `demo_07_turned_parts.py` | 车削件几何与工艺可行性 | 参数扫描 |
 
+全部在 `src/` 下，逐个跑即可：`python src/demo_00_check.py`。生成的图落在 `_build/`，不进版本库。
+
 ---
 
 ## 踩过的坑（每条都有实测数字）
@@ -174,24 +177,26 @@ scene_vision      识别 → 定位 → 抓取 → 验证          （计划）
 
 ```
 mujoco-robot-cell/
-├─ scene_machining.py        车床 + 三爪卡盘 + 工件（主线）
-├─ scene_full.py             SO-101 + 工作台（带开关，可关掉虎钳/槽台）
-├─ diag_feed_chuck.py        送料全流程 + 7 项指标（核心）
-├─ demo_09_try_versions.py   版本对比
-├─ verify_all.py             一键 7/7
-├─ live_bridge.py            常驻 3D 窗口 + 后台推帧
-├─ demo_00 – demo_07         入门教学线
-├─ diag_*.py                 22 个诊断脚本
+├─ verify_all.py             一键 7/7（唯一入口，刻意留在根目录）
+├─ README.md  HANDOFF.md  THIRD_PARTY.md
+├─ src/                      全部 Python，50 个脚本
+│  ├─ scene_machining.py       车床 + 三爪卡盘 + 工件（主线）
+│  ├─ scene_full.py            SO-101 + 工作台（带开关，可关虎钳/槽台）
+│  ├─ diag_feed_chuck.py       送料全流程 + 7 项指标（核心）
+│  ├─ live_bridge.py           常驻 3D 窗口 + 后台推帧
+│  ├─ demo_00 – demo_07        入门教学线（10 个）
+│  └─ diag_*.py                诊断脚本（22 个，排查历史的留档）
 ├─ models/
 │  ├─ panda/                 Franka Panda（Menagerie, Apache-2.0）
 │  ├─ simready/              工作台 / 虎钳 / 工件资产
 │  └─ _tmp_so101/            LeRobot SO-101 环境包（Apache-2.0）
-├─ docs/                     原理笔记
-├─ HANDOFF.md                工程日志
-└─ THIRD_PARTY.md            第三方声明
+├─ docs/                     原理笔记（8 篇）
+├─ assets/                   README 用图（送料动图）
+├─ tools/glb2obj             格式转换
+└─ _build/                   运行时生成的图与数据（gitignore，不进仓库）
 ```
 
-> 目录还没按 `core/` + `scenes/` 拆分——脚本之间有 30 多处交叉 `import`，重构要改一堆 `sys.path`，等第二个工位落地时一并做。现在 `README` 里的分层是**设计意图**，不是磁盘现状。
+> `src/` 现在是**平铺**的，没按 `core/` + `scenes/` 拆——脚本之间有 30 多处交叉 `import`，真拆要改一堆 `sys.path`。等第二个工位（视觉引导）落地时一并做，那时才知道 `core/` 到底该抽什么。
 
 ---
 
