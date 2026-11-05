@@ -59,7 +59,7 @@ def make_cam(lookat, distance, azimuth, elevation):
 #   E 正对卡盘端面：三爪 120° 夹住轴端最清楚
 #   I 侧向：能看到轴水平伸进卡盘
 CENTER = [0.184, 0.120, 0.060]
-CAM_MAIN = make_cam([0.20, 0.00, 0.08], 0.75, -35, -25)
+CAM_MAIN = make_cam([0.21, 0.01, 0.07], 0.55, -38, -22)
 CAM_CHUCK = make_cam(CENTER, 0.24, 0, -10)
 CAM_SIDE = make_cam(CENTER, 0.22, 90, -10)
 CAM_PART = make_cam(list(F.SHAFT_POS), 0.28, 30, -20)
