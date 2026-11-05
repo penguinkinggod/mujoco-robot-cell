@@ -65,6 +65,64 @@ REACH_LIMIT = 10.0     # mm, IK residual at the pre-insertion stop point
 SHAFT_Q0 = np.array([0.7071068, 0.0, 0.7071068, 0.0])
 
 
+def check_jaw_coupling(model, data, ids):
+    """Prove the two equality constraints really couple jaw 1/2 to jaw 0.
+
+    A fresh MjSpec equality defaults to data=[0, 1, 0, 0, 0, ...], i.e.
+    polycoef 0 + 1*x, which means q2 = q1. If that default ever changes,
+    or somebody edits eq.data, the constraint silently becomes "lock the
+    follower joint at 0" instead. The on-axis clamping test CANNOT catch
+    that by accident: with the shaft placed exactly on the chuck axis, all
+    three jaws happen to settle near 0 anyway, so spread would still look
+    fine. Check both the structure and the empty-load following behaviour.
+
+    Measured 2026-11-05: spec default data = [0,1,0,0,0,...],
+    eq obj ids 7->8 and 7->9, empty-load q=[5.000, 5.009, 5.009] mm.
+    """
+    jt = mujoco.mjtObj.mjOBJ_JOINT
+    jid = [mujoco.mj_name2id(model, jt, "jaw_slide_%d" % k)
+           for k in range(3)]
+    ja = [model.jnt_qposadr[j] for j in jid]
+
+    eq_ok = (model.neq == 2 and len(ids["jaw_acts"]) == 1)
+    if eq_ok:
+        expect = np.array([0.0, 1.0, 0.0, 0.0, 0.0])
+        masters, followers = set(), set()
+        for i in range(model.neq):
+            eq_ok &= (model.eq_type[i] == mujoco.mjtEq.mjEQ_JOINT)
+            eq_ok &= bool(np.allclose(model.eq_data[i][:5], expect,
+                                      atol=1e-9))
+            masters.add(int(model.eq_obj1id[i]))
+            followers.add(int(model.eq_obj2id[i]))
+        eq_ok &= (masters == {jid[0]}
+                  and followers == {jid[1], jid[2]})
+
+    # Sweep the screw with the shaft parked far away: no contact forces,
+    # so any remaining difference is purely the coupling constraint.
+    sq = model.jnt_qposadr[
+        mujoco.mj_name2id(model, jt, "shaft_free")]
+    ac = ids["jaw_acts"][0]
+    samples = []
+    for ctrl in (0.0, 0.004):
+        mujoco.mj_resetData(model, data)
+        data.qpos[sq:sq + 3] = [S.LATHE_X, S.LATHE_Y + 0.6, S.LATHE_Z]
+        data.qpos[sq + 3:sq + 7] = [1.0, 0.0, 0.0, 0.0]
+        data.qvel[:] = 0.0
+        mujoco.mj_forward(model, data)
+        for _ in range(1200):
+            data.ctrl[ac] = ctrl
+            mujoco.mj_step(model, data)
+        samples.append(np.array([data.qpos[a] * 1000 for a in ja]))
+    moved = float(samples[1][0] - samples[0][0])
+    follow_err = max(float(np.max(np.abs(f - f[0]))) for f in samples)
+    follow_ok = bool(moved > 1.0 and follow_err < 0.05)
+
+    # Leave a clean slate for the physics pass below.
+    data.ctrl[:] = 0.0
+    mujoco.mj_resetData(model, data)
+    return bool(eq_ok), follow_ok, moved, follow_err, samples
+
+
 def main():
     model, data, ids = S.make_scene()
     sq = model.jnt_qposadr[
@@ -81,6 +139,18 @@ def main():
     print("=" * 74)
     print("  卡盘轴线 : (%.3f, %.3f, %.3f)"
           % (S.LATHE_X, S.LATHE_Y, S.LATHE_Z))
+    print()
+
+    # ---------------- coupling (structure + behaviour) ----------------
+    eq_ok, follow_ok, moved, follow_err, samples = check_jaw_coupling(
+        model, data, ids)
+    print("  联动约束结构    : %s   (neq=%d, 丝杠=%d, polycoef 须为 0+1x)"
+          % ("OK" if eq_ok else "BAD", model.neq, len(ids["jaw_acts"])))
+    print("  空载跟随        : 主爪移动 %.2f mm，最大跟随偏差 %.4f mm  %s"
+          % (moved, follow_err, "OK" if follow_ok else "BAD"))
+    for ctrl, q in zip((0.0, 0.004), samples):
+        print("                    ctrl=%+.3f -> q=%s mm"
+              % (ctrl, np.round(q, 3)))
     print()
 
     # ---------------- physics ----------------
@@ -173,7 +243,8 @@ def main():
 
     ok = (ecc <= ECC_LIMIT and tilt <= TILT_LIMIT
           and contacts >= CONTACT_MIN and reach_err <= REACH_LIMIT
-          and spread <= SPREAD_LIMIT and force_ratio <= FORCE_RATIO_LIMIT)
+          and spread <= SPREAD_LIMIT and force_ratio <= FORCE_RATIO_LIMIT
+          and eq_ok and follow_ok)
     print("=" * 74)
     print("CHUCK_HEALTH jaw_spread_mm=%.3f ecc_mm=%.2f tilt_deg=%.2f "
           "contacts=%d reach_err_mm=%.2f force_ratio=%.2f"

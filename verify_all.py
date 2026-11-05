@@ -40,6 +40,9 @@ CORE_FILES = [
     "demo_09_try_versions.py",
     "verify_all.py",
     "diag_chuck_health.py",
+    # Syntax-checked only. This is a KNOWN FAIL baseline; wiring it into
+    # CHECKS would red the 6/6 green baseline. See its module docstring.
+    "diag_feed_chuck.py",
 ]
 
 MACHINING_CODE = (

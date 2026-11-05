@@ -379,6 +379,140 @@ def build_scene(shaft_mass=None, jaw_open=None):
     return spec
 
 
+def add_lathe(spec, *, origin=None, table_z=0.0, jaw_open=None,
+              jaw_mask=(2, 3), static_mask=(1, 3)):
+    """Append the three-jaw chuck to an EXISTING MjSpec (scene merging).
+
+    This is the add_lathe(spec) step that lets the shallow-slot scene
+    (scene_full.py) own the robot + workpiece while the chuck is a bolt-on
+    workstation. build_scene() above is deliberately left untouched: every
+    existing diagnostic keeps compiling exactly as before.
+
+    origin      (x, y, z) of the chuck FACE (jaws stick out toward -x).
+    jaw_mask    (contype, conaffinity) for the three jaw geoms. In
+                scene_full.py's bitmask scheme pass CT_FIXTURE=(4, 2):
+                the jaws then touch the workpiece (work ct=2 vs jaw ca=2)
+                but NOT the gripper pads (robot ct=1, ca=3), because
+                4&3 == 0 and 1&2 == 0. Without this the pads hit the jaws
+                and the arm stalls -- measured 34.9 mm IK residual at
+                x=0.25, 63.8 mm at x=0.28 with an empty gripper.
+    static_mask mask for headstock/chuck body/spindle. Pass (0, 0) to make
+                them purely visual, so neither the arm nor the inserted
+                shaft collides with the disc. Only the three jaws clamp.
+
+    Returns a dict of object names: jaw_act, jaws, joint names.
+    """
+    if origin is None:
+        origin = (LATHE_X, LATHE_Y, LATHE_Z)
+    if jaw_open is None:
+        jaw_open = JAW_OPEN
+    lx, ly, lz = origin
+    wb = spec.worldbody
+
+    def _m(g, ct, ca):
+        g.contype = ct
+        g.conaffinity = ca
+        return g
+
+    qx = [0.7071068, 0.0, 0.7071068, 0.0]   # cylinder local z -> world x
+
+    head = wb.add_geom()
+    head.name = "lathe_headstock"
+    head.type = mujoco.mjtGeom.mjGEOM_BOX
+    head.size = [0.045, 0.075, 0.060]
+    head.pos = [lx + CHUCK_L + 0.045, ly, table_z + 0.060]
+    head.rgba = [0.30, 0.32, 0.36, 1.0]
+    _m(head, *static_mask)
+
+    chuck = wb.add_geom()
+    chuck.name = "chuck_body"
+    chuck.type = mujoco.mjtGeom.mjGEOM_CYLINDER
+    chuck.size = [CHUCK_R, CHUCK_L / 2, 0.0]
+    chuck.pos = [lx + CHUCK_L / 2, ly, lz]
+    chuck.quat = qx
+    chuck.rgba = [0.44, 0.46, 0.50, 1.0]
+    chuck.friction = [0.8, 0.01, 0.001]
+    _m(chuck, *static_mask)
+
+    for k in range(3):
+        ang = 2 * np.pi * k / 3 + np.pi / 2
+        cy, cz = np.cos(ang), np.sin(ang)
+        slot = wb.add_geom()
+        slot.name = "chuck_slot_%d" % k
+        slot.type = mujoco.mjtGeom.mjGEOM_BOX
+        slot.size = [0.001, 0.006, (CHUCK_R - 0.012) / 2]
+        slot.pos = [lx - 0.001,
+                    ly + cy * (0.012 + (CHUCK_R - 0.012) / 2),
+                    lz + cz * (0.012 + (CHUCK_R - 0.012) / 2)]
+        ang_x = ang - np.pi / 2
+        slot.quat = [np.cos(ang_x / 2), np.sin(ang_x / 2), 0.0, 0.0]
+        slot.rgba = [0.18, 0.19, 0.22, 1.0]
+        slot.contype = 0
+        slot.conaffinity = 0
+
+    spindle = wb.add_geom()
+    spindle.name = "spindle"
+    spindle.type = mujoco.mjtGeom.mjGEOM_CYLINDER
+    spindle.size = [0.022, 0.060, 0.0]
+    spindle.pos = [lx + CHUCK_L + 0.060, ly, lz]
+    spindle.quat = qx
+    spindle.rgba = [0.55, 0.57, 0.60, 1.0]
+    _m(spindle, *static_mask)
+
+    for k in range(3):
+        ang = 2 * np.pi * k / 3 + np.pi / 2
+        cy, cz = np.cos(ang), np.sin(ang)
+        jb = wb.add_body()
+        jb.name = "jaw_%d" % k
+        jb.pos = [lx - JAW_LEN / 2 - 0.002,
+                  ly + jaw_open * cy, lz + jaw_open * cz]
+        slide = jb.add_joint()
+        slide.name = "jaw_slide_%d" % k
+        slide.type = mujoco.mjtJoint.mjJNT_SLIDE
+        slide.axis = [0.0, cy, cz]
+        slide.range = [-0.015, 0.008]
+        slide.damping[:] = 30.0
+        slide.armature = 0.01
+
+        jgeom = jb.add_geom()
+        jgeom.name = "jaw_geom_%d" % k
+        jgeom.type = mujoco.mjtGeom.mjGEOM_BOX
+        jgeom.size = [JAW_LEN / 2, JAW_W / 2, JAW_W / 2]
+        # Rotate the box so its local y points along THIS jaw's radius.
+        # Leaving all three axis-aligned makes their effective radial
+        # half-widths 9.0 / 12.3 / 12.3 mm, which fakes a 4.24 mm
+        # synchronisation error.
+        jgeom.quat = [np.cos(ang / 2), np.sin(ang / 2), 0.0, 0.0]
+        jgeom.rgba = [0.72, 0.68, 0.52, 1.0]
+        jgeom.friction = [1.8, 0.06, 0.004]
+        _m(jgeom, *jaw_mask)
+
+    # One screw = one actuator. MjsEquality.data defaults to
+    # [0,1,0,0,0,...], i.e. polycoef 0+1x => q2 = q1. Verified in
+    # diag_chuck_health.check_jaw_coupling (structure AND empty-load
+    # following), so do not "helpfully" zero it.
+    act = spec.add_actuator()
+    act.name = "jaw_act"
+    act.target = "jaw_slide_0"
+    act.trntype = mujoco.mjtTrn.mjTRN_JOINT
+    act.set_to_position(kp=4000.0, kv=120.0)
+    act.ctrlrange = [-0.015, 0.008]
+    act.forcerange = [-500.0, 500.0]
+
+    for k in (1, 2):
+        eq = spec.add_equality()
+        eq.type = mujoco.mjtEq.mjEQ_JOINT
+        eq.name1 = "jaw_slide_0"
+        eq.name2 = "jaw_slide_%d" % k
+        eq.solref[:] = [0.001, 1.0]
+        eq.solimp[:] = [0.9, 0.99, 0.0001, 0.5, 100.0]
+
+    return {"jaw_act": "jaw_act",
+            "jaws": ["jaw_%d" % k for k in range(3)],
+            "slides": ["jaw_slide_%d" % k for k in range(3)],
+            "origin": np.asarray(origin)}
+
+
 def make_scene():
     """建好并编译，返回 (model, data, 关键 id)。"""
     spec = build_scene()

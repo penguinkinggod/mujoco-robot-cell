@@ -150,7 +150,7 @@ def jaw_geometry():
     }
 
 
-def build_scene(shaft_mass=None):
+def build_scene(shaft_mass=None, with_lathe=False, lathe_origin=None):
     if shaft_mass is None:
         shaft_mass = SHAFT_MASS
 
@@ -306,11 +306,30 @@ def build_scene(shaft_mass=None):
     print("    normalized %d gripper pads to (%d, %d)"
           % (npad, CT_ROBOT[0], CT_ROBOT[1]))
 
+    if with_lathe:
+        # Bolt the lathe on as a workstation. Default OFF: demo_08 /
+        # demo_09 and every existing diagnostic keep their baseline.
+        # CT_FIXTURE (4,2) makes the jaws touch the workpiece but NOT the
+        # gripper pads, which is the same trick used for the slot fixture
+        # (the wrist sits only 8.2 mm above the pads). The headstock and
+        # disc are visual-only so the inserted shaft does not hit them.
+        import scene_machining as SM
+        if lathe_origin is None:
+            lathe_origin = (0.26, 0.12, TABLE_TOP_Z + 0.060)
+        SM.add_lathe(
+            spec,
+            origin=lathe_origin,
+            table_z=TABLE_TOP_Z,
+            jaw_mask=CT_FIXTURE,
+            static_mask=(0, 0),
+        )
+
     return spec
 
 
-def make_scene(shaft_mass=None):
-    spec = build_scene(shaft_mass)
+def make_scene(shaft_mass=None, with_lathe=False, lathe_origin=None):
+    spec = build_scene(shaft_mass, with_lathe=with_lathe,
+                       lathe_origin=lathe_origin)
     model = spec.compile()
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)
