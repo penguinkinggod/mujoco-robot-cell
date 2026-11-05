@@ -150,7 +150,15 @@ def jaw_geometry():
     }
 
 
-def build_scene(shaft_mass=None, with_lathe=False, lathe_origin=None):
+def build_scene(shaft_mass=None, with_lathe=False, lathe_origin=None,
+                with_vise=True, with_fixture=True, with_shaft_flat=True):
+    """Build the merged scene.
+
+    The three with_* switches default to True so demo_08 / demo_09 and every
+    existing diagnostic keep their exact baseline. The feed scene turns them
+    off: no bench vise, no shallow slot platform, and a PLAIN CYLINDER
+    workpiece (no milled flat). See diag_feed_chuck.build_model().
+    """
     if shaft_mass is None:
         shaft_mass = SHAFT_MASS
 
@@ -198,64 +206,72 @@ def build_scene(shaft_mass=None, with_lathe=False, lathe_origin=None):
         L.diffuse = dif
         L.castshadow = sh
 
-    # ---- real SimReady bench vise ----
-    print("Loading SimReady asset:")
-    vise = load_asset("equipment_bench_vise_a01")
-    print("    vise mass %.2f kg (from SimReady physics)" % total_mass(vise))
+    # ---- real SimReady bench vise (optional; the feed scene removes it) ----
+    vv_name = vc_name = None
+    if with_vise:
+        print("Loading SimReady asset:")
+        vise = load_asset("equipment_bench_vise_a01")
+        print("    vise mass %.2f kg (from SimReady physics)" % total_mass(vise))
 
-    # Local frame: disc body Y in [0, 0.027], jaws extend along +Y, leadscrew
-    # along X. Rotating +90 deg about Z maps local +Y to world -X, so the jaw
-    # opening faces the robot. Picked by rendering 4 candidates in
-    # diag_vise_orient.py, not by reasoning.
-    vise_quat = [np.cos(np.pi / 4), 0.0, 0.0, np.sin(np.pi / 4)]
+        # Local frame: disc body Y in [0, 0.027], jaws extend along +Y,
+        # leadscrew along X. Rotating +90 deg about Z maps local +Y to
+        # world -X, so the jaw opening faces the robot. Picked by
+        # diag_vise_orient.py, not by reasoning.
+        vise_quat = [np.cos(np.pi / 4), 0.0, 0.0, np.sin(np.pi / 4)]
 
-    # VISUAL ONLY (ct=0). The convex hull fills the jaw slot into a solid
-    # block: measured with diag_shaft_slip.py, the workpiece hit
-    # vise_sr_col on the way down and was thrown out (pad-to-workpiece
-    # error grew 17 -> 52 mm). A hull always fills concavities and that is
-    # not tunable, so functional collision comes from the rollers below.
-    vb, vv_name, vc_name = place_asset(
-        spec, wb, "vise_sr", vise,
-        pos=VISE_POS, quat=vise_quat,
-        rgba=(0.40, 0.44, 0.50, 1.0),
-        out_dir=mesh_out, ct=0, ca=0,
-    )
+        # VISUAL ONLY (ct=0). The convex hull fills the jaw slot into a
+        # solid block: measured with diag_shaft_slip.py, the workpiece hit
+        # vise_sr_col on the way down and was thrown out (pad-to-workpiece
+        # error grew 17 -> 52 mm). A hull always fills concavities and that
+        # is not tunable, so functional collision comes from the rollers.
+        vb, vv_name, vc_name = place_asset(
+            spec, wb, "vise_sr", vise,
+            pos=VISE_POS, quat=vise_quat,
+            rgba=(0.40, 0.44, 0.50, 1.0),
+            out_dir=mesh_out, ct=0, ca=0,
+        )
+    else:
+        print("    vise: removed (with_vise=False)")
 
-    # ---- fixture: shallow slot platform (route B) ----
-    g = slot_geometry()
-    print("    fixture (shallow slot platform, no self-centering):")
-    print("      slot %.0f mm wide x %.0f mm deep, platform %.0f x %.0f mm"
-          % (SLOT_W * 1000, SLOT_D * 1000,
-             PLATFORM_L * 1000, PLATFORM_W * 1000))
-    print("      slot floor z %.1f mm, platform top z %.1f mm"
-          % (g["slot_bottom"] * 1000, g["platform_top"] * 1000))
-    print("      workpiece D%.0f mm rests with axis at z %.1f mm"
-          % (SHAFT_D * 1000, g["rest_z"] * 1000))
+    # ---- fixture: shallow slot platform (optional; feed scene drops it) --
+    if with_fixture:
+        g = slot_geometry()
+        print("    fixture (shallow slot platform, no self-centering):")
+        print("      slot %.0f mm wide x %.0f mm deep, platform %.0f x %.0f mm"
+              % (SLOT_W * 1000, SLOT_D * 1000,
+                 PLATFORM_L * 1000, PLATFORM_W * 1000))
+        print("      slot floor z %.1f mm, platform top z %.1f mm"
+              % (g["slot_bottom"] * 1000, g["platform_top"] * 1000))
+        print("      workpiece D%.0f mm rests with axis at z %.1f mm"
+              % (SHAFT_D * 1000, g["rest_z"] * 1000))
 
-    # base plate: its top face IS the slot floor
-    base = wb.add_geom()
-    base.name = "slot_base"
-    base.type = mujoco.mjtGeom.mjGEOM_BOX
-    base.size = [PLATFORM_L / 2, PLATFORM_W / 2, g["slot_bottom"] / 2]
-    base.pos = [FIXTURE_X, FIXTURE_Y, TABLE_TOP_Z + g["slot_bottom"] / 2]
-    base.rgba = [0.42, 0.45, 0.50, 1.0]
-    base.friction = [0.8, 0.01, 0.001]
-    _mask(base, *CT_FIXTURE)
+        # base plate: its top face IS the slot floor
+        base = wb.add_geom()
+        base.name = "slot_base"
+        base.type = mujoco.mjtGeom.mjGEOM_BOX
+        base.size = [PLATFORM_L / 2, PLATFORM_W / 2, g["slot_bottom"] / 2]
+        base.pos = [FIXTURE_X, FIXTURE_Y, TABLE_TOP_Z + g["slot_bottom"] / 2]
+        base.rgba = [0.42, 0.45, 0.50, 1.0]
+        base.friction = [0.8, 0.01, 0.001]
+        _mask(base, *CT_FIXTURE)
 
-    # two walls: inner faces at y = FIXTURE_Y +- SLOT_W/2
-    for side, sy in (("L", -1), ("R", +1)):
-        w = wb.add_geom()
-        w.name = "slot_wall_%s" % side
-        w.type = mujoco.mjtGeom.mjGEOM_BOX
-        w.size = [PLATFORM_L / 2, g["wall_w"] / 2, SLOT_D / 2]
-        w.pos = [FIXTURE_X,
-                 FIXTURE_Y + sy * g["wall_y"],
-                 TABLE_TOP_Z + g["slot_bottom"] + SLOT_D / 2]
-        w.rgba = [0.56, 0.59, 0.65, 1.0]
-        w.friction = [0.8, 0.01, 0.001]
-        _mask(w, *CT_FIXTURE)
+        # two walls: inner faces at y = FIXTURE_Y +- SLOT_W/2
+        for side, sy in (("L", -1), ("R", +1)):
+            w = wb.add_geom()
+            w.name = "slot_wall_%s" % side
+            w.type = mujoco.mjtGeom.mjGEOM_BOX
+            w.size = [PLATFORM_L / 2, g["wall_w"] / 2, SLOT_D / 2]
+            w.pos = [FIXTURE_X,
+                     FIXTURE_Y + sy * g["wall_y"],
+                     TABLE_TOP_Z + g["slot_bottom"] + SLOT_D / 2]
+            w.rgba = [0.56, 0.59, 0.65, 1.0]
+            w.friction = [0.8, 0.01, 0.001]
+            _mask(w, *CT_FIXTURE)
+    else:
+        print("    fixture: removed (with_fixture=False)")
 
-    register_meshes(spec, [vv_name, vc_name])
+    if with_vise:
+        register_meshes(spec, [vv_name, vc_name])
 
     # ---- workpiece: D-shaft, free body ----
     shaft = wb.add_body()
@@ -273,27 +289,31 @@ def build_scene(shaft_mass=None, with_lathe=False, lathe_origin=None):
     sg.friction = [1.2, 0.02, 0.002]
     _mask(sg, *CT_WORK)
 
-    flat = shaft.add_geom()
-    flat.name = "shaft_flat"
-    flat.type = mujoco.mjtGeom.mjGEOM_BOX
-    # The shaft body is rotated: local z -> world x (shaft axis),
-    # local x -> -world z. So the 80 mm half-length belongs in size[2]
-    # and the 4 mm thickness in size[0]. With these swapped the "milled
-    # flat" becomes an 80 mm TALL vertical plate that punches through the
-    # table and holds the shaft up in mid-air -- measured world bbox
-    # z[-0.030, 0.050] instead of a thin strip on top of the cylinder.
-    flat.size = [SHAFT_FLAT / 2, SHAFT_D * 0.42, SHAFT_L / 2]
-    flat.pos = [-(SHAFT_D / 2 - SHAFT_FLAT / 2), 0.0, 0.0]
-    flat.mass = 0.0
-    flat.rgba = [0.80, 0.82, 0.86, 1.0]
-    # VISUAL ONLY. A box cannot sit flush on a cylinder: its corners stick
-    # ~3 mm past the D20 envelope (sqrt(8.4^2 + 10^2) = 13.1 mm). Those
-    # corners land first, kick the shaft sideways and make it roll --
-    # measured in diag_slot_alone.py: every drop converged to y = +4 mm
-    # with quat rotated, and the shaft never touched a slot wall. The slot
-    # walls already provide lateral restraint, so let the cylinder own
-    # all contact and keep the flat purely for looks.
-    _mask(flat, 0, 0)
+    if with_shaft_flat:
+        flat = shaft.add_geom()
+        flat.name = "shaft_flat"
+        flat.type = mujoco.mjtGeom.mjGEOM_BOX
+        # The shaft body is rotated: local z -> world x (shaft axis),
+        # local x -> -world z. So the 80 mm half-length belongs in size[2]
+        # and the 4 mm thickness in size[0]. With these swapped the "milled
+        # flat" becomes an 80 mm TALL vertical plate that punches through
+        # the table and holds the shaft up in mid-air -- measured world
+        # bbox z[-0.030, 0.050] instead of a thin strip on the cylinder.
+        flat.size = [SHAFT_FLAT / 2, SHAFT_D * 0.42, SHAFT_L / 2]
+        flat.pos = [-(SHAFT_D / 2 - SHAFT_FLAT / 2), 0.0, 0.0]
+        flat.mass = 0.0
+        flat.rgba = [0.80, 0.82, 0.86, 1.0]
+        # VISUAL ONLY. A box cannot sit flush on a cylinder: its corners
+        # stick ~3 mm past the D20 envelope (sqrt(8.4^2 + 10^2) = 13.1 mm).
+        # Those corners land first, kick the shaft sideways and make it
+        # roll -- measured in diag_slot_alone.py: every drop converged to
+        # y = +4 mm with quat rotated, and the shaft never touched a slot
+        # wall. The slot walls already provide lateral restraint, so let
+        # the cylinder own all contact and keep the flat purely for looks.
+        _mask(flat, 0, 0)
+    else:
+        print("    shaft_flat: omitted -> PLAIN CYLINDER D%.0f"
+              % (SHAFT_D * 1000))
 
     # ---- gripper pad collision mask ----
     npad = 0
@@ -327,9 +347,12 @@ def build_scene(shaft_mass=None, with_lathe=False, lathe_origin=None):
     return spec
 
 
-def make_scene(shaft_mass=None, with_lathe=False, lathe_origin=None):
+def make_scene(shaft_mass=None, with_lathe=False, lathe_origin=None,
+               with_vise=True, with_fixture=True, with_shaft_flat=True):
     spec = build_scene(shaft_mass, with_lathe=with_lathe,
-                       lathe_origin=lathe_origin)
+                       lathe_origin=lathe_origin, with_vise=with_vise,
+                       with_fixture=with_fixture,
+                       with_shaft_flat=with_shaft_flat)
     model = spec.compile()
     data = mujoco.MjData(model)
     mujoco.mj_forward(model, data)

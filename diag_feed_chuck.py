@@ -92,16 +92,115 @@ def tilt_deg(quat):
         2 * np.arccos(min(1.0, abs(float(np.dot(SHAFT_Q0, quat)))))))
 
 
-def build_model():
-    """Merged scene, with the D-flat promoted to a real collision geom.
+CRADLE_DROP = 0.011      # 托条中心比两 pad 中点低多少（R10 + 板半厚 1 mm）
+CRADLE_LEN = 0.060       # 托条沿工件轴向的长度
 
-    Local patch only: scene_full.py keeps the flat visual-only so the
-    demo_09 / diag_slot_alone baselines are untouched.
+
+def add_grip_fix(spec, kind="cradle"):
+    """Give the gripper a support bar under the pads (form closure).
+
+    Two flat pads on a plain cylinder touch along ONE line. Gravity then
+    rotates the shaft about that line until it hangs 40-55 deg off axis
+    (measured: exp_plain_cyl.py), which is why a bare cylinder "won't sit".
+    A bar under the pads carries the weight, so the pads only have to stop
+    the shaft sliding sideways -- no friction-dependent balance.
+
+    Geometry is resolved at the real grasp orientation (wrist_roll fixed),
+    then written into the gripper body frame, because a local +x offset
+    means different world directions depending on wrist roll.
     """
-    spec = F.build_scene(with_lathe=True, lathe_origin=LATHE_ORIGIN)
-    shaft = next(b for b in spec.bodies if b.name == "shaft")
-    flat = next(g for g in shaft.geoms if g.name == "shaft_flat")
-    flat.contype, flat.conaffinity = F.CT_WORK
+    if kind in ("v", "both"):
+        _add_v_jaw(spec)
+    if kind in ("cradle", "both"):
+        _add_cradle(spec)
+    if kind not in ("v", "cradle", "both"):
+        raise ValueError("unknown grip_fix: %r" % (kind,))
+
+
+def _add_v_jaw(spec, half_angle_deg=45.0, arm=0.006):
+    """V-groove on the FIXED pad only: two 45 deg blades opening toward the
+    moving jaw. Fixed pad has no local rotation, so its +x is the inward
+    face -- measured with _probe_pads.py, not guessed.
+
+    V (two contact points) + the flat moving pad (one point) gives three
+    points of contact, which stops the shaft rotating about a single line.
+    """
+    body = next(b for b in spec.bodies if b.name == "gripper")
+    pad = next(g for g in body.geoms if g.name == "fixed_jaw_pad")
+    vx = pad.pos[0] + pad.size[0]          # inner face of the pad
+    vy = pad.pos[1]
+    vz = pad.pos[2]
+    a = np.radians(half_angle_deg)
+    for sign in (+1, -1):
+        g = body.add_geom()
+        g.name = "vjaw_%s" % ("up" if sign > 0 else "dn")
+        g.type = mujoco.mjtGeom.mjGEOM_BOX
+        g.size = [0.0012, 0.008, arm]
+        g.pos = [vx + arm * np.sin(a) * 0.5,
+                 vy,
+                 vz + sign * arm * np.cos(a) * 0.5]
+        g.quat = [np.cos(a / 2), 0.0, sign * np.sin(a / 2), 0.0]
+        g.rgba = [0.90, 0.58, 0.16, 1.0]
+        g.contype, g.conaffinity = F.CT_ROBOT
+    print("    grip_fix: V jaw at inner face x=%.4f (arm %.0f mm)"
+          % (vx, arm * 1000))
+
+
+def _add_cradle(spec):
+
+    tmp = spec.compile()
+    td = mujoco.MjData(tmp)
+    jid = lambda n: mujoco.mj_name2id(tmp, mujoco.mjtObj.mjOBJ_JOINT, n)
+    gid = lambda n: mujoco.mj_name2id(tmp, mujoco.mjtObj.mjOBJ_GEOM, n)
+    bid = lambda n: mujoco.mj_name2id(tmp, mujoco.mjtObj.mjOBJ_BODY, n)
+
+    td.qpos[:] = 0.0
+    td.qpos[tmp.jnt_qposadr[jid("gripper")]] = 0.15
+    td.qpos[tmp.jnt_qposadr[jid("wrist_roll")]] = 1.55
+    mujoco.mj_forward(tmp, td)
+
+    Rg = td.xmat[bid("gripper")].reshape(3, 3)      # gripper local -> world
+    pg = td.xpos[bid("gripper")].copy()
+    mid = (td.geom_xpos[gid("fixed_jaw_pad")] +
+           td.geom_xpos[gid("moving_jaw_pad")]) / 2.0
+
+    # bar centre: straight below the grasp point, in WORLD z
+    p_local = Rg.T @ (mid - np.array([0.0, 0.0, CRADLE_DROP]) - pg)
+    # bar axes in world: local x -> -z (thickness), y -> y, z -> +x (length)
+    Rt = np.array([[0.0, 0.0, 1.0],
+                   [0.0, 1.0, 0.0],
+                   [-1.0, 0.0, 0.0]])
+    q_local = np.zeros(4)
+    mujoco.mju_mat2Quat(q_local, np.ascontiguousarray(Rg.T @ Rt).reshape(-1))
+
+    body = next(b for b in spec.bodies if b.name == "gripper")
+    g = body.add_geom()
+    g.name = "grip_cradle"
+    g.type = mujoco.mjtGeom.mjGEOM_BOX
+    g.size = [0.001, 0.006, CRADLE_LEN / 2]
+    g.pos = p_local
+    g.quat = q_local
+    g.rgba = [0.90, 0.58, 0.16, 1.0]
+    g.contype, g.conaffinity = F.CT_ROBOT
+    print("    grip_fix: cradle at local %s (len %.0f mm)"
+          % (np.round(p_local, 4), CRADLE_LEN * 1000))
+
+
+def build_model(grip_fix=None):
+    """Feed scene: no vise, no slot platform, PLAIN cylinder workpiece.
+
+    Requested 2026-11-05: "把虎钳和浅平台删掉，把工件换成圆柱".
+    Removing the milled flat and the slot platform means nothing stops the
+    cylinder rolling, so the grasp now has to work on the real pads alone.
+    grip_fix selects an optional gripper patch (see add_grip_fix):
+        None -> stock pads
+        "v" / "cradle" / "both"
+    """
+    spec = F.build_scene(with_lathe=True, lathe_origin=LATHE_ORIGIN,
+                         with_vise=False, with_fixture=False,
+                         with_shaft_flat=False)
+    if grip_fix:
+        add_grip_fix(spec, grip_fix)
     return spec.compile()
 
 
