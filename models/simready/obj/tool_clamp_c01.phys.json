@@ -1,0 +1,173 @@
+{
+  "name": "tool_clamp_c01",
+  "totalVerts": 182835,
+  "totalTris": 357648,
+  "nodes": [
+    {
+      "name": "hande_01_obj_00",
+      "mass": 0.044159,
+      "density": 7850,
+      "joints": [
+        {
+          "name": "joint_hande_01_joint_00",
+          "type": "prismatic",
+          "parent": "pres_01_obj_00",
+          "pivot": [
+            -0.116316,
+            0.011978,
+            0.034343
+          ],
+          "axis": [
+            0,
+            0,
+            -1
+          ],
+          "min": -0.0001,
+          "max": 0.048753,
+          "unit": "meters"
+        }
+      ],
+      "hulls": {
+        "bufferView": 20,
+        "byteOffset": 420,
+        "counts": [
+          7
+        ],
+        "materials": [
+          0
+        ]
+      },
+      "worldMatrix": [
+        [
+          1,
+          0,
+          0,
+          -0.11631631851196289
+        ],
+        [
+          0,
+          1,
+          0,
+          0.01197806652635336
+        ],
+        [
+          0,
+          0,
+          1,
+          0.03434300050139427
+        ],
+        [
+          0,
+          0,
+          0,
+          1
+        ]
+      ]
+    },
+    {
+      "name": "pres_01_obj_00",
+      "mass": 0.187941,
+      "density": 7850,
+      "joints": [
+        {
+          "name": "joint_pres_01_joint_00",
+          "type": "prismatic",
+          "parent": "body_01_obj_00",
+          "pivot": [
+            -0.058022,
+            0.011968,
+            0.010704
+          ],
+          "axis": [
+            1,
+            0,
+            0
+          ],
+          "min": -0.008772,
+          "max": 0.047079,
+          "unit": "meters"
+        }
+      ],
+      "hulls": {
+        "bufferView": 20,
+        "byteOffset": 216,
+        "counts": [
+          9,
+          8
+        ],
+        "materials": [
+          0,
+          0
+        ]
+      },
+      "worldMatrix": [
+        [
+          1,
+          0,
+          0,
+          -0.058022286742925644
+        ],
+        [
+          0,
+          1,
+          0,
+          0.01196766085922718
+        ],
+        [
+          0,
+          0,
+          1,
+          0.01070429664105177
+        ],
+        [
+          0,
+          0,
+          0,
+          1
+        ]
+      ]
+    },
+    {
+      "name": "body_01_obj_00",
+      "mass": 0.515,
+      "density": 7850,
+      "joints": null,
+      "hulls": {
+        "bufferView": 20,
+        "byteOffset": 0,
+        "counts": [
+          18
+        ],
+        "materials": [
+          0
+        ]
+      },
+      "worldMatrix": [
+        [
+          1,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          1,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          1,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          1
+        ]
+      ]
+    }
+  ]
+}

@@ -1,0 +1,244 @@
+{
+  "name": "equipment_machine_vise_c01",
+  "totalVerts": 96177,
+  "totalTris": 161814,
+  "nodes": [
+    {
+      "name": "clamp_01_obj_00",
+      "mass": 47.33688,
+      "density": 8500,
+      "joints": [
+        {
+          "name": "joint_clamp_01_joint_00",
+          "type": "prismatic",
+          "parent": "body_01_obj_00",
+          "pivot": [
+            -0.0208,
+            0.267746,
+            0
+          ],
+          "axis": [
+            1,
+            0,
+            0
+          ],
+          "min": 0,
+          "max": 0.281554,
+          "unit": "meters"
+        }
+      ],
+      "hulls": {
+        "bufferView": 51,
+        "byteOffset": 2772,
+        "counts": [
+          45
+        ],
+        "materials": [
+          0
+        ]
+      },
+      "worldMatrix": [
+        [
+          1,
+          0,
+          0,
+          -0.020800000056624413
+        ],
+        [
+          0,
+          1,
+          0,
+          0.267746239900589
+        ],
+        [
+          0,
+          0,
+          1,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          1
+        ]
+      ]
+    },
+    {
+      "name": "head_01_obj_00",
+      "mass": 2.153778,
+      "density": 8500,
+      "joints": [
+        {
+          "name": "joint_head_01_joint_00",
+          "type": "revolute",
+          "parent": "clamp_01_obj_00",
+          "pivot": [
+            0.498202,
+            0.267746,
+            0
+          ],
+          "axis": [
+            1,
+            0,
+            0
+          ],
+          "unit": "degrees"
+        }
+      ],
+      "hulls": {
+        "bufferView": 51,
+        "byteOffset": 2124,
+        "counts": [
+          12,
+          14,
+          12,
+          16
+        ],
+        "materials": [
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "worldMatrix": [
+        [
+          1,
+          0,
+          0,
+          0.49820172786712646
+        ],
+        [
+          0,
+          1,
+          0,
+          0.2677462697029114
+        ],
+        [
+          0,
+          0,
+          1,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          1
+        ]
+      ]
+    },
+    {
+      "name": "shaft_01_obj_00",
+      "mass": 1.874016,
+      "density": 7850,
+      "joints": [
+        {
+          "name": "joint_shaft_01_joint_00",
+          "type": "prismatic",
+          "parent": "head_01_obj_00",
+          "pivot": [
+            0.516943,
+            0.268043,
+            0
+          ],
+          "axis": [
+            0,
+            1,
+            0
+          ],
+          "min": -0.157645,
+          "max": 0.155519,
+          "unit": "meters"
+        }
+      ],
+      "hulls": {
+        "bufferView": 51,
+        "byteOffset": 1752,
+        "counts": [
+          31
+        ],
+        "materials": [
+          1
+        ]
+      },
+      "worldMatrix": [
+        [
+          1,
+          0,
+          0,
+          0.5169434547424316
+        ],
+        [
+          0,
+          1,
+          0,
+          0.268042653799057
+        ],
+        [
+          0,
+          0,
+          1,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          1
+        ]
+      ]
+    },
+    {
+      "name": "body_01_obj_00",
+      "mass": 81.52562,
+      "density": 7850,
+      "joints": null,
+      "hulls": {
+        "bufferView": 51,
+        "byteOffset": 0,
+        "counts": [
+          31,
+          28,
+          27,
+          29,
+          31
+        ],
+        "materials": [
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      },
+      "worldMatrix": [
+        [
+          1,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          1,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          1,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          1
+        ]
+      ]
+    }
+  ]
+}

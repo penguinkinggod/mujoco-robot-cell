@@ -1,0 +1,244 @@
+{
+  "name": "equipment_bench_vise_heavy_b01",
+  "totalVerts": 135028,
+  "totalTris": 189405,
+  "nodes": [
+    {
+      "name": "base_01_obj_00",
+      "mass": 11.492316,
+      "density": 7800,
+      "joints": null,
+      "hulls": {
+        "bufferView": 68,
+        "byteOffset": 960,
+        "counts": [
+          19,
+          14,
+          26,
+          24,
+          18,
+          19,
+          19
+        ],
+        "materials": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ]
+      },
+      "worldMatrix": [
+        [
+          1,
+          0,
+          0,
+          -0.00036425236612558365
+        ],
+        [
+          0,
+          1,
+          0,
+          -0.0000775754451751709
+        ],
+        [
+          0,
+          0,
+          1,
+          -0.00004156678915023804
+        ],
+        [
+          0,
+          0,
+          0,
+          1
+        ]
+      ]
+    },
+    {
+      "name": "driver_01_obj_00",
+      "mass": 1.408837,
+      "density": 7850,
+      "joints": [
+        {
+          "name": "joint_driver_01_joint_00",
+          "type": "revolute",
+          "parent": "press_01_obj_00",
+          "pivot": [
+            0.000234,
+            0.089589,
+            0.218815
+          ],
+          "axis": [
+            0,
+            0,
+            -1
+          ],
+          "unit": "degrees"
+        }
+      ],
+      "hulls": {
+        "bufferView": 68,
+        "byteOffset": 708,
+        "counts": [
+          21
+        ],
+        "materials": [
+          1
+        ]
+      },
+      "worldMatrix": [
+        [
+          1,
+          0,
+          0,
+          0.00023401257931254804
+        ],
+        [
+          0,
+          1,
+          0,
+          0.08958888798952103
+        ],
+        [
+          0,
+          0,
+          1,
+          0.21881546080112457
+        ],
+        [
+          0,
+          0,
+          0,
+          1
+        ]
+      ]
+    },
+    {
+      "name": "handle_01_obj_00",
+      "mass": 0.355564,
+      "density": 7850,
+      "joints": [
+        {
+          "name": "joint_handle_01_joint_00",
+          "type": "prismatic",
+          "parent": "driver_01_obj_00",
+          "pivot": [
+            -0.070472,
+            0.089659,
+            0.202012
+          ],
+          "axis": [
+            1,
+            0,
+            0
+          ],
+          "min": 0,
+          "max": 0.140211,
+          "unit": "meters"
+        }
+      ],
+      "hulls": {
+        "bufferView": 68,
+        "byteOffset": 576,
+        "counts": [
+          11
+        ],
+        "materials": [
+          1
+        ]
+      },
+      "worldMatrix": [
+        [
+          1,
+          0,
+          0,
+          -0.07047200202941895
+        ],
+        [
+          0,
+          1,
+          0,
+          0.08965902775526047
+        ],
+        [
+          0,
+          0,
+          1,
+          0.2020120471715927
+        ],
+        [
+          0,
+          0,
+          0,
+          1
+        ]
+      ]
+    },
+    {
+      "name": "press_01_obj_00",
+      "mass": 6.14656,
+      "density": 7850,
+      "joints": [
+        {
+          "name": "joint_press_01_joint_00",
+          "type": "prismatic",
+          "parent": "base_01_obj_00",
+          "pivot": [
+            -0.000364,
+            0.089422,
+            -0.004042
+          ],
+          "axis": [
+            0,
+            0,
+            -1
+          ],
+          "min": -0.089788,
+          "max": 0.026277,
+          "unit": "meters"
+        }
+      ],
+      "hulls": {
+        "bufferView": 68,
+        "byteOffset": 0,
+        "counts": [
+          21,
+          27
+        ],
+        "materials": [
+          1,
+          1
+        ]
+      },
+      "worldMatrix": [
+        [
+          1,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          1,
+          0,
+          0.08950001001358032
+        ],
+        [
+          0,
+          0,
+          1,
+          -0.0040000006556510925
+        ],
+        [
+          0,
+          0,
+          0,
+          1
+        ]
+      ]
+    }
+  ]
+}

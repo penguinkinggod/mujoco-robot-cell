@@ -1,0 +1,53 @@
+{
+  "name": "drivetrain_axle_shaft_a01",
+  "totalVerts": 128978,
+  "totalTris": 230858,
+  "nodes": [
+    {
+      "name": "axleshaft_01_obj_00",
+      "mass": 7.123347,
+      "density": 1200,
+      "joints": null,
+      "hulls": {
+        "bufferView": 34,
+        "byteOffset": 0,
+        "counts": [
+          23,
+          32,
+          32
+        ],
+        "materials": [
+          0,
+          0,
+          0
+        ]
+      },
+      "worldMatrix": [
+        [
+          1,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          1,
+          0,
+          0
+        ],
+        [
+          0,
+          0,
+          1,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          1
+        ]
+      ]
+    }
+  ]
+}

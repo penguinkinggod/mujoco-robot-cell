@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 生成的产物（demo 会自动重建）
+demo_00.png
+demo_01_data.csv
+demo_01_pendulum.png
+demo_02_arm.png
+demo_02_arm.mp4
+demo_03_dataset.npz
+demo_03_dataset.csv
+demo_03_views.png
+demo_04_panda.png
+demo_04_panda.mp4
+# demo_04_panda.gif 要提交，README 首屏用
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 手工备份文件
+*.bak
+*.bak2
+
+# 日志
+*.log
+
+# 本地依赖与下载缓存（可再生，不提交）
+node_modules/
+*.tar.gz
+*.tar
+
+# 注意：models/_tmp_so101/ 名字虽带 _tmp，但里面是 SO-101 的 XML 和 STL，
+# scene_full.py:64 直接引用，绝不能整体忽略。只忽略上面的压缩包。

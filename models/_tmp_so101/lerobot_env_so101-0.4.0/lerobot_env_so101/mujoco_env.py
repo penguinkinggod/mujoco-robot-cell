@@ -1,0 +1,468 @@
+#!/usr/bin/env python
+
+# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
+# Copyright 2026 Amane INOUE.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""SO-101 MuJoCo gym environment.
+
+Ported from lohpaul9/gym-hil (Apache-2.0, `SO-101` branch,
+https://github.com/huggingface/gym-hil/pull/36), authored by Paul Loh
+(github.com/lohpaul9). The Franka/Panda-specific ``FrankaGymEnv`` and the
+``RobotGymEnv`` abstract base (which only ever had one concrete
+implementation, SO-101) are not carried over; ``SO101GymEnv`` inherits
+directly from ``MujocoGymEnv``.
+"""
+
+import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal, Optional
+
+import gymnasium as gym
+import mujoco
+import numpy as np
+from gymnasium import spaces
+
+from lerobot_env_so101.gripper import normalized_to_ctrl
+from lerobot_env_so101.ik_control import control_point, roll_to_align_axis, solve_ik
+
+_logger = logging.getLogger(__name__)
+
+ASSETS_DIR = Path(__file__).parent / "assets"
+
+_ARM_JOINT_NAMES = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll")
+HOME_POSITION = np.zeros(len(_ARM_JOINT_NAMES), dtype=np.float64)
+CARTESIAN_BOUNDS = np.asarray([[0.1, -0.3, 0.0], [0.5, 0.3, 0.4]])
+_ZERO_ACTION_TOLERANCE = 1e-6
+
+_IK_DAMPING = 0.1
+_IK_ITERATIONS = 20
+
+# Axes of the ``gripperframe`` site: x runs out of the gripper along the jaws,
+# z runs from the fixed jaw toward the moving jaw.
+_APPROACH_AXIS = 0
+_JAW_AXIS = 2
+_ROLL_JOINT_NAME = "wrist_roll"
+_JAW_PAD_GEOM_NAMES = ("fixed_jaw_pad", "moving_jaw_pad")
+_GRIPPER_JOINT_NAME = "gripper"
+# Jaw angle in radians at which the two pads are parallel, 40 mm apart.
+_GRASP_JAW_ANGLE = 0.46
+# Top-down grasps hold the jaw axis along world y, so the jaws close on the
+# two faces of an axis-aligned block that the arm can straddle.
+_TOP_DOWN_JAW_DIRECTION = np.asarray([0.0, 1.0, 0.0])
+
+
+def grasp_point_offset(model: mujoco.MjModel, site_id: int) -> np.ndarray:
+    """Midpoint of the two fingertip pads at the grasp jaw angle, in the site frame.
+
+    ``gripperframe`` lies on the fixed jaw's inner face; this is the point
+    between the jaws that should sit on the block.
+    """
+    data = mujoco.MjData(model)
+    data.qpos[model.joint(_GRIPPER_JOINT_NAME).qposadr[0]] = _GRASP_JAW_ANGLE
+    mujoco.mj_forward(model, data)
+    midpoint = np.mean([data.geom_xpos[model.geom(name).id] for name in _JAW_PAD_GEOM_NAMES], axis=0)
+    return data.site_xmat[site_id].reshape(3, 3).T @ (midpoint - data.site_xpos[site_id])
+
+
+@dataclass(frozen=True)
+class GymRenderingSpec:
+    """Offscreen frame size and camera used for rendering.
+
+    ``camera_id`` of ``-1`` selects MuJoCo's free camera; pass a camera name
+    from the MJCF (for example ``"front"``) to render a fixed view.
+    """
+
+    height: int = 128
+    width: int = 128
+    camera_id: str | int = -1
+    mode: Literal["rgb_array", "human"] = "rgb_array"
+
+
+class MujocoGymEnv(gym.Env):
+    """A MuJoCo model wrapped in the gymnasium interface.
+
+    Owns the model, data, and renderer, and derives the number of physics
+    substeps per control step. Robot-specific control and the task loop belong
+    to subclasses.
+    """
+
+    def __init__(
+        self,
+        xml_path: Path,
+        seed: int = 0,
+        control_dt: float = 0.02,
+        physics_dt: float = 0.002,
+        render_spec: GymRenderingSpec = GymRenderingSpec(),  # noqa: B008
+    ):
+        """Load an MJCF model and configure the simulation timestep.
+
+        Args:
+            xml_path: Path to the MJCF scene.
+            seed: Seed for ``random_state``.
+            control_dt: Seconds of simulated time per control step.
+            physics_dt: MuJoCo integration timestep. The number of substeps per
+                control step is ``control_dt // physics_dt``.
+            render_spec: Frame height, width, and camera id used by
+                ``render()``.
+        """
+        self._model = mujoco.MjModel.from_xml_path(xml_path.as_posix())
+        self._model.vis.global_.offwidth = render_spec.width
+        self._model.vis.global_.offheight = render_spec.height
+        self._data = mujoco.MjData(self._model)
+        self._model.opt.timestep = physics_dt
+        self._control_dt = control_dt
+        self._n_substeps = int(control_dt // physics_dt)
+        self._random = np.random.RandomState(seed)
+        self._viewer: Optional[mujoco.Renderer] = None
+        self._render_specs = render_spec
+
+    def render(self) -> np.ndarray:
+        """Render one offscreen frame.
+
+        Returns:
+            An ``(height, width, 3)`` ``uint8`` array from the configured
+            camera.
+        """
+        if self._viewer is None:
+            self._viewer = mujoco.Renderer(
+                model=self._model,
+                height=self._render_specs.height,
+                width=self._render_specs.width,
+            )
+        self._viewer.update_scene(self._data, camera=self._render_specs.camera_id)
+        return self._viewer.render()
+
+    def close(self) -> None:
+        """Release graphics resources if they exist."""
+        viewer = self._viewer
+        if viewer is None:
+            return
+
+        if hasattr(viewer, "close") and callable(viewer.close):
+            try:
+                viewer.close()
+            except Exception:
+                # Teardown failures must not mask the caller's own cleanup, but a
+                # leaking GL context only shows up as slow growth over a long run.
+                _logger.debug("viewer.close() failed", exc_info=True)
+
+        self._viewer = None
+
+    @property
+    def model(self) -> mujoco.MjModel:
+        return self._model
+
+    @property
+    def data(self) -> mujoco.MjData:
+        return self._data
+
+    @property
+    def control_dt(self) -> float:
+        return self._control_dt
+
+    @property
+    def physics_dt(self) -> float:
+        return self._model.opt.timestep
+
+    @property
+    def random_state(self) -> np.random.RandomState:
+        return self._random
+
+
+class SO101GymEnv(MujocoGymEnv):
+    """SO-101 pick/place base environment: 4-DOF Cartesian position IK control.
+
+    Base class only: it implements robot control but not ``step()``/``reset()``.
+    Instantiate a task subclass such as ``SO101PickCubeGymEnv``.
+
+    Native action space is ``[dx, dy, dz, grasp]``. SO-101's 5-DOF arm cannot
+    independently track a 6-DOF Cartesian pose, so the IK controller solves for
+    position only and there are no orientation deltas to command. Use
+    ``lerobot_env_so101.wrappers.SevenDofToFourDofAdapter`` for teleop/HIL code
+    written against the upstream 7-dim convention.
+
+    Action deltas are unscaled metres, inherited from gym-hil's teleoperation
+    convention: an action of 1.0 saturates the workspace in a single step. See
+    "Known limitations" in the README before training a policy against this.
+
+    The grasp component is an absolute target in [0, 1] (0=closed, 1=open),
+    not a delta: it is written directly to the gripper actuator's ctrl each
+    step via ``lerobot_env_so101.gripper.normalized_to_ctrl``.
+    """
+
+    # Declared on the class because gymnasium validates render_mode against it
+    # at registration time, before any instance exists. render_fps depends on
+    # control_dt, so __init__ refines it per instance.
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 10}
+
+    def __init__(
+        self,
+        xml_path: Path | None = None,
+        seed: int = 0,
+        control_dt: float = 0.02,
+        physics_dt: float = 0.002,
+        render_spec: GymRenderingSpec = GymRenderingSpec(),  # noqa: B008
+        render_mode: Literal["rgb_array", "human"] = "rgb_array",
+        image_obs: bool = False,
+        home_position: np.ndarray = HOME_POSITION,
+        cartesian_bounds: np.ndarray = CARTESIAN_BOUNDS,
+        action_scale: float = 1.0,
+        top_down_ik: bool = False,
+        jaw_pads: bool = False,
+    ):
+        """Create the SO-101 base environment.
+
+        Args:
+            xml_path: MJCF scene to load. Defaults to the bundled
+                ``pick_scene.xml``.
+            seed: Seed for the environment's RNG.
+            control_dt: Seconds of simulated time per control step.
+            physics_dt: MuJoCo integration timestep.
+            render_spec: Frame height, width, and camera id used by
+                ``render()``.
+            render_mode: ``"rgb_array"`` or ``"human"``.
+            image_obs: Whether the task subclass should include a camera view
+                in its observation.
+            home_position: Arm joint configuration applied by
+                ``reset_robot()``.
+            cartesian_bounds: ``(2, 3)`` array of min/max end-effector target
+                positions. The IK target is clipped to this box every step.
+            action_scale: Metres per unit of position action. Must be
+                positive.
+            top_down_ik: Solve the IK for the grasp point between the jaws
+                with the gripper pointing straight down, instead of for the
+                ``gripperframe`` position alone. The action then moves the
+                grasp point.
+            jaw_pads: Enable collision on the box pads at the two fingertips.
+                MuJoCo collides the jaw meshes as convex hulls, which touch a
+                block at one point each; the pads give it flat faces to be
+                held by.
+
+        Raises:
+            ValueError: If ``action_scale`` is not positive.
+        """
+        if xml_path is None:
+            xml_path = ASSETS_DIR / "pick_scene.xml"
+
+        if action_scale <= 0.0:
+            raise ValueError(f"action_scale must be positive, got {action_scale}")
+
+        self._home_position = home_position
+        self._cartesian_bounds = cartesian_bounds
+        self._action_scale = action_scale
+        self._top_down_ik = top_down_ik
+
+        super().__init__(
+            xml_path=xml_path,
+            seed=seed,
+            control_dt=control_dt,
+            physics_dt=physics_dt,
+            render_spec=render_spec,
+        )
+
+        self.metadata = {
+            **self.metadata,
+            "render_fps": int(np.round(1.0 / self.control_dt)),
+        }
+        self.render_mode = render_mode
+        self.image_obs = image_obs
+
+        self._arm_dof_ids = np.asarray([self._model.joint(name).id for name in _ARM_JOINT_NAMES])
+        self._arm_ctrl_ids = np.asarray([self._model.actuator(name).id for name in _ARM_JOINT_NAMES])
+        self._gripper_ctrl_id = self._model.actuator("gripper").id
+        self._ee_site_id = self._model.site("gripperframe").id
+        if jaw_pads:
+            pad_ids = [self._model.geom(name).id for name in _JAW_PAD_GEOM_NAMES]
+            self._model.geom_contype[pad_ids] = 1
+            self._model.geom_conaffinity[pad_ids] = 1
+        self._roll_joint_id = self._model.joint(_ROLL_JOINT_NAME).id
+        self._roll_index = _ARM_JOINT_NAMES.index(_ROLL_JOINT_NAME)
+        self._ik_point_offset = (
+            grasp_point_offset(self._model, self._ee_site_id) if top_down_ik else None
+        )
+        self._camera_id = mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_CAMERA, "front")
+
+        self._target_ee_pos: np.ndarray | None = None
+        self._last_action_was_zero = False
+
+        base_obs_space = {
+            "agent_pos": spaces.Dict(
+                {
+                    "tcp_pose": spaces.Box(-np.inf, np.inf, shape=(7,), dtype=np.float32),
+                    "tcp_vel": spaces.Box(-np.inf, np.inf, shape=(6,), dtype=np.float32),
+                    "gripper_pose": spaces.Box(-1, 1, shape=(1,), dtype=np.float32),
+                }
+            )
+        }
+        if self.image_obs:
+            self.observation_space = spaces.Dict(
+                {
+                    **base_obs_space,
+                    "pixels": spaces.Dict(
+                        {
+                            "front": spaces.Box(
+                                low=0,
+                                high=255,
+                                shape=(self._render_specs.height, self._render_specs.width, 3),
+                                dtype=np.uint8,
+                            ),
+                        }
+                    ),
+                }
+            )
+        else:
+            self.observation_space = spaces.Dict(base_obs_space)
+
+        self.action_space = spaces.Box(
+            low=np.asarray([-1.0, -1.0, -1.0, 0.0], dtype=np.float32),
+            high=np.asarray([1.0, 1.0, 1.0, 1.0], dtype=np.float32),
+            dtype=np.float32,
+        )
+
+    def reset_robot(self):
+        """Reset the arm to the home position and resynchronize the IK target.
+
+        The IK target (``_target_ee_pos``) is an accumulated Python attribute
+        rather than a MuJoCo body, so it must be re-read from the end-effector
+        sensor here; otherwise it would still hold the target from before the
+        reset.
+        """
+        self._data.qpos[self._arm_dof_ids] = self._home_position
+        self._data.ctrl[self._arm_ctrl_ids] = self._home_position
+        mujoco.mj_forward(self._model, self._data)
+
+        self._target_ee_pos = self.ik_point_pos
+        self._last_action_was_zero = False
+
+    @property
+    def ik_point_pos(self) -> np.ndarray:
+        """World position of the point the action moves.
+
+        The ``gripperframe`` site by default, the grasp point between the jaws
+        with ``top_down_ik``.
+        """
+        return control_point(self._data, self._ee_site_id, self._ik_point_offset)
+
+    def _top_down_seed(self) -> np.ndarray:
+        """Current arm angles with wrist_roll turned to the top-down jaw direction.
+
+        The approach-axis constraint leaves the rotation about that axis free,
+        and the solver stays on the branch nearest its seed, so the seed is
+        what selects the jaw direction.
+        """
+        seed = self._data.qpos[self._arm_dof_ids].copy()
+        seed[self._roll_index] += roll_to_align_axis(
+            self._data,
+            self._ee_site_id,
+            self._roll_joint_id,
+            _JAW_AXIS,
+            _TOP_DOWN_JAW_DIRECTION,
+        )
+        roll_range = self._model.jnt_range[self._roll_joint_id]
+        seed[self._roll_index] = np.clip(seed[self._roll_index], roll_range[0], roll_range[1])
+        return seed
+
+    def apply_action(self, action: np.ndarray) -> None:
+        """Apply a native 4-dim action ``[dx, dy, dz, grasp]`` via position IK.
+
+        Position deltas are multiplied by ``action_scale`` (metres per unit
+        action); the grasp command is an absolute target in [0, 1]
+        (0=closed, 1=open), written directly to the gripper ctrl each step,
+        and is not scaled.
+
+        A near-zero position delta holds the current pose rather than the
+        accumulated target, so repeated zero actions do not drift toward an
+        overshot target.
+
+        Args:
+            action: Array of ``[dx, dy, dz, grasp]``. Position deltas are
+                clipped to the environment's Cartesian bounds after scaling.
+        """
+        x, y, z, grasp_command = action
+
+        # Zero-action detection uses the raw input so the hold-position
+        # behaviour does not depend on the configured scale.
+        raw_delta = np.asarray([x, y, z])
+        action_is_zero = np.linalg.norm(raw_delta) < _ZERO_ACTION_TOLERANCE
+        delta = raw_delta * self._action_scale
+
+        # On transition from motion to hold, lock the target to the current position
+        # instead of the last accumulated (and possibly overshot) target.
+        if action_is_zero and not self._last_action_was_zero:
+            self._target_ee_pos = self.ik_point_pos
+        elif not action_is_zero:
+            self._target_ee_pos = self._target_ee_pos + delta
+        self._last_action_was_zero = action_is_zero
+
+        self._target_ee_pos = np.clip(
+            self._target_ee_pos, self._cartesian_bounds[0], self._cartesian_bounds[1]
+        )
+
+        gripper_range = self._model.actuator("gripper").ctrlrange
+        self._data.ctrl[self._gripper_ctrl_id] = normalized_to_ctrl(grasp_command, gripper_range)
+
+        # The arm actuators are <position>: ctrl is a target angle held across
+        # the substeps, so the IK is solved once per control step.
+        target_q = solve_ik(
+            model=self._model,
+            data=self._data,
+            site_id=self._ee_site_id,
+            dof_ids=self._arm_dof_ids,
+            target_pos=self._target_ee_pos,
+            ik_method="levenberg_marquardt",
+            ik_damping=_IK_DAMPING,
+            ik_iterations=_IK_ITERATIONS,
+            seed_q=self._top_down_seed() if self._top_down_ik else None,
+            point_offset=self._ik_point_offset,
+            approach_axis=_APPROACH_AXIS if self._top_down_ik else None,
+        )
+        arm_ctrlrange = self._model.actuator_ctrlrange[self._arm_ctrl_ids]
+        self._data.ctrl[self._arm_ctrl_ids] = np.clip(target_q, arm_ctrlrange[:, 0], arm_ctrlrange[:, 1])
+
+        for _ in range(self._n_substeps):
+            mujoco.mj_step(self._model, self._data)
+
+    def get_robot_state(self):
+        """Get the current state of the robot."""
+        ee_pos = self._data.sensor("so101/ee_pos").data
+        qpos = self.data.qpos[self._arm_dof_ids].astype(np.float32)
+        qvel = self.data.qvel[self._arm_dof_ids].astype(np.float32)
+        gripper_pose = self.get_gripper_pose()
+
+        return np.concatenate([qpos, qvel, gripper_pose, ee_pos])
+
+    def get_gripper_pose(self):
+        """Gripper ctrl target normalized to [-1, 1]: -1 = fully closed, +1 = fully open."""
+        gripper_range = self._model.actuator("gripper").ctrlrange
+        gripper_pos = self._data.ctrl[self._gripper_ctrl_id]
+        normalized = 2 * (gripper_pos - gripper_range[0]) / (gripper_range[1] - gripper_range[0]) - 1
+        return np.array([normalized], dtype=np.float32)
+
+    def render(self) -> np.ndarray:
+        """Render the front camera view.
+
+        The renderer is built on first use: constructing it eagerly would open
+        an OpenGL context on every instantiation, which fails on a headless
+        host even for state-only training that never renders.
+        """
+        if self._viewer is None:
+            self._viewer = mujoco.Renderer(
+                model=self._model,
+                height=self._render_specs.height,
+                width=self._render_specs.width,
+            )
+        self._viewer.update_scene(self.data, camera=self._camera_id)
+        return self._viewer.render()

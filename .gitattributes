@@ -1,0 +1,15 @@
+# 仓库内统一 LF，工作区按平台自动处理
+* text=auto
+
+# 3D 资产 / 图像 / 压缩包：禁止任何换行转换
+# OBJ 是文本格式，若被当源码做 CRLF 转换，checkout 后字节会变，
+# 导致 mesh 校验和变化、以及"文件明明没改却显示 modified"。
+*.obj     binary
+*.stl     binary
+*.glb     binary
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.npz     binary
+*.tar.gz  binary
