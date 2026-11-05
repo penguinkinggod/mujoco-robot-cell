@@ -39,6 +39,7 @@ CORE_FILES = [
     "demo_08_pick_and_load.py",
     "demo_09_try_versions.py",
     "verify_all.py",
+    "diag_chuck_health.py",
 ]
 
 MACHINING_CODE = (
@@ -92,6 +93,20 @@ def check_chuck(out, err, rc):
         "OK" if held else "FAIL", "OK" if pull_ok else "FAIL")
 
 
+def check_chuck_health(out, err, rc):
+    m = re.search(
+        r"CHUCK_HEALTH jaw_spread_mm=([\d.]+) ecc_mm=([\d.]+) "
+        r"tilt_deg=([\d.]+) contacts=(\d+) reach_err_mm=([\d.]+)", out)
+    if not m:
+        return False, "no CHUCK_HEALTH line"
+    ecc, tilt = float(m.group(2)), float(m.group(3))
+    contacts, reach = int(m.group(4)), float(m.group(5))
+    good = (rc == 0 and "CHUCK_HEALTH PASS" in out
+            and ecc <= 1.0 and tilt <= 2.0
+            and contacts >= 6 and reach <= 10.0)
+    return good, "偏心%.2fmm 接触%d 可达%.1fmm" % (ecc, contacts, reach)
+
+
 CHECKS = [
     dict(name="语法检查", cmd=[PY, "-m", "py_compile"] + CORE_FILES,
          check=check_compile, slow=False, hint="秒级"),
@@ -101,6 +116,8 @@ CHECKS = [
          check=check_slot, slow=True, hint="约 3 秒"),
     dict(name="卡盘夹紧", cmd=[PY, "diag_chuck_grip.py"],
          check=check_chuck, slow=True, hint="约 2 秒"),
+    dict(name="卡盘工位体检", cmd=[PY, "diag_chuck_health.py"],
+         check=check_chuck_health, slow=True, hint="约 5 秒"),
     dict(name="完整序列 3/3", cmd=[PY, "demo_09_try_versions.py"],
          check=check_demo09, slow=True, hint="约 9 秒"),
 ]
