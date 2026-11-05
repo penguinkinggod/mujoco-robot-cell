@@ -38,3 +38,6 @@ node_modules/
 
 # 注意：models/_tmp_so101/ 名字虽带 _tmp，但里面是 SO-101 的 XML 和 STL，
 # scene_full.py:64 直接引用，绝不能整体忽略。只忽略上面的压缩包。
+
+# MuJoCo 运行日志（每次跑脚本都会重写，不入库）
+MUJOCO_LOG.TXT
