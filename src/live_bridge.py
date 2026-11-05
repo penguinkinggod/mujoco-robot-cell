@@ -37,6 +37,11 @@ OUT = os.path.join(ROOT, "_build")    # generated figures, not tracked
 STATE = os.path.join(OUT, "live_state.npy")
 TMP = os.path.join(OUT, "_live_tmp.npy")   # 必须以 .npy 结尾，否则 numpy 会自动补后缀
 
+# 画面里放哪一套场景。view 和 run 必须用同一套，否则同轴、接触这些
+# 指标是对着 V 槽算的，画面上却是平板爪 —— 看着抓住了，其实不是那只手。
+SCENE = dict(v_jaw=True, lift=True)
+RUN_ARGS = dict(carry_lock=False)      # 搬运段不用运动学锁，靠真实接触
+
 # 这些文件一变，说明「场景结构」变了，需要重编译模型。
 WATCH = ("scene_full.py", "scene_machining.py",
          "demo_08_pick_and_load.py", "diag_feed_chuck.py")
@@ -95,7 +100,7 @@ def view():
         sig = model_signature()
         try:
             Dm = reload_modules()
-            model = Dm.build_model()
+            model = Dm.build_model(**SCENE)
         except Exception as exc:                      # 改到一半的语法错误
             print("VIEW_RELOAD_WAIT %s: %s" % (type(exc).__name__, exc),
                   flush=True)
@@ -141,10 +146,12 @@ def view():
         print("VIEW_RELOAD scene source changed -> recompiling", flush=True)
 
 
-def run():
-    D.FRAME_EVERY = 20          # 每 20 步推一帧，画面连续不跳
-    model = D.build_model()
-    data = mujoco.MjData(model)
+def run(loop=False):
+    """跑仿真并把每帧关节值推给窗口。
+
+    没有这个进程，view 那个窗口只会停在初始姿态上 —— 它就是一只
+    「等着收帧」的手，没人推就一直不动。桌面 bat 两个都要起。
+    """
     frames = [0]
 
     def hook(tag, _m, d):
@@ -152,9 +159,26 @@ def run():
         frames[0] += 1
         time.sleep(0.015)
 
-    rc = D.main(frame_hook=hook, model=model, data=data)
-    print("PUSH_DONE frames=%d rc=%d" % (frames[0], rc), flush=True)
-    return rc
+    while True:
+        try:
+            D.FRAME_EVERY = 20          # reload 会把模块常量还原成 60
+            model = D.build_model(**SCENE)
+            data = mujoco.MjData(model)
+            rc = D.main(frame_hook=hook, model=model, data=data,
+                        **SCENE, **RUN_ARGS)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            print("RUN_ERROR %s: %s" % (type(exc).__name__, exc), flush=True)
+            rc = 1
+        print("PUSH_DONE frames=%d rc=%d" % (frames[0], rc), flush=True)
+        if not loop:
+            return rc
+        time.sleep(1.5)         # 喘口气再跑一遍，窗口不会一下停住
+        for name in RELOAD_ORDER:      # 循环时热点改代码也能生效
+            if name in sys.modules:
+                importlib.reload(sys.modules[name])
+        globals()["D"] = sys.modules["diag_feed_chuck"]
 
 
 if __name__ == "__main__":
@@ -162,6 +186,6 @@ if __name__ == "__main__":
     if mode == "view":
         raise SystemExit(view())
     if mode == "run":
-        raise SystemExit(run())
-    print("usage: live_bridge.py view|run")
+        raise SystemExit(run(loop="--loop" in sys.argv))
+    print("usage: live_bridge.py view|run [--loop]")
     raise SystemExit(2)
