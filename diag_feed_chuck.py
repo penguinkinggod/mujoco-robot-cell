@@ -97,24 +97,102 @@ CRADLE_LEN = 0.060       # 托条沿工件轴向的长度
 
 
 def add_grip_fix(spec, kind="cradle"):
-    """Give the gripper a support bar under the pads (form closure).
+    """Optional gripper patches, selected for measurement, not by taste.
 
-    Two flat pads on a plain cylinder touch along ONE line. Gravity then
-    rotates the shaft about that line until it hangs 40-55 deg off axis
-    (measured: exp_plain_cyl.py), which is why a bare cylinder "won't sit".
-    A bar under the pads carries the weight, so the pads only have to stop
-    the shaft sliding sideways -- no friction-dependent balance.
+    Why a plain cylinder still fails after deleting the flat and the slot
+    (measured this session, exp_pad_align.py + exp_pad_friction.py):
 
-    Geometry is resolved at the real grasp orientation (wrist_roll fixed),
-    then written into the gripper body frame, because a local +x offset
-    means different world directions depending on wrist roll.
+    1. NOT friction. Sweeping the pad mu 0.1/0.3/0.8 gives literally
+       identical tilt (41.2 / 56.3 deg) -> the contact is not sliding.
+    2. NOT the pad's own 26.4 deg twist. Counter-rotating the moving pad
+       to be parallel at the working aperture buys 11 deg (56.3 -> 44.9).
+    3. It is the CONTACT LENGTH ALONG THE SHAFT. A 14.4 mm patch pressed
+       on a Phi20 x 160 mm rod resists a tipping couple of only
+       N * 7 mm ~ 0.08 N.m, while the rod's own weight hung 10 mm below
+       the contact line needs ~0.02-0.04 N.m. So the rod swings like a
+       pendulum until it is nearly vertical (measured 87-118 deg).
+    "long" fixes the cause: extend both pads 40 mm along the shaft, which
+    raises the tipping couple ~3x and spreads the squeeze over the rod.
     """
     if kind in ("v", "both"):
         _add_v_jaw(spec)
     if kind in ("cradle", "both"):
         _add_cradle(spec)
-    if kind not in ("v", "cradle", "both"):
+    if kind in ("long", "long_both"):
+        _add_long_pads(spec)
+    if kind not in ("v", "cradle", "both", "long", "long_both"):
         raise ValueError("unknown grip_fix: %r" % (kind,))
+
+
+def _add_long_pads(spec, length=0.040, tall=0.018, thick=0.0010):
+    """Extend both pads along the shaft axis, so tipping needs a real couple.
+
+    The extension is oriented in WORLD space (long axis along the shaft),
+    not along the pad, because the hand's own orientation is misaligned by
+    30-50 deg at the grasp pose -- copying the pad's frame would just copy
+    that error. That is the one advantage of building geometry instead of
+    tuning the arm: we can choose the contact orientation outright.
+    """
+    tmp = spec.compile()
+    td = mujoco.MjData(tmp)
+    jid = lambda n: mujoco.mj_name2id(tmp, mujoco.mjtObj.mjOBJ_JOINT, n)
+    gid = lambda n: mujoco.mj_name2id(tmp, mujoco.mjtObj.mjOBJ_GEOM, n)
+
+    td.qpos[:] = 0.0
+    td.qpos[tmp.jnt_qposadr[jid("gripper")]] = 0.17
+    td.qpos[tmp.jnt_qposadr[jid("wrist_roll")]] = 1.55
+    # 把工件放到卡盘轴线上（与送料时的实际抓取位置一致）
+    sj = jid("shaft_free")
+    td.qpos[tmp.jnt_qposadr[sj]:tmp.jnt_qposadr[sj] + 3] = F.SHAFT_POS
+    mujoco.mj_forward(tmp, td)
+    shaft_z = float(td.qpos[tmp.jnt_qposadr[sj] + 2])
+
+    p_fix = td.geom_xpos[gid("fixed_jaw_pad")].copy()
+    p_mov = td.geom_xpos[gid("moving_jaw_pad")].copy()
+    close_dir = p_mov - p_fix
+    close_dir /= np.linalg.norm(close_dir)
+
+    for name, other in (("fixed_jaw_pad", "moving_jaw_pad"),
+                        ("moving_jaw_pad", "fixed_jaw_pad")):
+        i = gid(name)
+        body = tmp.geom_bodyid[i]
+        Rb = td.xmat[body].reshape(3, 3)
+        pb = td.xpos[body].copy()
+        Rw = td.geom_xmat[i].reshape(3, 3)
+
+        # 本指垫朝另一片的法向
+        n = (td.geom_xpos[gid(other)] - td.geom_xpos[i])
+        n /= np.linalg.norm(n)
+        L = np.array([1.0, 0.0, 0.0])            # 沿轴
+        L = L - n * (L @ n)
+        L /= np.linalg.norm(L)
+        H = np.cross(n, L)                        # 右手系：x=n, y=L, z=H
+        if H[2] < 0:                              # 让 z 朝上，别把 40 mm 竖起来
+            L, H = -L, -H
+
+        R_des = np.column_stack([n, L, H])        # x=厚 y=沿轴 z=上下
+        # 贴在指垫内表面：沿 n 偏移半个板厚 + 原指垫半厚
+        face = td.geom_xpos[i] + n * float(tmp.geom_size[i][0])
+        pos_w = face + n * (thick / 2)
+        pos_w[2] = shaft_z                        # 与轴心等高，不要夹在轴肩上方
+
+        R_local = Rb.T @ R_des
+        q = np.zeros(4)
+        mujoco.mju_mat2Quat(q, np.ascontiguousarray(R_local).reshape(-1))
+
+        b = next(bb for bb in spec.bodies if bb.name ==
+                 mujoco.mj_id2name(tmp, mujoco.mjtObj.mjOBJ_BODY, body))
+        g = b.add_geom()
+        g.name = "longpad_%s" % ("fix" if "fixed" in name else "mov")
+        g.type = mujoco.mjtGeom.mjGEOM_BOX
+        g.size = [thick / 2, length / 2, tall / 2]
+        g.pos = Rb.T @ (pos_w - pb)
+        g.quat = q
+        g.rgba = [0.85, 0.08, 0.12, 1.0]
+        g.contype, g.conaffinity = F.CT_ROBOT
+        print("    grip_fix: %s %.0f x %.0f x %.0f mm at local %s"
+              % (g.name, thick * 1000, length * 1000, tall * 1000,
+                 np.round(g.pos, 4)))
 
 
 def _add_v_jaw(spec, half_angle_deg=45.0, arm=0.006):
