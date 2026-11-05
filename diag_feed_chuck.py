@@ -2,60 +2,72 @@
 
 STATUS 2026-11-05: PASS. Wired into verify_all.py CHECKS.
 
-SCOPE: TWO EXPLICIT SIMPLIFICATIONS -- do NOT read this as full physics
+SCOPE: ONE EXPLICIT SIMPLIFICATION -- do NOT read this as full physics
 ---------------------------------------------------------------------
-1. The milled D-flat is a ROUGH collision proxy, not an accurate shape.
-   scene_full.py keeps shaft_flat visual-only (contype=0) because the box
-   corners stick ~3.1 mm past the D20 envelope and wreck the slot-drop
-   tests. Here the flat is patched to CT_WORK as a LOCAL change. Its only
-   job is to stop the cylinder rolling; the exact shape is deliberately
-   left for later ("具体形状后面再优化"). Do not copy this patch into
-   scene_full.py without re-running diag_slot_alone.py and demo_09.
+The CARRY is KINEMATIC. From the centring stage until the chuck has
+clamped, every step writes the shaft qpos/quat back to
+(world pin / site, SHAFT_Q0) and zeroes qvel. This ASSUMES the gripper
+has perfect form closure. It does NOT prove the real gripper can hold the
+shaft -- two flat pads on a D20 rod touch along one line, so the rod
+pivots about it. The lock is released BEFORE any load test, and
+FEED_METRIC reports that fact so nobody can quietly extend it through the
+pull-out and fake a pass.
 
-2. The CARRY is KINEMATIC. From the centring stage until the chuck has
-   clamped, every step writes the shaft qpos/quat back to
-   (pad_center - lock_offset, SHAFT_Q0) and zeroes qvel. This ASSUMES the
-   gripper has perfect form closure. It does NOT prove the real gripper
-   can hold the shaft -- see "Known open defect" below. The lock is
-   released BEFORE the load tests, and FEED_METRIC reports that fact so
-   nobody can quietly extend it through the pull-out and fake a pass.
+The workpiece is a PLAIN CYLINDER (no milled flat, no slot platform).
+That is a deliberate choice, not an omission -- see HANDOFF section 16 for
+why the flat and the fixture were deleted and what it cost.
 
 What this DOES prove: given a shaft delivered on-axis and correctly
 oriented, the chuck station can centre it, clamp it, hold it against
 gravity and resist a 20 N pull-out AFTER the robot has fully retreated.
 
-Evidence chain (controlled rounds, this session)
------------------------------------------------
-- Making the D-flat a real collision geom cuts first-pad-contact tilt
-  23.6 -> 4.1 deg. With the flat left visual-only the whole feed collapses
-  (final coax 1134 / 1215 mm, shaft ejected to x=-34 m). The flat is
-  REQUIRED, not cosmetic.
+Evidence chain (controlled rounds)
+----------------------------------
+Grasp orientation:
+- With the plain cylinder the real grasp used to come up 43.8 deg off
+  axis, because the arm stopped 25-37 mm short under load and never
+  reached the descend target. move3() now integrates the measured error
+  back into the commanded target (re-sending the same absolute point just
+  lands on the same droop): residual 24.8 -> 1.2 mm, grasp tilt 43.8 ->
+  2.5 deg.
+
+Hand-over to the chuck (this is where the flow actually broke):
+- GRIP_CLOSE while the jaws close: robot and chuck fight for one shaft,
+  the losing servo drags the pads 6.46 mm off axis.
+- GRIP_OPEN with the lock anchored on the gripperframe site: the jaws
+  push the shaft into the still-open pads, the arm gives way 12.07 mm and
+  carries the shaft with it.
+- Working order: pin the shaft in WORLD space, back the arm 55 mm clear,
+  then let the jaws close on a shaft that nothing else touches.
+  coax 1.05 mm, tilt 0.0 deg, contacts 6 (2+2+2), pull-out 0.00 mm.
+
+Chuck jaws:
+- JAW_LEN 28 -> 55 mm. A 28 mm jaw lets the 80 mm rod pivot like a ball
+  joint: 6 contacts at clamp, one jaw lets go on release (4), axis
+  10.9 deg off, 20 N pull-out ejects the shaft 4172 mm. 55 mm holds it.
+- CHUCK_CLAMP_CTRL -0.009 -> -0.010. Less (0.003-0.007) leaves the rod
+  loose in the jaws (tilt 15-18 deg); more (-0.014) shoves it 7.34 mm
+  off-centre and one jaw leaves the surface entirely.
+- Longer jaws reach 27 mm further out, so diag_chuck_health's "gripper
+  stops outside the chuck" probe moved from -70 to -90 mm (13.78 -> 7.91).
+
+Earlier rounds, kept because they still bind:
 - scene_full.py sets NO spec.option, while scene_machining.py sets
   noslip_iterations=10 / noslip_tolerance=0 / cone=ELLIPTIC / impratio=5.
   Applying those from the start breaks the grasp, whose constants were
-  tuned under the defaults (shaft flies to x=-34 m). Patching only the
-  friction-relevant fields into model.opt AT THE CLAMP STAGE raises total
-  jaw normal force 8.4 -> 18.7 N (the independent chuck scene measures
-  18.2 N) and drops 20 N pull-out from 1522 mm to 0.62 mm.
+  tuned under the defaults. Patching only the friction-relevant fields
+  into model.opt AT THE CLAMP STAGE raises total jaw normal force
+  8.4 -> 18.7 N and drops 20 N pull-out from 1522 mm to 0.62 mm.
 - Retreat bug: the move helper used to write CHUCK_OPEN_CTRL on every
   step, so retreating OPENED the chuck and dropped the shaft (coax 50.85
-  mm). Passing CHUCK_CLAMP_CTRL for the retreat fixes it (coax 3.05 mm).
-- Ruled out by controlled scans: tighter clamp alone (-0.011 / -0.013 /
-  -0.015) raises force to 21.4 N but pull-out stays 4713..35460 mm;
-  higher pad friction; static closed-loop pose correction; moving the
-  chuck in x/y; lower lift; two-stage clamp order; wrist_roll 0/0.8/2.4/3.14.
+  mm). Passing CHUCK_CLAMP_CTRL for the retreat fixes it.
 
-Known open defect (NOT solved here, do not close)
--------------------------------------------------
-Unassisted grasp: the real collision shape is a smooth cylinder and at
-WRIST_ROLL_GRASP=1.55 the pad line [0.64, 0.768, 0.006] meets the shaft
-axis at ~50 deg. The shaft hangs ~11 mm below the pad centre on friction
-alone and swings to vertical; measured tilt grows 0.9 -> 23.6 -> 43.8 ->
-57.7 -> 98.2 deg through approach/descend/close/centre/lift. demo_09's
-3/3 never checks orientation, so a vertical stick dropped in the slot
-still "passes". Fix the grasp (real flat geometry / levelled pads /
-cradle from below), add an orientation check to demo_09, and ONLY THEN
-delete the kinematic lock. Deleting the lock first reintroduces the bug.
+Still open, do not close: the carry is a kinematic lock. Two flat pads on
+a cylinder are a LINE contact and cannot resist the tipping couple, which
+is why the rod still hangs rather than being gripped. demo_09's 3/3 also
+never checks orientation, so a vertical stick dropped in the slot still
+"passes". A real fix is a jaw that closes around the diameter (V block or
+bored soft jaws), not more tuning of the arm.
 
 Pass/fail thresholds (written down BEFORE any of the scans)
 -----------------------------------------------------------
@@ -118,81 +130,13 @@ def add_grip_fix(spec, kind="cradle"):
         _add_v_jaw(spec)
     if kind in ("cradle", "both"):
         _add_cradle(spec)
-    if kind in ("long", "long_both"):
-        _add_long_pads(spec)
-    if kind not in ("v", "cradle", "both", "long", "long_both"):
+    # "long" (stretch the pads along the shaft) was tried and REJECTED:
+    # it dropped closing tilt 41 -> 20 deg but the shaft then flipped to
+    # 107 deg and no aperture lifted it. Adding plates is the wrong lever;
+    # the real fix was the hand-over order plus longer CHUCK jaws. See
+    # HANDOFF section 16.
+    if kind not in ("v", "cradle", "both"):
         raise ValueError("unknown grip_fix: %r" % (kind,))
-
-
-def _add_long_pads(spec, length=0.040, tall=0.018, thick=0.0010):
-    """Extend both pads along the shaft axis, so tipping needs a real couple.
-
-    The extension is oriented in WORLD space (long axis along the shaft),
-    not along the pad, because the hand's own orientation is misaligned by
-    30-50 deg at the grasp pose -- copying the pad's frame would just copy
-    that error. That is the one advantage of building geometry instead of
-    tuning the arm: we can choose the contact orientation outright.
-    """
-    tmp = spec.compile()
-    td = mujoco.MjData(tmp)
-    jid = lambda n: mujoco.mj_name2id(tmp, mujoco.mjtObj.mjOBJ_JOINT, n)
-    gid = lambda n: mujoco.mj_name2id(tmp, mujoco.mjtObj.mjOBJ_GEOM, n)
-
-    td.qpos[:] = 0.0
-    td.qpos[tmp.jnt_qposadr[jid("gripper")]] = 0.17
-    td.qpos[tmp.jnt_qposadr[jid("wrist_roll")]] = 1.55
-    # 把工件放到卡盘轴线上（与送料时的实际抓取位置一致）
-    sj = jid("shaft_free")
-    td.qpos[tmp.jnt_qposadr[sj]:tmp.jnt_qposadr[sj] + 3] = F.SHAFT_POS
-    mujoco.mj_forward(tmp, td)
-    shaft_z = float(td.qpos[tmp.jnt_qposadr[sj] + 2])
-
-    p_fix = td.geom_xpos[gid("fixed_jaw_pad")].copy()
-    p_mov = td.geom_xpos[gid("moving_jaw_pad")].copy()
-    close_dir = p_mov - p_fix
-    close_dir /= np.linalg.norm(close_dir)
-
-    for name, other in (("fixed_jaw_pad", "moving_jaw_pad"),
-                        ("moving_jaw_pad", "fixed_jaw_pad")):
-        i = gid(name)
-        body = tmp.geom_bodyid[i]
-        Rb = td.xmat[body].reshape(3, 3)
-        pb = td.xpos[body].copy()
-        Rw = td.geom_xmat[i].reshape(3, 3)
-
-        # 本指垫朝另一片的法向
-        n = (td.geom_xpos[gid(other)] - td.geom_xpos[i])
-        n /= np.linalg.norm(n)
-        L = np.array([1.0, 0.0, 0.0])            # 沿轴
-        L = L - n * (L @ n)
-        L /= np.linalg.norm(L)
-        H = np.cross(n, L)                        # 右手系：x=n, y=L, z=H
-        if H[2] < 0:                              # 让 z 朝上，别把 40 mm 竖起来
-            L, H = -L, -H
-
-        R_des = np.column_stack([n, L, H])        # x=厚 y=沿轴 z=上下
-        # 贴在指垫内表面：沿 n 偏移半个板厚 + 原指垫半厚
-        face = td.geom_xpos[i] + n * float(tmp.geom_size[i][0])
-        pos_w = face + n * (thick / 2)
-        pos_w[2] = shaft_z                        # 与轴心等高，不要夹在轴肩上方
-
-        R_local = Rb.T @ R_des
-        q = np.zeros(4)
-        mujoco.mju_mat2Quat(q, np.ascontiguousarray(R_local).reshape(-1))
-
-        b = next(bb for bb in spec.bodies if bb.name ==
-                 mujoco.mj_id2name(tmp, mujoco.mjtObj.mjOBJ_BODY, body))
-        g = b.add_geom()
-        g.name = "longpad_%s" % ("fix" if "fixed" in name else "mov")
-        g.type = mujoco.mjtGeom.mjGEOM_BOX
-        g.size = [thick / 2, length / 2, tall / 2]
-        g.pos = Rb.T @ (pos_w - pb)
-        g.quat = q
-        g.rgba = [0.85, 0.08, 0.12, 1.0]
-        g.contype, g.conaffinity = F.CT_ROBOT
-        print("    grip_fix: %s %.0f x %.0f x %.0f mm at local %s"
-              % (g.name, thick * 1000, length * 1000, tall * 1000,
-                 np.round(g.pos, 4)))
 
 
 def _add_v_jaw(spec, half_angle_deg=45.0, arm=0.006):
@@ -311,6 +255,10 @@ def main(frame_hook=None, model=None, data=None):
     shaft_joint = gid(mujoco.mjtObj.mjOBJ_JOINT, "shaft_free")
     sq = model.jnt_qposadr[shaft_joint]
     sv = model.jnt_dofadr[shaft_joint]
+    # Depth measured: -0.030 (shaft centred in the jaws) lets the jaws
+    # shove it 16.9 mm off axis and then spit it out; -0.008 puts the
+    # tail 40 mm outside the jaws and it sags 10.6 deg; -0.016 is the
+    # balance that centres and holds it.
     axis = np.array([LATHE_ORIGIN[0] - 0.016,
                      LATHE_ORIGIN[1], LATHE_ORIGIN[2]])
     shaft_geoms = [
@@ -345,11 +293,28 @@ def main(frame_hook=None, model=None, data=None):
         return contacts, force
 
     arm = Arm(model, data)
-    state = {"offset": None, "lock_active": True}
+    state = {"offset": None, "off_site": None, "abs_pos": None,
+             "lock_active": True}
 
     def lock():
-        """Kinematic carry: assume a perfect gripper, keep the shaft axial."""
-        data.qpos[sq:sq + 3] = arm.pad_center() - state["offset"]
+        """Kinematic carry: assume a perfect gripper, keep the shaft axial.
+
+        Two reference frames, because the fingers change the answer:
+        - carry: pad_center - offset. The robot IS holding the shaft, and
+          both move together, so the pad centre is the natural anchor.
+        - clamp: gripperframe site + off_site. Opening the fingers moves
+          pad_center, and anchoring there would drag the shaft sideways
+          with it (measured: coax 1.05 -> 27.95 mm the moment the robot
+          let go). The site does not move when the fingers open.
+        """
+        if state["abs_pos"] is not None:
+            # Hand-over mode: the shaft is pinned in WORLD space while the
+            # arm backs away, so the arm cannot drag it.
+            data.qpos[sq:sq + 3] = state["abs_pos"]
+        elif state["off_site"] is not None:
+            data.qpos[sq:sq + 3] = data.site_xpos[arm.site] + state["off_site"]
+        else:
+            data.qpos[sq:sq + 3] = arm.pad_center() - state["offset"]
         data.qpos[sq + 3:sq + 7] = SHAFT_Q0
         data.qvel[sv:sv + 6] = 0.0
 
@@ -391,12 +356,30 @@ def main(frame_hook=None, model=None, data=None):
         return float(np.linalg.norm(arm.pad_center() - np.asarray(target)))
 
     def move3(target, ns, grip, locked,
-              jaw_ctrl=SM.CHUCK_OPEN_CTRL):
-        for _ in range(3):
-            err = move(np.asarray(target), max(90, ns // 3),
-                       grip, locked, jaw_ctrl)
-            if err < 0.005:
+              jaw_ctrl=SM.CHUCK_OPEN_CTRL, iters=8):
+        """Iterate until the pads actually reach the goal -- by MOVING THE GOAL.
+
+        Re-sending the same absolute target is useless under load: the
+        position servos settle at the same droop every time. Measured this
+        session, carrying the 197 g shaft toward the chuck:
+        aim (184,120,60) -> pads stop 24.8 mm short; the retry loop did
+        fire (3x) and landed on the same point, so the shaft arrived at
+        z = 94.7 mm instead of 60 mm and never entered the jaws.
+
+        So each round adds (goal - measured) to the commanded target.
+        That is plain integral compensation, not a physical shortcut --
+        the arm still has to hold the load, it just aims higher.
+        """
+        goal = np.asarray(target, dtype=float)
+        tgt = goal.copy()
+        err = float(np.linalg.norm(arm.pad_center() - goal))
+        for _ in range(iters):
+            if err < 0.003:
                 break
+            move(tgt, max(90, ns // 3), grip, locked, jaw_ctrl)
+            err = float(np.linalg.norm(arm.pad_center() - goal))
+            # 0.8 damping: full step overshoots once the load unloads
+            tgt = tgt + 0.8 * (goal - arm.pad_center())
         return err
 
     def settle(n, jaw_ctrl, grip, locked=False):
@@ -480,14 +463,32 @@ def main(frame_hook=None, model=None, data=None):
     model.opt.noslip_iterations = 10
     model.opt.noslip_tolerance = 0.0
 
-    settle(700, SM.CHUCK_CLAMP_CTRL, GRIP_CLOSE, locked=True)
+    # Hand the shaft over BEFORE the jaws close. With GRIP_CLOSE the
+    # robot keeps holding the same shaft the jaws are closing on, the two
+    # clamps fight, and the losing servo drags everything 6.46 mm off axis
+    # (measured). Release the fingers first, re-anchor the lock on the
+    # gripperframe site, then let the jaws close on a shaft that nothing
+    # else is pulling.
+    # Hand-over, in this exact order, because the earlier orders failed:
+    # 1) pin the shaft in world space (nothing can drag it now)
+    # 2) back the arm away, so the pads stop touching the shaft
+    # 3) let the jaws close on a shaft that has no other force on it
+    # With GRIP_CLOSE the robot and the chuck fought for the same shaft and
+    # the losing servo dragged the pads 6.46 mm off axis; with GRIP_OPEN but
+    # the lock anchored on the gripperframe site, the jaws pushed the shaft
+    # into the still-open pads, the arm gave way 12.07 mm and carried the
+    # shaft with it (both measured).
+    state["abs_pos"] = shaft().copy()
+    settle(700, SM.CHUCK_CLAMP_CTRL, GRIP_OPEN, locked=True)
+    move3(np.array([axis[0] + 0.055, axis[1], axis[2] + 0.015]),
+          200, GRIP_OPEN, True, SM.CHUCK_CLAMP_CTRL)
     print("  卡爪夹紧(锁) 轴=%s 同轴=%5.2f mm 接触=%d"
           % (np.round(shaft(), 4), coax(), jaw_state()[0]))
     tick("⑨ 三爪夹紧｜单丝杠联动")
 
     # Hand the shaft back to PHYSICS before any load test.
     state["lock_active"] = False
-    settle(400, SM.CHUCK_CLAMP_CTRL, GRIP_CLOSE)
+    settle(1600, SM.CHUCK_CLAMP_CTRL, GRIP_OPEN)
     print("  解锁静置     轴=%s 同轴=%5.2f mm 倾斜=%5.1f deg 接触=%d"
           % (np.round(shaft(), 4), coax(),
              tilt_deg(data.qpos[sq + 3:sq + 7]), jaw_state()[0]))

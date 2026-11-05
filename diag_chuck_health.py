@@ -226,10 +226,13 @@ def main():
 
     # The gripper STOPS outside the chuck and lets the shaft front reach in.
     # At only 30 mm from the mouth the pads collide with the jaws: measured
-    # 85.68 mm residual at z=0.06. At 70 mm it is 9.08 mm. Raising the
-    # chuck to z=0.14 would give 6.54 mm, but that needs a spindle housing.
+    # 85.68 mm residual at z=0.06. At 70 mm it was 9.08 mm -- but that was
+    # with 28 mm jaws. The jaws are now 55 mm long (they need the length to
+    # stop the shaft pivoting: see scene_machining.JAW_LEN), so they reach
+    # 27 mm further out and the pads hit them again (13.78 mm at 70 mm).
+    # 90 mm is the same clearance as before, measured from the new jaw tip.
     mouth = np.array(
-        [S.LATHE_X - 0.070, S.LATHE_Y, S.LATHE_Z])
+        [S.LATHE_X - 0.090, S.LATHE_Y, S.LATHE_Z])
     for _ in range(3):
         err = arm.move_to(mouth, n_steps=300, grip=GRIP_OPEN,
                           wrist_roll=WRIST_ROLL_GRASP)
