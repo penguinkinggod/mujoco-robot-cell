@@ -20,13 +20,43 @@
 抓取倾角       2.5°        手臂交接时的姿态误差
 ```
 
-`verify_all.py` **7/7 PASS，20.5 秒**，纯 CPU。
+`verify_all.py` **8/8 PASS，27 秒**，纯 CPU。
 
 *Coaxiality 1.05 mm · tilt 0.0° · 6 contacts · 0.00 mm sink under gravity · 0.00 mm pull-out under 20 N · 21.2 N grip force · 2.5° grasp tilt.*
 
 ---
 
 ## 最近在做什么
+
+> **2026-11-06** · 工件真的被抓住了：搬运段拿掉运动学锁，8/8 通过
+
+以前 7/7 里的搬运段是把工件**钉**在手上的，夹爪其实什么都没夹住。
+今天把这件事做实了，全物理跑通：
+
+```
+同轴 0.94 mm · 轴向偏 0.0° · 三爪接触 6 点
+重力下沉 0.00 mm · 20 N 拉拔 0.92 mm · 三爪力 21.1 N
+carry = physics（无锁）
+```
+
+`python src/diag_feed_chuck.py --v-jaw --lift --no-lock`
+
+根因是三个叠在一起的几何错误，**每一个单独看都像"摩擦不够"**：
+
+1. **手指闭合方向斜着搓工件。** `wrist_roll = 1.55` 下活动指行程是
+   `[16.3, 25.6, 4.5] mm`——一半在顺着工件轴向推。量化后发现 1.55 有
+   50% 行程沿轴，−0.95 只有 12%。改成 −0.95。
+2. **两片指垫根本不在同一轴向位置。** 原装 SO-101 固定指面比活动指面
+   靠后 **14.8 mm**，各自切一个 V 槽，两个槽口就沿轴错开 **15.4 mm**，
+   夹爪是在"啃"圆柱不是"托"圆柱。把两个槽口统一到同一轴向工位后
+   错开降到 1.9 mm，轴线偏离 20° → 4.3°。
+3. **瞄准点随开合漂。** 只有一片指在动，两片指垫的中点每次开合会滑
+   **21 mm**。手臂瞄准工件，闭合后爪子却落在旁边 21 mm。把两个抓取
+   参考点都钉在不动的那片指上（TCP 恒定），瞄准误差归零。
+
+还有个隐蔽的坑：中途读到的"倾斜 77°"是圆柱**绕自身轴滚转**，
+不是轴线歪了——卡盘一夹就回到 0°。判据必须用轴线方向，不能用四元数
+转角，否则会去修一个不存在的问题。
 
 > **2026-11-05** · 21 次提交 · 从 6/7 修回 7/7
 
@@ -48,7 +78,7 @@
 
 | 工位 | 状态 | 靠什么 | 目录 |
 |---|---|---|---|
-| **车床上下料** | ✅ 7/7 通过 | 手写 IK + 位置伺服 | `src/scene_machining.py` |
+| **车床上下料** | ✅ 8/8 通过 | 手写 IK + 位置伺服 | `src/scene_machining.py` |
 | 视觉引导抓取 | ○ 下一步 | 相机标定 + 位姿估计 | 计划 `scenes/vision_pick/` |
 | 手势遥操作 | ○ 计划 | 手部关键点 → 末端映射 | 计划 `teleop/` |
 | 视频示教 / 模仿学习 | ○ 计划 | BC / ACT 训练 | 计划 `learning/` |
@@ -158,14 +188,18 @@ scene_vision      识别 → 定位 → 抓取 → 验证          （计划）
 - **夹紧量有窗口**：`-0.003` 太松（倾斜 18°），`-0.014` 太紧（把轴挤偏 7.34 mm），`-0.010` 可用。扫了 4 档。
 - **摩擦不是主因**：怀疑指垫太光滑，扫了摩擦系数——不是。两片平板夹圆柱只有**线接触**，扛不住倾覆力矩。
 
-完整工程日志在 [`HANDOFF.md`](HANDOFF.md)，713 行，含所有失败版本和当时数字。
+完整工程日志在 [`HANDOFF.md`](HANDOFF.md)，935 行，含所有失败版本和当时数字。
 
 ---
 
 ## 已知限制（诚实写清楚，比吹牛有用）
 
-1. **搬运段仍用 `kinematic_lock`。** 手臂拎着工件走时 `qpos` 被钉住，等于假设"手已经抓住了"。这一段没有真物理。
-2. **抓取靠摩擦，不是形封闭。** 倾角 2.5°（原 43.8°），但工件本质还是"吊在指垫下面靠摩擦"。要真解决得换爪型——V 块或按直径镗的软爪。
+1. **默认路径的搬运段仍用 `kinematic_lock`。** 8/8 里第 7 项（默认 flat pad）
+   仍是钉住的，第 8 项（`--v-jaw --lift --no-lock`）才是全物理。默认值没换，
+   是因为 7 项旧判据都建立在旧数字上，换默认会把历史对比打断。
+2. **全物理那组是"V 槽 + μ=0.05 + 加大夹紧力"换来的。** 41 N 正压力 × 0.05
+   = 2.05 N 摩擦，对上 1.93 N 自重刚好只够吊住，所以夹紧量必须给到 −0.10。
+   真实车间的钢-尼龙摩擦是 0.2~0.3，这里仍偏保守。
 3. **`demo_09` 的 3/3 不检查姿态。** 只验位置，工件歪着放进去也算过。
 4. **没有 sim-to-real。** 无真机、无标定、无参数迁移。
 5. **没有自动避障。** 路点是手给的，没有规划器。
@@ -218,12 +252,36 @@ mujoco-robot-cell/
 - [ ] 相机标定 + 视觉引导抓取
 - [ ] 手势遥操作（手部关键点 → 末端映射）
 - [ ] 遥操作数据采集 + BC/ACT 训练
-- [ ] 换 V 块爪 / 软爪，把搬运段从 `kinematic_lock` 拿掉
+- [x] 换 V 块爪，把搬运段从 `kinematic_lock` 拿掉（全物理 8/8）
 - [ ] 目录重构：`core/` + `scenes/` 分层
 - [ ] 自动避障规划
 - [ ] 变径工件（Φ15~Φ25）通用夹持
 
 想一起做，开 issue 就行。
+
+### 训练成果往哪发：Hugging Face
+
+代码留在这个仓库，**权重、数据集、在线 demo 走 Hugging Face**——它的搜索是按 model / dataset 找的，没人按代码找，把 `src/` 搬过去既搜不到也白占空间。
+
+| HF 的柜子 | 装什么 | 什么时候有 |
+|---|---|---|
+| **Models** | 训练好的权重 + config | 第一个策略训出来之后 |
+| **Datasets** | LeRobot dataset v2（parquet + `meta/info.json` + 视频） | 遥操作采完第一批 |
+| **Spaces** | Gradio 在线 demo | 有模型之后，给人点开就能跑 |
+
+**发布门槛**——不看"训练跑通了"，看在同一个任务、同一套指标下的对比：
+
+| 指标 | 现在手写 IK | 训练策略要赢在哪 |
+|---|---|---|
+| 同轴度 | 1.05 mm | 不劣于基线，或收敛更快 |
+| 流程耗时 | 20.5 s | 明显更快 |
+| 泛化 | 工件起始位姿写死 | **换位姿仍能成功** ← 这一条才算成果 |
+
+前两条赢了只是复现，第三条赢了才是"模型比代码强"。
+
+发布顺序不能反：**标定 → 采集 → 训练 → 权重上传 → 在线 demo**。标定没做好，采出来的数据集整批是废的。
+
+> Code stays on GitHub. Weights, datasets and the interactive demo will go to Hugging Face once a trained policy actually beats the hand-written IK on *generalization* — not merely on speed or repeatability.
 
 ---
 
@@ -234,6 +292,25 @@ mujoco-robot-cell/
 不做全文双语的原因很实际：这个仓库每天迭代，逐句翻译会拖慢速度，而机翻质量的英文比没有英文更劝退。哪一节需要英文，开 issue 说一声。
 
 Body text is Chinese; **key results are written in both languages**. Full bilingual docs would slow down daily iteration — if you need a section in English, open an issue and I'll add it.
+
+---
+
+## 相关工作 / Prior art
+
+开工前查过一轮，**大方向都有人做过**，所以这里不装成首创；我们专注的是下面最后一格那个没人给判据的问题。
+
+| 方向 | 已有的东西 | 和这里的关系 |
+|---|---|---|
+| V 槽夹圆柱、几何自定心 | [US9808936](https://patents.google.com/patent/US9808936)、Goldberg 的 [v-grip 论文](https://goldberg.berkeley.edu/pubs/gopal-icra02.pdf) | 给出槽深约束 `H ≤ R/sinθ`：90° / Φ20 → **14.14 mm 是上限**。我们曾误当成下限加到 16 mm，实测反而更差，已改回 8 mm |
+| 形封闭理论 | [Multi-Fingered Robotic Grasping: A Primer](https://robotics.ucmerced.edu/sites/g/files/ufvvjh1576/f/page/documents/graspingprimer.pdf) | 3D 无摩擦形封闭需 ≥7 点接触。4 条线接触且轴向无约束 → **必须补挡边**，这不是调参能绕过的 |
+| SO-101 仿真 + LeRobot 采集 | [tuul-ai/so101_sim](https://github.com/tuul-ai/so101_sim)、[makolon/lerobot_sim](https://github.com/makolon/lerobot_sim) | 环境、多相机、数据集生成比我们从零搭的完整；训练阶段应基于它们 |
+| CNC 上下料工作站 | [intrinsic-ai/intrinsic-omts](https://github.com/intrinsic-ai/intrinsic-omts)（2026-09 开源，Apache-2.0） | 工业答案是 ROS 2 + FoundationPose + MoveIt2；本项目是低成本臂的接触级验证，定位不同 |
+| 大模型设计爪型 | [Lang2Morph](https://alphaxiv.org/abs/2509.18937)、清华 RoboTwin 博士论文（2025） | 验证「参数化 + 仿真验证闭环」可行；Lang2Morph 把 50+ 参数缩到每指 4 个，正是 `_v_plates()` 的思路 |
+| 通用 benchmark / 现成夹爪 | [robosuite](https://github.com/ARISE-Initiative/robosuite)、[MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) | 换爪之前先翻现成 MJCF，别从 box 拼起 |
+
+**空白**：现有项目判断「抓住了没有」，多用 task-level attachment / kinematic lock、渲染能跑通，或端到端成功率倒推。本项目 `src/check_grip_hold.py` 给的是**低摩擦 + 定量下拉 + 抬起跟走 + 逐条接触力**的可复现判据，配上 7 项装夹指标。这是值得拿出去的部分。
+
+> 完整调研记录、槽深扫描表和否决结论见 [`HANDOFF.md`](HANDOFF.md) §18。
 
 ---
 

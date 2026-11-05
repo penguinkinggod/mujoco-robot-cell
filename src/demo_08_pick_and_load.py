@@ -78,9 +78,18 @@ class Arm:
         self.pads = [i for i in range(model.ngeom)
                      if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, i)
                          or "").find("pad") >= 0]
+        # V-slot jaws replace the flat pads with four blades whose average
+        # centre is 6.4 mm behind the slot mouth, so the pad-centre trick
+        # below would be wrong. Those jaws also drop two inert reference
+        # dots exactly at each mouth centre; prefer them when present.
+        self.refs = [i for i in range(model.ngeom)
+                     if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, i)
+                         or "").find("grasp_ref") >= 0]
 
     def pad_center(self, d=None):
         d = d or self.d
+        if len(self.refs) >= 2:
+            return (d.geom_xpos[self.refs[0]] + d.geom_xpos[self.refs[1]]) / 2
         if len(self.pads) < 2:
             return d.site_xpos[self.site].copy()
         return (d.geom_xpos[self.pads[0]] + d.geom_xpos[self.pads[1]]) / 2

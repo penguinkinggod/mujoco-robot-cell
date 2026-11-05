@@ -136,6 +136,33 @@ def check_feed(out, err, rc):
         coax, tilt, contacts, pull, force)
 
 
+def check_feed_physics(out, err, rc):
+    """V jaws, and NOTHING pinned: form closure + friction carry the part.
+
+    This check exists because the locked run above can pass while the gripper
+    holds nothing at all -- which is exactly what happened for several
+    sessions: 4 contacts and 105 N, yet the rod was wedged and 20 deg off
+    axis. Here the V grooves must locate the rod by geometry and the contact
+    must carry it across the cell on its own.
+    """
+    m = re.search(
+        r"FEED_METRIC coax_mm=([\d.]+) tilt_deg=([\d.]+) "
+        r"contacts=(\d+) slip_mm=([\d.]+) pull_mm=([\d.]+) "
+        r"jaw_force_N=([\d.]+) grasp_tilt_deg=([\d.]+) "
+        r"carry=physics physics_after_clamp=(\d+)", out)
+    if not m:
+        return False, "no FEED_METRIC line with carry=physics"
+    coax, tilt = float(m.group(1)), float(m.group(2))
+    contacts = int(m.group(3))
+    slip, pull = float(m.group(4)), float(m.group(5))
+    force, unlocked = float(m.group(6)), int(m.group(8))
+    good = (rc == 0 and "FEED_METRIC PASS" in out and unlocked == 1
+            and coax <= 2.0 and tilt <= 10.0 and contacts >= 6
+            and slip <= 2.0 and pull <= 2.0)
+    return good, "无锁同轴%.2fmm 倾斜%.1f° 接触%d 拉%.2fmm 力%.1fN" % (
+        coax, tilt, contacts, pull, force)
+
+
 CHECKS = [
     dict(name="语法检查", cmd=[PY, "-m", "py_compile"] + CORE_FILES,
          check=check_compile, slow=False, hint="秒级"),
@@ -151,6 +178,9 @@ CHECKS = [
          check=check_demo09, slow=True, hint="约 9 秒"),
     dict(name="机械臂送料装夹", cmd=[PY, "src/diag_feed_chuck.py"],
          check=check_feed, slow=True, hint="约 4 秒"),
+    dict(name="送料·全物理(V槽)",
+         cmd=[PY, "src/diag_feed_chuck.py", "--v-jaw", "--lift", "--no-lock"],
+         check=check_feed_physics, slow=True, hint="约 20 秒"),
 ]
 
 

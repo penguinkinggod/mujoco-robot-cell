@@ -208,7 +208,226 @@ def _add_cradle(spec):
           % (np.round(p_local, 4), CRADLE_LEN * 1000))
 
 
-def build_model(grip_fix=None):
+# ---------------- V-slot jaws (both pads) ----------------
+# Geometry, not friction: a Phi20 rod sits in a 90 deg V at 14.14 mm from the
+# apex, so the slot has to be that deep. The pads hang only 3 mm above the
+# table at the grasp point (measured: pad lowest corner z = +2.3 / +3.0 mm),
+# so a downward-opening slot would go through the table. That is why the
+# workpiece has to be lifted onto two cradles first -- the cradles hold it at
+# its ENDS, leaving the middle 80 mm free for the jaws to reach underneath.
+# US9808936 ("Two-phase gripper to reorient and grasp") gives the jaw-cavity
+# constraint H <= R/sin(theta) so the FINGERS do not touch before the part is
+# held. For a 90 deg V and Phi20 that is H <= 14.14 mm -- an UPPER bound, not
+# a minimum. I had this backwards and set 16 mm; the sweep below showed the
+# shallower the better: 8 mm -> 16.6 deg / 2.3 mm, 16 mm -> 53.6 deg / 3.9 mm.
+V_DEPTH = 0.008          # slot depth (m); swept 8..20 mm, 8 is best so far
+V_BAR = 0.004            # blade thickness
+V_LEN = 0.024            # slot length along the workpiece axis
+V_QREF = 0.10            # gripper qpos the slot frame is measured at
+# The V slot has to be cut along the rod axis, so the jaw closing axis must
+# be perpendicular to it.
+#
+# 2026-11-06 RE-MEASURED after fixing the free-joint bug (the old builder
+# zeroed qpos and teleported the rod to the origin, so the earlier scan that
+# picked -1.00 was measuring a phantom). probe_grasp_contact.py --wsweep,
+# jaw-on-shaft contacts at clamp / shaft follow on a 60 mm lift:
+#   -1.60 -> 0 / -16.1 mm | -1.30 -> 0 / -21.9 | -1.00 -> 0 / -23.9
+#   -0.60 -> 1 / +39.3 mm |  0.00 -> 2 /   0.0 | +0.60 -> 0 /   0.0
+#   +1.00 -> 0 /   0.0    | +1.55 -> 4 / +31.6 mm  <-- only real grip
+# +1.55 is the stock WRIST_ROLL_GRASP from demo_08: it was right all along.
+V_WRIST = -0.95
+# A 90 deg V seat locates the rod by geometry, but CARRYING it is still
+# friction-limited: 41 N of clamp x mu=0.05 is 2.05 N of friction against a
+# 1.93 N part, so the rod rotated away 77 deg on the first fast traverse.
+# Closing harder is what an operator does; -0.10 measured 22.9 N on the chuck
+# jaws and 0.07 mm of 20 N pull-out.
+V_GRIP_CLOSE = -0.10
+LIFT_DZ = 0.030          # workpiece raised off the table
+CRADLE_HALF_X = 0.005    # cradle half-width along the workpiece axis
+CRADLE_BAR = 0.005
+# Cradle depth is INDEPENDENT of jaw depth: the cradle only has to locate the
+# rod, whereas the jaws have to swallow it. Sharing V_DEPTH dropped the rod
+# 7.5 mm when the jaws got deeper (39.8 -> 32.3 mm) and invalidated the run.
+CRADLE_DEPTH = 0.010
+
+
+def _v_plates(O, u_ax, w_ax, v_ax, depth=None, bar=None, length=None):
+    """Two 45 deg blades forming a V. u_ax = mouth normal, v_ax = slot axis.
+
+    Defaults are resolved at CALL time, not at definition time, so a sweep
+    can override V_DEPTH / V_LEN without reloading the module.
+    """
+    depth = V_DEPTH if depth is None else depth
+    bar = V_BAR if bar is None else bar
+    length = V_LEN if length is None else length
+    out = []
+    off = depth / 2 + bar / (2 * np.sqrt(2))
+    for sgn in (+1, -1):
+        c = O + (-off) * u_ax + (sgn * off) * w_ax
+        x = (u_ax + sgn * w_ax) / np.sqrt(2)
+        z = np.cross(x, v_ax)
+        R = np.column_stack([x, v_ax, z])
+        out.append((c, R, [depth * np.sqrt(2) / 2, length / 2, bar / 2]))
+    return out
+
+
+def _install_v_jaws(spec):
+    """Replace both flat pads with V blocks, opening toward each other.
+
+    Each pad gets a 90 deg groove whose axis runs along the workpiece, so the
+    slot frame must be built from three mutually perpendicular directions:
+      v = rod axis, u = jaw closing axis, w = the in-plane "up" direction.
+    Hardcoding u = world +/-Z was wrong by 86.3 deg at the real grasp pose --
+    the two grooves ended up staggered instead of facing each other.
+    """
+    tmp = spec.compile()
+    td = mujoco.MjData(tmp)
+    jid = lambda n: mujoco.mj_name2id(tmp, mujoco.mjtObj.mjOBJ_JOINT, n)
+    gid = lambda n: mujoco.mj_name2id(tmp, mujoco.mjtObj.mjOBJ_GEOM, n)
+    bid = lambda n: mujoco.mj_name2id(tmp, mujoco.mjtObj.mjOBJ_BODY, n)
+
+    # The slot has to face WORLD +/-Z AT THE GRASP POSE, not at home. The arm
+    # swings tens of degrees between the two, so defining the blades at home
+    # put both jaws above the rod and the slot pointed off into space
+    # (measured: gripper blades at z=+53 mm while the rod centre was z=+40).
+    # So solve the grasp IK first with the stock pads, then cut the slots in
+    # that pose.
+    from demo_08_pick_and_load import Arm
+    # NEVER zero the whole qpos here: "shaft" has a FREE joint, so its qpos
+    # IS its world pose. Zeroing it teleports the workpiece to the origin and
+    # zeroes its quaternion, so every slot below was cut against a phantom rod
+    # at (0,0,0). All earlier wrist/depth conclusions came from that bug.
+    td.qpos[tmp.jnt_qposadr[jid("wrist_roll")]] = V_WRIST
+    mujoco.mj_forward(tmp, td)
+    arm = Arm(tmp, td)
+    sh = mujoco.mj_name2id(tmp, mujoco.mjtObj.mjOBJ_BODY, "shaft")
+    c0 = td.xpos[sh].copy()
+    # Same approach the real flow uses, stepped through physics. A bare ik()
+    # call returns a different joint solution for the same tool pose (the arm
+    # is redundant), and the blades ended up rotated 44 deg away from the
+    # slot axis -- enough that the rod never entered the groove.
+    arm.move_to(c0 + np.array([0, 0, 0.060]), 300, 0.50, V_WRIST)
+    arm.move_to(c0 + np.array([0, 0, 0.002]), 400, 0.50, V_WRIST)
+    td.qpos[tmp.jnt_qposadr[jid("gripper")]] = V_QREF
+    mujoco.mj_forward(tmp, td)
+
+    # v = rod axis; u = closing axis with its along-rod part stripped;
+    # w = gravity projected into the plane left over. All three orthogonal.
+    v_ax = td.xmat[sh].reshape(3, 3)[:, 2].copy()
+    v_ax /= np.linalg.norm(v_ax)
+    p1 = td.geom_xpos[gid("fixed_jaw_pad")].copy()
+    p2 = td.geom_xpos[gid("moving_jaw_pad")].copy()
+    u = p2 - p1
+    u -= np.dot(u, v_ax) * v_ax
+    u /= np.linalg.norm(u)
+    z = np.array([0.0, 0.0, 1.0])
+    w_ax = z - np.dot(z, u) * u - np.dot(z, v_ax) * v_ax
+    w_ax /= np.linalg.norm(w_ax)
+    print("    v_jaw: wrist %.2f, mouth axis [%+.2f %+.2f %+.2f] (u.v=%.3f)"
+          % (V_WRIST, *u, np.dot(u, v_ax)))
+
+    # The stock SO-101 pads are NOT axially aligned: the fixed pad's face sits
+    # 14.8 mm behind the moving pad's. Cutting each V at its own pad therefore
+    # staggers the two mouths 15.4 mm apart along the rod; the jaws then WEDGE
+    # the rod instead of cradling it and it ends up 20 deg off axis (measured,
+    # with 4 contacts and 105 N -- force alone never showed this). So build
+    # both V blocks on ONE common axial station, halfway between the pads.
+    pads = []
+    for pad_name, usgn in (("fixed_jaw_pad", +1.0), ("moving_jaw_pad", -1.0)):
+        g = gid(pad_name)
+        p = td.geom_xpos[g].copy()
+        half_th = tmp.geom_size[g][0]
+        O = p + u * half_th * usgn
+        pads.append((pad_name, usgn, g, p, half_th, O,
+                     float((O - c0) @ v_ax)))
+    s_mid = 0.5 * (pads[0][6] + pads[1][6])
+    print("    v_jaw: pad mouths were %.1f mm apart along the rod -> "
+          "aligned to one station" % ((pads[1][6] - pads[0][6]) * 1000))
+
+    mouths = []                            # (usgn, mouth centre) per finger
+    for pad_name, usgn, g, p, half_th, O, s in pads:
+        b = tmp.geom_bodyid[g]
+        O = O + (s_mid - s) * v_ax         # common axial station
+        mouths.append((usgn, O))
+        u_ax = u * usgn                    # mouth normal = closing axis
+        print("    v_jaw: %s mouth s=%+.1f mm, lateral %+.1f mm"
+              % (pad_name, (O - c0) @ v_ax * 1000, (O - c0) @ w_ax * 1000))
+
+        p_b = td.xpos[b].copy()
+        R_b = td.xmat[b].reshape(3, 3)
+        body = next(bb for bb in spec.bodies
+                    if bb.name == mujoco.mj_id2name(
+                        tmp, mujoco.mjtObj.mjOBJ_BODY, b))
+
+        for k, (c, R, hs) in enumerate(_v_plates(O, u_ax, w_ax, v_ax)):
+            ng = body.add_geom()
+            ng.name = "%s_v%d" % (pad_name, k + 1)
+            ng.type = mujoco.mjtGeom.mjGEOM_BOX
+            ng.size = hs
+            ng.pos = R_b.T @ (c - p_b)
+            q = np.zeros(4)
+            mujoco.mju_mat2Quat(q, np.ascontiguousarray(R_b.T @ R).reshape(-1))
+            ng.quat = q
+            ng.rgba = [0.90, 0.58, 0.16, 1.0]
+            ng.contype, ng.conaffinity = F.CT_ROBOT
+
+    # ONE stable TCP: both reference dots live on the FIXED finger's body.
+    # The fixed finger never travels; the moving one sweeps ~22 mm. Ref dots
+    # parked one-per-finger therefore average to a point that slides by half
+    # that travel every time the jaws move -- measured as a 21 mm aim error:
+    # the arm aimed at the rod and the CLOSED jaws ended up 21 mm beside it.
+    # Pinning both dots to the fixed finger makes pad_center() a constant, so
+    # move_to() aims where the jaws will actually meet.
+    gf = gid("fixed_jaw_pad")
+    bf = tmp.geom_bodyid[gf]
+    body_f = next(bb for bb in spec.bodies
+                  if bb.name == mujoco.mj_id2name(
+                      tmp, mujoco.mjtObj.mjOBJ_BODY, bf))
+    p_f = td.xpos[bf].copy()
+    R_f = td.xmat[bf].reshape(3, 3)
+    for k, (usgn, O) in enumerate(mouths):
+        ref = body_f.add_geom()
+        ref.name = "grasp_ref_%d" % k
+        ref.type = mujoco.mjtGeom.mjGEOM_SPHERE
+        ref.size = [0.0008, 0.0, 0.0]
+        ref.pos = R_f.T @ (O - p_f)
+        ref.rgba = [0.1, 0.1, 0.1, 0.0]
+        ref.contype, ref.conaffinity = 0, 0
+
+    for pad_name in ("fixed_jaw_pad", "moving_jaw_pad"):
+        spec.delete(spec.geom(pad_name))
+    print("    v_jaw: both pads -> 90 deg V slot, depth %.0f mm" % (V_DEPTH * 1000))
+
+
+def _lift_workpiece(spec):
+    """Raise the rod and put a V cradle under each end."""
+    b = next(bb for bb in spec.bodies if bb.name == "shaft")
+    b.pos = [b.pos[0], b.pos[1], b.pos[2] + LIFT_DZ]
+    # _v_plates takes the slot MOUTH as its origin, not the apex.
+    mouth_z = b.pos[2] - (np.sqrt(2.0) - 1.0) * CRADLE_DEPTH
+    up = np.array([0.0, 0.0, 1.0])
+    v_ax = np.array([1.0, 0.0, 0.0])
+    w_ax = np.array([0.0, 1.0, 0.0])
+    for sx in (-1.0, +1.0):
+        O = np.array([b.pos[0] + sx * (F.SHAFT_L / 2 - CRADLE_HALF_X),
+                      b.pos[1], mouth_z])
+        for k, (c, R, hs) in enumerate(
+                _v_plates(O, up, w_ax, v_ax, depth=CRADLE_DEPTH, bar=CRADLE_BAR,
+                          length=CRADLE_HALF_X * 2)):
+            g = spec.worldbody.add_geom()
+            g.name = "cradle_%s%d" % ("L" if sx < 0 else "R", k + 1)
+            g.type = mujoco.mjtGeom.mjGEOM_BOX
+            g.size = hs
+            g.pos = c
+            q = np.zeros(4)
+            mujoco.mju_mat2Quat(q, np.ascontiguousarray(R).reshape(-1))
+            g.quat = q
+            g.rgba = [0.46, 0.48, 0.52, 1.0]
+            g.contype, g.conaffinity = F.CT_STATIC
+    print("    cradle: rod lifted %.0f mm, V under both ends" % (LIFT_DZ * 1000))
+
+
+def build_model(grip_fix=None, v_jaw=False, lift=False, arc_jaw=False):
     """Feed scene: no vise, no slot platform, PLAIN cylinder workpiece.
 
     Requested 2026-11-05: "把虎钳和浅平台删掉，把工件换成圆柱".
@@ -221,15 +440,24 @@ def build_model(grip_fix=None):
     spec = F.build_scene(with_lathe=True, lathe_origin=LATHE_ORIGIN,
                          with_vise=False, with_fixture=False,
                          with_shaft_flat=False)
+    if lift:
+        _lift_workpiece(spec)
+    if arc_jaw:
+        import arc_jaws
+        arc_jaws.install(spec)
+    elif v_jaw:
+        _install_v_jaws(spec)
     if grip_fix:
         add_grip_fix(spec, grip_fix)
     return spec.compile()
 
 
 FRAME_EVERY = 60         # 每 N 步采一帧；仅 frame_hook 非 None 时生效
+GRIP_SETTLE = 120        # 每次 move3 前先把夹爪指令落实的步数
 
 
-def main(frame_hook=None, model=None, data=None):
+def main(frame_hook=None, model=None, data=None, carry_lock=True,
+         v_jaw=False, lift=False, wrist=None):
     """Run the feed sequence.
 
     frame_hook(tag, model, data) is an OPTIONAL visualisation tap.
@@ -239,8 +467,18 @@ def main(frame_hook=None, model=None, data=None):
 
     model / data may be injected so an external viewer can watch the very
     same MjData being stepped. Defaults build fresh ones.
+
+    carry_lock=False drops the kinematic lock during the carry segment and
+    lets the grasp carry the load on its own. Default True keeps the
+    numbers that verify_all.py asserts.
     """
-    model = model if model is not None else build_model()
+    # Flat pads tolerate any wrist angle; a V groove only closes properly
+    # when the jaw axis is square to the rod. Keep the stock value for the
+    # verified 7/7 path and switch automatically for the V-jaw experiment.
+    if wrist is None:
+        wrist = V_WRIST if v_jaw else WRIST_ROLL_GRASP
+    grip_close = V_GRIP_CLOSE if v_jaw else GRIP_CLOSE
+    model = model if model is not None else build_model(v_jaw=v_jaw, lift=lift)
     data = data if data is not None else mujoco.MjData(model)
 
     def tick(tag=None):
@@ -273,6 +511,16 @@ def main(frame_hook=None, model=None, data=None):
     def coax():
         p = shaft()
         return float(np.hypot(p[1] - axis[1], p[2] - axis[2]) * 1000)
+
+    def axdev():
+        """Angle between the ROD AXIS and world x -- not the quaternion.
+
+        A round part that merely rolls in the V groove reports tens of degrees
+        of "tilt" from tilt_deg() while its axis never moved, which sent two
+        earlier debugging rounds after a non-existent problem.
+        """
+        ax = data.xmat[shaft_body].reshape(3, 3)[:, 2]
+        return float(np.degrees(np.arccos(min(1.0, abs(float(ax[0]))))))
 
     def jaw_state():
         contacts, force = 0, 0.0
@@ -324,12 +572,12 @@ def main(frame_hook=None, model=None, data=None):
         Also takes jaw_ctrl explicitly: writing CHUCK_OPEN_CTRL on every
         step of the retreat used to open the chuck and drop the shaft.
         """
-        data.qpos[arm.qadr[4]] = WRIST_ROLL_GRASP
-        data.ctrl[4] = WRIST_ROLL_GRASP
+        data.qpos[arm.qadr[4]] = wrist
+        data.ctrl[4] = wrist
         mujoco.mj_forward(model, data)
         off = arm.pad_offset()
         q_goal, _ = arm.ik(np.asarray(target) - off,
-                           lock_wrist_roll=WRIST_ROLL_GRASP)
+                           lock_wrist_roll=wrist)
         q_start = np.array([data.qpos[a] for a in arm.qadr])
         for i in range(ns):
             frac = (i + 1) / ns
@@ -356,7 +604,8 @@ def main(frame_hook=None, model=None, data=None):
         return float(np.linalg.norm(arm.pad_center() - np.asarray(target)))
 
     def move3(target, ns, grip, locked,
-              jaw_ctrl=SM.CHUCK_OPEN_CTRL, iters=8):
+              jaw_ctrl=SM.CHUCK_OPEN_CTRL, iters=8, probe=None,
+              probe_goal=None):
         """Iterate until the pads actually reach the goal -- by MOVING THE GOAL.
 
         Re-sending the same absolute target is useless under load: the
@@ -372,14 +621,39 @@ def main(frame_hook=None, model=None, data=None):
         """
         goal = np.asarray(target, dtype=float)
         tgt = goal.copy()
-        err = float(np.linalg.norm(arm.pad_center() - goal))
+
+        # Apply the grip command BEFORE the convergence check.
+        # "夹紧" targets the same point as the preceding "下降", so err was
+        # already ~0 and the early break below returned without ever writing
+        # GRIP_CLOSE into ctrl: the fingers stayed at 0.500 (open), the pads
+        # sat 19-23 mm off the axis, and the shaft never left the table.
+        # Measured before this fix: ncon had zero pad-shaft contacts.
+        for _ in range(GRIP_SETTLE):
+            data.ctrl[arm.grip_act] = grip
+            data.ctrl[jaw_act] = jaw_ctrl
+            mujoco.mj_step(model, data)
+            if locked:
+                lock()
+
+        # probe: measure the PART instead of the pads. The pads can sit on the
+        # chuck axis while the rod hangs 4 mm off it, because the grip point
+        # is not the rod's centre; servoing the pads then cannot fix the part.
+        # Measured before this: pads on axis (IK residual 1.2 mm) but the rod
+        # arrived at coax 3.94 mm and only 4 of 6 jaw contacts closed.
+        meas = probe if probe is not None else arm.pad_center
+        # probe_goal is what the PROBED point should reach. The pad command
+        # carries a constant pad-to-part offset, so comparing the part against
+        # the pad-space goal double-counts that offset and drives the arm to
+        # the wrong place (measured: this alone broke the flat-pad 7/7 run).
+        gmeas = goal if probe_goal is None else np.asarray(probe_goal, float)
+        err = float(np.linalg.norm(meas() - gmeas))
         for _ in range(iters):
             if err < 0.003:
                 break
             move(tgt, max(90, ns // 3), grip, locked, jaw_ctrl)
-            err = float(np.linalg.norm(arm.pad_center() - goal))
+            err = float(np.linalg.norm(meas() - gmeas))
             # 0.8 damping: full step overshoots once the load unloads
-            tgt = tgt + 0.8 * (goal - arm.pad_center())
+            tgt = tgt + 0.8 * (gmeas - meas())
         return err
 
     def settle(n, jaw_ctrl, grip, locked=False):
@@ -394,8 +668,8 @@ def main(frame_hook=None, model=None, data=None):
 
     # ---------------- reset / home ----------------
     mujoco.mj_resetData(model, data)
-    data.qpos[arm.qadr[4]] = WRIST_ROLL_GRASP
-    data.ctrl[4] = WRIST_ROLL_GRASP
+    data.qpos[arm.qadr[4]] = wrist
+    data.ctrl[4] = wrist
     data.ctrl[arm.grip_act] = GRIP_OPEN
     data.ctrl[jaw_act] = SM.CHUCK_OPEN_CTRL
     for _ in range(600):
@@ -418,14 +692,14 @@ def main(frame_hook=None, model=None, data=None):
     pick = [
         ("接近", [g[0], g[1], g[2] + R + 0.075], GRIP_OPEN, 550),
         ("下降", [g[0], g[1], g[2] + 0.002], GRIP_OPEN, 400),
-        ("夹紧", [g[0], g[1], g[2] + 0.002], GRIP_CLOSE, 320),
+        ("夹紧", [g[0], g[1], g[2] + 0.002], grip_close, 320),
     ]
     grasp_tilt = None
     for name, tgt, grip, ns in pick:
         move3(np.array(tgt), ns, grip, False)
         grasp_tilt = tilt_deg(data.qpos[sq + 3:sq + 7])
-        print("  %-6s 轴=%s 倾斜=%5.1f deg  pad-轴=%5.1f mm"
-              % (name, np.round(shaft(), 4), grasp_tilt,
+        print("  %-6s 轴=%s 轴向偏=%5.1f deg  pad-轴=%5.1f mm"
+              % (name, np.round(shaft(), 4), axdev(),
                  np.linalg.norm(arm.pad_center() - shaft()) * 1000))
         if name == "夹紧":
             state["offset"] = arm.pad_center() - shaft()
@@ -434,8 +708,14 @@ def main(frame_hook=None, model=None, data=None):
              "④ 夹紧｜真实抓取（轴会歪）")
     print("  shaft_in_grip = %s mm（搬运锁的相对偏移）"
           % np.round(state["offset"] * 1000, 2))
-    print("  ⚠ 真实抓取倾斜 %.1f deg：夹爪形封闭尚未解决，此处由搬运锁接管"
-          % grasp_tilt)
+    if v_jaw and not carry_lock:
+        print("  V 槽形封闭抓取：轴线偏离 %.1f deg，搬运全靠真实接触（无锁）"
+              % axdev())
+    elif v_jaw:
+        print("  V 槽形封闭抓取：轴线偏离 %.1f deg" % axdev())
+    else:
+        print("  ⚠ 平板爪夹圆柱会翻（四元数倾角 %.1f deg）：搬运由运动学锁接管"
+              % grasp_tilt)
 
     # ---------------- kinematic carry ----------------
     carry = [
@@ -445,8 +725,13 @@ def main(frame_hook=None, model=None, data=None):
         ("下到轴线", [axis[0], axis[1], axis[2]], 700),
     ]
     for name, tgt, ns in carry:
+        # The last leg is the one that decides whether the rod enters the
+        # jaws, so close the loop on the ROD there, not on the pads.
+        close_on_part = (name == "下到轴线") and not carry_lock
         err = move3(np.array(tgt) + state["offset"], ns,
-                    GRIP_CLOSE, True)
+                    grip_close, carry_lock,
+                    probe=shaft if close_on_part else None,
+                    probe_goal=np.array(tgt) if close_on_part else None)
         print("  %-6s IK残差=%5.1f mm 轴=%s 同轴=%6.2f mm 倾斜=%4.1f deg"
               % (name, err * 1000, np.round(shaft(), 4), coax(),
                  tilt_deg(data.qpos[sq + 3:sq + 7])))
@@ -529,9 +814,10 @@ def main(frame_hook=None, model=None, data=None):
     print("=" * 74)
     print("FEED_METRIC coax_mm=%.2f tilt_deg=%.1f contacts=%d "
           "slip_mm=%.2f pull_mm=%.2f jaw_force_N=%.1f "
-          "grasp_tilt_deg=%.1f carry=kinematic_lock physics_after_clamp=%d"
+          "grasp_tilt_deg=%.1f carry=%s physics_after_clamp=%d"
           % (final_coax, final_tilt, contacts, slip, pull, force,
-             grasp_tilt, 0 if state["lock_active"] else 1))
+             grasp_tilt, "kinematic_lock" if carry_lock else "physics",
+             0 if state["lock_active"] else 1))
     print("FEED_METRIC %s" % ("PASS" if ok else "FAIL"))
     if not ok:
         print("  未通过判据：同轴≤%.1fmm 倾斜≤%.1fdeg 接触≥%d "
@@ -544,4 +830,16 @@ def main(frame_hook=None, model=None, data=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="机械臂送料到三爪卡盘")
+    ap.add_argument("--v-jaw", action="store_true",
+                    help="换成 90 度 V 槽爪（圆柱靠形封闭，不靠摩擦）")
+    ap.add_argument("--lift", action="store_true",
+                    help="工件先抬到 V 托架上，让爪能伸到下面")
+    ap.add_argument("--no-lock", action="store_true",
+                    help="搬运段不用运动学锁，让真实接触承受载荷")
+    args = ap.parse_args()
+    raise SystemExit(main(v_jaw=args.v_jaw, lift=args.lift,
+                          carry_lock=not args.no_lock))
