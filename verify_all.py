@@ -40,8 +40,7 @@ CORE_FILES = [
     "demo_09_try_versions.py",
     "verify_all.py",
     "diag_chuck_health.py",
-    # Syntax-checked only. This is a KNOWN FAIL baseline; wiring it into
-    # CHECKS would red the 6/6 green baseline. See its module docstring.
+    # Also a real CHECKS entry below (kept here for py_compile coverage).
     "diag_feed_chuck.py",
 ]
 
@@ -112,6 +111,31 @@ def check_chuck_health(out, err, rc):
         spread, ecc, contacts, reach)
 
 
+def check_feed(out, err, rc):
+    """Robot feeding. NOTE: the carry uses a kinematic lock (an explicit,
+    documented simplification). We assert physics_after_clamp=1 so nobody
+    can quietly extend the lock through the pull-out test and fake a pass,
+    and match 'carry=kinematic_lock' literally so silently deleting the
+    lock also fails the parse instead of being reported as full physics.
+    """
+    m = re.search(
+        r"FEED_METRIC coax_mm=([\d.]+) tilt_deg=([\d.]+) "
+        r"contacts=(\d+) slip_mm=([\d.]+) pull_mm=([\d.]+) "
+        r"jaw_force_N=([\d.]+) grasp_tilt_deg=([\d.]+) "
+        r"carry=kinematic_lock physics_after_clamp=(\d+)", out)
+    if not m:
+        return False, "no FEED_METRIC line"
+    coax, tilt = float(m.group(1)), float(m.group(2))
+    contacts = int(m.group(3))
+    slip, pull = float(m.group(4)), float(m.group(5))
+    force, unlocked = float(m.group(6)), int(m.group(8))
+    good = (rc == 0 and "FEED_METRIC PASS" in out and unlocked == 1
+            and coax <= 2.0 and tilt <= 10.0 and contacts >= 6
+            and slip <= 2.0 and pull <= 2.0)
+    return good, "同轴%.2fmm 倾斜%.1f° 接触%d 拉%.2fmm 力%.1fN" % (
+        coax, tilt, contacts, pull, force)
+
+
 CHECKS = [
     dict(name="语法检查", cmd=[PY, "-m", "py_compile"] + CORE_FILES,
          check=check_compile, slow=False, hint="秒级"),
@@ -125,6 +149,8 @@ CHECKS = [
          check=check_chuck_health, slow=True, hint="约 5 秒"),
     dict(name="完整序列 3/3", cmd=[PY, "demo_09_try_versions.py"],
          check=check_demo09, slow=True, hint="约 9 秒"),
+    dict(name="机械臂送料装夹", cmd=[PY, "diag_feed_chuck.py"],
+         check=check_feed, slow=True, hint="约 4 秒"),
 ]
 
 
