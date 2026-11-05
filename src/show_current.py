@@ -263,7 +263,10 @@ D:\\robot-env\\Scripts\\python.exe verify_all.py          :: 复跑 7/7 回归</
 
 
 def main():
-    model = D.build_model()
+    # Render the run that actually grips: V jaws, rod on the cradle, and NO
+    # kinematic lock. The flat-pad path below is kept only because the older
+    # 7-item checks still assert its numbers.
+    model = D.build_model(v_jaw=True, lift=True)
     data = mujoco.MjData(model)
     rend = mujoco.Renderer(model, height=540, width=720)
     rend.scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = True
@@ -295,7 +298,8 @@ def main():
     print("正在跑送料仿真并逐帧渲染（画面与 PASS 指标同源）...")
     buf = io.StringIO()
     with contextlib.redirect_stdout(Tee(sys.stdout, buf)):
-        rc = D.main(frame_hook=frame_hook, model=model, data=data)
+        rc = D.main(frame_hook=frame_hook, model=model, data=data,
+                    v_jaw=True, lift=True, carry_lock=False)
     rend.close()
 
     metric, status = parse_metric(buf.getvalue())
