@@ -99,12 +99,14 @@ def check_chuck_health(out, err, rc):
         r"tilt_deg=([\d.]+) contacts=(\d+) reach_err_mm=([\d.]+)", out)
     if not m:
         return False, "no CHUCK_HEALTH line"
-    ecc, tilt = float(m.group(2)), float(m.group(3))
+    spread, ecc, tilt = float(m.group(1)), float(m.group(2)), float(m.group(3))
     contacts, reach = int(m.group(4)), float(m.group(5))
     good = (rc == 0 and "CHUCK_HEALTH PASS" in out
             and ecc <= 1.0 and tilt <= 2.0
-            and contacts >= 6 and reach <= 10.0)
-    return good, "偏心%.2fmm 接触%d 可达%.1fmm" % (ecc, contacts, reach)
+            and contacts >= 6 and reach <= 10.0
+            and spread <= 0.2)   # true synchronisation must not regress
+    return good, "位移差%.2fmm 偏心%.2fmm 接触%d 可达%.1fmm" % (
+        spread, ecc, contacts, reach)
 
 
 CHECKS = [

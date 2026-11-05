@@ -93,7 +93,7 @@ place_shaft_in_chuck(data)
 # 先张开，等稳定
 for _ in range(200):
     for a in JAW_ACTS:
-        data.ctrl[a] = 0.005      # 往外张开
+        data.ctrl[a] = S.CHUCK_OPEN_CTRL      # 往外张开
     data.ctrl[ids["gripper_act"]] = 0.0
     mujoco.mj_step(model, data)
 
@@ -103,7 +103,7 @@ print("  张开后：轴位置 z = %.4f（卡盘轴线 %.4f）"
 # 闭合
 for _ in range(1500):
     for a in JAW_ACTS:
-        data.ctrl[a] = -0.012     # 往里夹
+        data.ctrl[a] = S.CHUCK_CLAMP_CTRL     # 往里夹
     mujoco.mj_step(model, data)
 
 n, f = count_jaw_contacts(data)
@@ -127,7 +127,7 @@ print("=" * 74)
 z_before = data.qpos[SHAFT_FREE_QADR + 2]
 for _ in range(2000):
     for a in JAW_ACTS:
-        data.ctrl[a] = -0.012
+        data.ctrl[a] = S.CHUCK_CLAMP_CTRL
     mujoco.mj_step(model, data)
 z_after = data.qpos[SHAFT_FREE_QADR + 2]
 drop = (z_before - z_after) * 1000
@@ -162,14 +162,14 @@ for pull in (1.0, 2.0, 5.0, 10.0, 20.0):
     place_shaft_in_chuck(data)
     for _ in range(1200):
         for a in JAW_ACTS:
-            data.ctrl[a] = -0.012
+            data.ctrl[a] = S.CHUCK_CLAMP_CTRL
         mujoco.mj_step(model, data)
 
     x0 = data.qpos[SHAFT_FREE_QADR]
     # 沿 +x 方向拉（往外拽）
     for _ in range(800):
         for a in JAW_ACTS:
-            data.ctrl[a] = -0.012
+            data.ctrl[a] = S.CHUCK_CLAMP_CTRL
         data.xfrc_applied[SHAFT_BODY, 0] = pull
         mujoco.mj_step(model, data)
     data.xfrc_applied[SHAFT_BODY, 0] = 0.0

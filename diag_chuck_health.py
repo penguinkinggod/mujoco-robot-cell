@@ -18,15 +18,25 @@ changes with joint angles). demo_08's comment records 143 mm of accumulated
 error before it was fixed by re-solving 3 times. Any reachability claim made
 with one call is wrong.
 
-Known limitation (measured, not guessed)
----------------------------------------
-The three jaws are driven by three independent position servos, so their
-displacements differ by ~4 mm and their normal forces by ~4x. A joint
-equality constraint was tried (mjEQ_JOINT, q1=q2) and rejected: 12 kp/ctrl
-combinations all ejected the shaft (0 contacts, eccentricity > 300 mm).
-The independent-servo version actually clamps well (0.2 mm eccentricity,
-20 N pull-out), so jaw_spread is reported as diagnostic information, NOT as
-a pass/fail criterion. Do not "fix" it without re-running this script.
+Why the jaws are synchronous now (measured, not guessed)
+-------------------------------------------------------
+Old version: three independent position servos, displacement spread
+4.24 mm, per-jaw force ratio ~4x. The root cause was NOT the drive -- the
+three jaw BOXES were never rotated to their 120 deg radial directions, so
+their effective radial half-widths were 9.0 / 12.3 / 12.3 mm. Fixing only
+that geometry (drive untouched) cut the spread to 0.23 mm and equalised
+the forces.
+
+Current: ONE servo (the screw) drives jaw_slide_0; two mjEQ_JOINT
+constraints make the other two jaws follow. Spread 0.12 mm, forces
+[6.5, 4.6, 7.1] N, eccentricity 0.00 mm, 20 N pull-out holds.
+mjEQ_JOINT is a SOFT constraint, so the remaining ~0.1 mm is elastic
+compliance under contact load, not a lack of synchronisation. Real chuck
+screws and jaws are not infinitely rigid either.
+
+DO NOT put the two extra actuators back: three servos fighting the same
+constraints blows q up to 202 mm and ejects the shaft (12 kp/ctrl combos
+all failed). jaw_spread IS now a pass/fail criterion.
 
 Run:
     D:\\robot-env\\Scripts\\python.exe diag_chuck_health.py
@@ -41,6 +51,11 @@ from demo_08_pick_and_load import Arm, WRIST_ROLL_GRASP, GRIP_OPEN
 ECC_LIMIT = 1.0        # mm, shaft axis vs chuck axis
 TILT_LIMIT = 2.0       # deg
 CONTACT_MIN = 6        # jaw-shaft contact points
+# True synchronisation criteria (added 2026-11-05 after the geometry fix).
+# 0.2 mm is the soft-constraint compliance measured under clamping load,
+# NOT a relaxed standard: it was 4.24 mm before.
+SPREAD_LIMIT = 0.2     # mm, max-min jaw slide displacement
+FORCE_RATIO_LIMIT = 2.0  # max/min per-jaw normal force
 # Coarse workspace check ONLY. A bare IK move still carries ~10 mm of
 # steady-state error. Final insertion accuracy (coaxiality <= 2 mm) needs
 # demo_09's shaft_in_grip compensation in the merged scene -- that is the
@@ -78,11 +93,11 @@ def main():
 
     for _ in range(200):
         for a in acts:
-            data.ctrl[a] = 0.005
+            data.ctrl[a] = S.CHUCK_OPEN_CTRL
         mujoco.mj_step(model, data)
     for _ in range(1500):
         for a in acts:
-            data.ctrl[a] = -0.012
+            data.ctrl[a] = S.CHUCK_CLAMP_CTRL
         mujoco.mj_step(model, data)
 
     jaw_q = np.array([data.qpos[a] * 1000 for a in ja])
@@ -111,13 +126,16 @@ def main():
                 contacts += 1
                 forces[k] += abs(f[0])
 
-    print("  三爪位移 (mm)   : %s   差 %.2f mm"
-          % (np.round(jaw_q, 2), spread))
-    print("  各爪法向力 (N)  : %s" % np.round(forces, 1))
+    force_ratio = (max(forces) / max(min(forces), 1e-6)
+                   if contacts >= CONTACT_MIN else float("inf"))
+    print("  三爪位移 (mm)   : %s   差 %.3f mm   (要求 ≤ %.1f)"
+          % (np.round(jaw_q, 3), spread, SPREAD_LIMIT))
+    print("  各爪法向力 (N)  : %s   力比 %.2f   (要求 ≤ %.1f)"
+          % (np.round(forces, 1), force_ratio, FORCE_RATIO_LIMIT))
     print("  轴心偏心        : %.2f mm   (要求 ≤ %.1f)" % (ecc, ECC_LIMIT))
     print("  轴姿态倾斜      : %.2f deg  (要求 ≤ %.1f)" % (tilt, TILT_LIMIT))
     print("  卡爪-轴接触点   : %d        (要求 ≥ %d)" % (contacts, CONTACT_MIN))
-    print("  （位移差为已知特征，仅诊断，不参与判定；见文件头说明）")
+    print("  （三爪由 1 个丝杠 + 2 条联动约束驱动；残余 0.1 mm 是软约束柔度）")
     print()
 
     # ---------------- reachability ----------------
@@ -154,11 +172,12 @@ def main():
     print()
 
     ok = (ecc <= ECC_LIMIT and tilt <= TILT_LIMIT
-          and contacts >= CONTACT_MIN and reach_err <= REACH_LIMIT)
+          and contacts >= CONTACT_MIN and reach_err <= REACH_LIMIT
+          and spread <= SPREAD_LIMIT and force_ratio <= FORCE_RATIO_LIMIT)
     print("=" * 74)
-    print("CHUCK_HEALTH jaw_spread_mm=%.2f ecc_mm=%.2f tilt_deg=%.2f "
-          "contacts=%d reach_err_mm=%.2f"
-          % (spread, ecc, tilt, contacts, reach_err))
+    print("CHUCK_HEALTH jaw_spread_mm=%.3f ecc_mm=%.2f tilt_deg=%.2f "
+          "contacts=%d reach_err_mm=%.2f force_ratio=%.2f"
+          % (spread, ecc, tilt, contacts, reach_err, force_ratio))
     print("CHUCK_HEALTH %s" % ("PASS" if ok else "FAIL"))
     print("=" * 74)
     print("OK")

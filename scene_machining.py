@@ -70,6 +70,14 @@ JAW_W = 0.018                 # 卡爪截面宽
 JAW_LEN = 0.028               # 卡爪沿轴向长度
 JAW_OPEN = 0.022              # 张开时卡爪内表面到轴线的距离
 
+# 卡盘驱动：真实三爪卡盘是「一根丝杠驱动一个自由度」，不是三个电机。
+# 这里只留 1 个 position servo 作用在 jaw_slide_0，另两爪由两条
+# mjEQ_JOINT 关节联动约束被动跟随（见 build_scene）。
+# 数值由受控扫描选定：位移差 0.12 mm、各爪力 [6.5,4.6,7.1] N、
+# 偏心 0.00 mm、20 N 拉不动。-0.012 也能夹住但位移差升到 0.17 mm。
+CHUCK_OPEN_CTRL = 0.005
+CHUCK_CLAMP_CTRL = -0.009
+
 
 def build_scene(shaft_mass=None, jaw_open=None):
     """建整个场景，返回 MjSpec。
@@ -268,11 +276,20 @@ def build_scene(shaft_mass=None, jaw_open=None):
         slide.damping[:] = 30.0
         slide.armature = 0.01
 
-        # 卡爪主体：截面是 (轴向长, 径向厚, 切向宽)
+        # 卡爪主体：截面是 (轴向长, 径向厚, 切向宽)。
+        # 必须把 box 绕 x 轴转到该爪的径向上！早期版本三个 geom 都是
+        # 轴对齐的，box 沿各自径向的支撑半宽变成 9*|cos|+9*|sin|：
+        # 第 0 爪 9 mm，另两爪 12.3 mm。三爪内表面到轴线天生差 3.3 mm，
+        # 导致「三爪不同步、受力差 4 倍」的假象（实测位移差 4.24 mm、
+        # 力 [7.1,23.8,25.8] N）。旋转后驱动架构一行不改，位移差降到
+        # 0.23 mm、力 [19.1,18.4,19.4] N、偏心 0.00 mm。
         jgeom = jb.add_geom()
         jgeom.name = "jaw_geom_%d" % k
         jgeom.type = mujoco.mjtGeom.mjGEOM_BOX
         jgeom.size = [JAW_LEN / 2, JAW_W / 2, JAW_W / 2]
+        # 绕 x 轴转 ang：局部 y 轴 (0,1,0) -> (0,cos(ang),sin(ang))，
+        # 正好与该爪的 slide axis [0, cy, cz] 同向。
+        jgeom.quat = [np.cos(ang / 2), np.sin(ang / 2), 0.0, 0.0]
         jgeom.rgba = [0.72, 0.68, 0.52, 1.0]
         jgeom.friction = [1.8, 0.06, 0.004]
         jgeom.contype = 2
@@ -280,21 +297,36 @@ def build_scene(shaft_mass=None, jaw_open=None):
 
         jaw_bodies.append(jb)
 
-    # 卡爪执行器：位置伺服，往里夹
-    # 关键：用 MuJoCo 的 <position> 简写等价形式。
-    # 手写 gainprm/biasprm 很容易把符号搞反（第一版就是这样，
-    # 卡爪不动、还把轴顶飞了）。正确的关系是：
-    #     force = gainprm[0]*(ctrl - qpos) - biasprm[2]*qvel
-    # 也就是 biasprm[1] 必须 = -gainprm[0]，biasprm[2] = -阻尼。
-    # 用 set_to_position 让 MuJoCo 自己填，不手写。
-    for k in range(3):
-        act = spec.add_actuator()
-        act.name = "jaw_act_%d" % k
-        act.target = "jaw_slide_%d" % k
-        act.trntype = mujoco.mjtTrn.mjTRN_JOINT
-        act.set_to_position(kp=4000.0, kv=120.0)
-        act.ctrlrange = [-0.015, 0.008]
-        act.forcerange = [-500.0, 500.0]
+    # 卡盘驱动：一根丝杠 = 一个执行器 + 两条关节联动约束。
+    #
+    # 用 MuJoCo 的 <position> 简写等价形式（set_to_position），别手写
+    # gainprm/biasprm —— 第一版把符号写反，卡爪不动还把轴顶飞了。
+    # 正确关系：force = gainprm[0]*(ctrl - qpos) - biasprm[2]*qvel。
+    act = spec.add_actuator()
+    act.name = "jaw_act"
+    act.target = "jaw_slide_0"
+    act.trntype = mujoco.mjtTrn.mjTRN_JOINT
+    act.set_to_position(kp=4000.0, kv=120.0)
+    act.ctrlrange = [-0.015, 0.008]
+    act.forcerange = [-500.0, 500.0]
+
+    # 联动约束：q_jaw_slide_0 = q_jaw_slide_1 = q_jaw_slide_2。
+    # MjsEquality.data 默认是 [0,1,0,0,0,...]，即 q1 = q2 的多项式恒等，
+    # 不用赋值；objtype 显式与否实测结果完全一样。
+    #
+    # 为什么早先「3 个伺服 + equality」会失败：3 个位置伺服各拉各的，
+    # 约束又强行绑在一起，求解器与伺服互相打，q 冲到 202 mm、轴被弹飞
+    # （12 组 kp/ctrl 全灭）。只留 1 个伺服、另两爪被动跟随才成立。
+    # 另外 mjEQ_JOINT 是软约束：收紧 solref 到 1 ms、提高 solimp 上限，
+    # 能把接触反力造成的稳态柔度压到 0.12 mm。真实卡盘的丝杠和爪也
+    # 不是绝对刚体，这个量级反而比「严格零差」更物理。
+    for k in (1, 2):
+        eq = spec.add_equality()
+        eq.type = mujoco.mjtEq.mjEQ_JOINT
+        eq.name1 = "jaw_slide_0"
+        eq.name2 = "jaw_slide_%d" % k
+        eq.solref[:] = [0.001, 1.0]
+        eq.solimp[:] = [0.9, 0.99, 0.0001, 0.5, 100.0]
 
     # ---- 相机 ----
     # 用 lookat 方式建相机最不容易错：
@@ -361,8 +393,10 @@ def make_scene():
                                          "gripper"),
         "jaws": [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY,
                                    "jaw_%d" % k) for k in range(3)],
+        # 一根丝杠只有一个 ctrl。保留列表形式，让诊断脚本里
+        # `for a in ids["jaw_acts"]: data.ctrl[a] = ...` 原样可用。
         "jaw_acts": [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR,
-                                       "jaw_act_%d" % k) for k in range(3)],
+                                       "jaw_act")],
     }
     return model, data, ids
 
@@ -382,7 +416,10 @@ if __name__ == "__main__":
     print("  末端位置  : %s" % np.round(data.site_xpos[ids["ee"]], 3))
     print("  卡盘中心  : (%.3f, %.3f, %.3f)" % (LATHE_X, LATHE_Y, LATHE_Z))
     print()
-    print("  执行器 %d 个：6 个臂关节 + 1 个夹爪 + 3 个卡爪" % model.nu)
+    print("  执行器 %d 个：臂关节 + 1 个夹爪 + 1 个卡盘丝杠（三爪联动）"
+          % model.nu)
+    print("  自由度约束 %d 条：jaw_slide_0 = jaw_slide_1 = jaw_slide_2"
+          % model.neq)
     for i in range(model.nu):
         n = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, i)
         print("    %-16s ctrlrange=[%+.3f, %+.3f]"
