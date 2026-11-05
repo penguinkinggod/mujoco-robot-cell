@@ -5,7 +5,8 @@ __pycache__/
 .venv/
 venv/
 
-# 生成的产物（demo 会自动重建）
+# 生成的产物（demo 会自动重建，统一落在 _build/）
+_build/
 demo_00.png
 demo_01_data.csv
 demo_01_pendulum.png

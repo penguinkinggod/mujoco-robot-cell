@@ -31,21 +31,21 @@ ENV["MUJOCO_GL"] = "glfw"
 ENV["PYTHONUTF8"] = "1"
 
 CORE_FILES = [
-    "scene_full.py",
-    "scene_machining.py",
-    "diag_slot_alone.py",
-    "diag_fixture_profile.py",
-    "diag_chuck_grip.py",
-    "demo_08_pick_and_load.py",
-    "demo_09_try_versions.py",
+    "src/scene_full.py",
+    "src/scene_machining.py",
+    "src/diag_slot_alone.py",
+    "src/diag_fixture_profile.py",
+    "src/diag_chuck_grip.py",
+    "src/demo_08_pick_and_load.py",
+    "src/demo_09_try_versions.py",
     "verify_all.py",
-    "diag_chuck_health.py",
+    "src/diag_chuck_health.py",
     # Also a real CHECKS entry below (kept here for py_compile coverage).
-    "diag_feed_chuck.py",
+    "src/diag_feed_chuck.py",
 ]
 
 MACHINING_CODE = (
-    "import scene_machining as S; "
+    "import sys; sys.path.insert(0, 'src'); import scene_machining as S; "
     "m,d,ids=S.make_scene(); "
     "print('COMPILE_OK ngeom=%d nbody=%d nq=%d' % (m.ngeom,m.nbody,m.nq))"
 )
@@ -141,15 +141,15 @@ CHECKS = [
          check=check_compile, slow=False, hint="秒级"),
     dict(name="车床场景编译", cmd=[PY, "-c", MACHINING_CODE],
          check=check_machining, slow=False, hint="秒级"),
-    dict(name="夹具落料 13/13", cmd=[PY, "diag_slot_alone.py"],
+    dict(name="夹具落料 13/13", cmd=[PY, "src/diag_slot_alone.py"],
          check=check_slot, slow=True, hint="约 3 秒"),
-    dict(name="卡盘夹紧", cmd=[PY, "diag_chuck_grip.py"],
+    dict(name="卡盘夹紧", cmd=[PY, "src/diag_chuck_grip.py"],
          check=check_chuck, slow=True, hint="约 2 秒"),
-    dict(name="卡盘工位体检", cmd=[PY, "diag_chuck_health.py"],
+    dict(name="卡盘工位体检", cmd=[PY, "src/diag_chuck_health.py"],
          check=check_chuck_health, slow=True, hint="约 5 秒"),
-    dict(name="完整序列 3/3", cmd=[PY, "demo_09_try_versions.py"],
+    dict(name="完整序列 3/3", cmd=[PY, "src/demo_09_try_versions.py"],
          check=check_demo09, slow=True, hint="约 9 秒"),
-    dict(name="机械臂送料装夹", cmd=[PY, "diag_feed_chuck.py"],
+    dict(name="机械臂送料装夹", cmd=[PY, "src/diag_feed_chuck.py"],
          check=check_feed, slow=True, hint="约 4 秒"),
 ]
 
