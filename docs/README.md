@@ -1,22 +1,27 @@
-# 原理笔记
+# 学习据点
 
-每一步一张纸，讲清"这段代码在干什么、为什么这么写、你改哪一行会看到什么"。
-不需要先学完 Python，看现象 → 改参数 → 再看现象，就是最快的学法。
+这个仓库按三条线走：
 
-| 文件 | 对应 demo |
+1. **先学仿真**：看懂模型、控制、运动学、接触和数据。
+2. **再做一个具体工位**：SO-101 抓取棒料并送进车床卡盘。
+3. **最后接入学习方法**：视觉、遥操作、模仿学习。前一层没站稳，不急着训练。
+
+## 从哪里开始
+
+| 想做什么 | 先看什么 |
 |---|---|
-| `01-what-is-simulator.md` | `demo_00_check.py` |
-| `02-control-and-steady-state-error.md` | `demo_01_pendulum.py` |
-| `03-kinematics-and-jacobian.md` | `demo_02_arm.py` |
-| `04-embodied-data.md` | `demo_03_camera_dataset.py` |
-| `05-grasp-pipeline.md` | `demo_04_panda_grasp.py` |
-| `06-why-numerically-exact-still-fails.md` | 四层误差诊断（IK 0.5 mm → 实际 38 mm） |
-| `07-community-learning-paths.md` | 社区学习路径调研（别人怎么走的） |
+| 第一次接触 MuJoCo | [01-what-is-simulator.md](learn/01-what-is-simulator.md) |
+| 想知道为什么“算对了还会错” | [06-why-numerically-exact-still-fails.md](learn/06-why-numerically-exact-still-fails.md) |
+| 想按顺序学基础 | [01](learn/01-what-is-simulator.md) → [02](learn/02-control-and-steady-state-error.md) → [03](learn/03-kinematics-and-jacobian.md) → [04](learn/04-embodied-data.md) → [05](learn/05-grasp-pipeline.md) |
+| 想看当前车床工位 | [项目定位](project-position.md) → [项目计划](project-plan.md) |
+| 想看代码和脚本放哪 | [代码地图](code-map.md) |
+| 想看 Git、GitHub、commit 怎么用 | [版本与提交](git-and-commits.md) |
+| 想查实验数据 | [工位资料索引](station/README.md) |
+| 想看相关研究 | [相关工作](research/related-work.md) |
+| 想看旧过程和失败版本 | [归档](archive/README.md) |
 
-## 推荐阅读顺序
+## 当前边界
 
-如果你只想读两篇：**先 `01`，再 `06`**。
+这里不是大创申报书，也不是把每一次小改动都写成报告。仓库只保留：当前项目状态、能帮助下次继续的学习笔记、能复现的实验和重要失败原因。
 
-`01` 告诉你仿真器到底在算什么；`06` 告诉你为什么算对了还会错——这两篇合起来是整个仓库的地基，其他都是它的应用。
-
-然后按 demo 顺序走 `02` → `05`。`07` 不用按顺序读，等你有「我是不是走偏了」的疑问时再看。
+大段历史不放在首屏；需要时从 [归档](archive/README.md) 或 Git 历史回看。

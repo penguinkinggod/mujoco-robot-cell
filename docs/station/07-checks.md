@@ -1,6 +1,6 @@
 # 已经做到了什么
 
-> README 里拆出来的，数字截至 2026-11-06。
+> 车床工位技术记录；当前状态以仓库首页为准。
 
 九项检查一次跑完，任何一项不过退出码非 0：
 
@@ -21,4 +21,4 @@
 变径扫描不在这 9 项里：它是带对照的实验，不是回归检查。单独跑
 `python src/diag_diameter_sweep.py`，结果落 `_build/diameter_sweep.csv` 和同名 PNG。
 
-回到 [README](../../README.md) · 全部拆分见 [索引](README.md)
+回到 [README](../../README.md) · 全部工位资料见 [索引](README.md)
