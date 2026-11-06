@@ -128,6 +128,10 @@ JAW_ARC_HALF_DEG = 52.0       # 每爪包角 104 deg，三爪共 312 deg，留 3
 JAW_ARC_CLEAR = 0.0002        # 镗孔半径比料半径大 0.2 mm（真机软爪留的间隙）
 JAW_ARC_THICK = 0.005         # 弧片径向厚度
 JAW_BACK_THICK = 0.008        # 背板厚度（只在视觉上补成实心块）
+# 软爪镗孔半径。None = 跟着 SHAFT_D 走，等于每换一种料就就地镗一套爪；
+# 设成固定值则是「拿一套现成软爪去夹别的直径」，给变径扫描用。
+# 默认 None，主线行为不变。
+JAW_ARC_BORE_R = None
 # 软爪的「设计闭合位」：镗孔时卡爪停的位置，与实际控制量解耦。
 # 夹紧力来自丝杠继续拧紧（ctrl 比这个位置更深），不是来自几何过盈。
 JAW_ARC_Q0 = -0.015
@@ -141,7 +145,8 @@ def add_soft_jaws(jb, k, ang, jaw_open, apply_mask):
     棒料仍可沿 +x 插入。基板、作动器、三条联动约束一行都不用改。
     """
     r_clamp = jaw_open + JAW_ARC_Q0
-    r_hole = SHAFT_D / 2 + JAW_ARC_CLEAR
+    bore = SHAFT_D / 2 if JAW_ARC_BORE_R is None else JAW_ARC_BORE_R
+    r_hole = bore + JAW_ARC_CLEAR
     r_c = r_hole + JAW_ARC_THICK / 2
     half = np.deg2rad(JAW_ARC_HALF_DEG)
     da = 2 * half / JAW_ARC_SEGS
