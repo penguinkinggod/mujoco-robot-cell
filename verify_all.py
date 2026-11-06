@@ -163,6 +163,31 @@ def check_feed_physics(out, err, rc):
         coax, tilt, contacts, pull, force)
 
 
+def check_env_cell(out, err, rc):
+    """Same physics, but in the official lerobot/so101-tabletop-mujoco world.
+
+    The scene migration is only real if the numbers survive it. This runs the
+    identical V-jaw flow with official_world=True and requires the same
+    coaxiality band and `carry=physics` -- plus all four cameras present, so a
+    silently dropped camera (which would break the dataset/video path) fails
+    the check instead of passing quietly.
+    """
+    m = re.search(
+        r"FEED_METRIC coax_mm=([\d.]+) tilt_deg=([\d.]+) contacts=(\d+) "
+        r"slip_mm=([\d.]+) pull_mm=([\d.]+) .*carry=physics", out)
+    if not m:
+        return False, "官方场景里没有 carry=physics 的 FEED_METRIC"
+    ncam = re.search(r"CAMS (\d+)", out)
+    if not ncam or int(ncam.group(1)) < 4:
+        return False, "相机不全（应为 front/top/cell/wrist_cam 四个）"
+    coax, tilt = float(m.group(1)), float(m.group(2))
+    contacts = int(m.group(3))
+    good = (rc == 0 and "FEED_METRIC PASS" in out
+            and coax <= 2.0 and tilt <= 10.0 and contacts >= 6)
+    return good, "官方场景 同轴%.2fmm 倾斜%.1f° 接触%d 相机%s个" % (
+        coax, tilt, contacts, ncam.group(1))
+
+
 CHECKS = [
     dict(name="语法检查", cmd=[PY, "-m", "py_compile"] + CORE_FILES,
          check=check_compile, slow=False, hint="秒级"),
@@ -176,11 +201,15 @@ CHECKS = [
          check=check_chuck_health, slow=True, hint="约 5 秒"),
     dict(name="完整序列 3/3", cmd=[PY, "src/demo_09_try_versions.py"],
          check=check_demo09, slow=True, hint="约 9 秒"),
-    dict(name="机械臂送料装夹", cmd=[PY, "src/diag_feed_chuck.py"],
+    dict(name="机械臂送料装夹(历史基线·穿模)",
+         cmd=[PY, "src/diag_feed_chuck.py", "--passthrough"],
          check=check_feed, slow=True, hint="约 4 秒"),
     dict(name="送料·全物理(V槽)",
          cmd=[PY, "src/diag_feed_chuck.py", "--v-jaw", "--lift", "--no-lock"],
          check=check_feed_physics, slow=True, hint="约 20 秒"),
+    dict(name="送料·官方场景(SO-101 env)",
+         cmd=[PY, "src/env_cell.py", "--run", "--no-video"],
+         check=check_env_cell, slow=True, hint="约 5 秒"),
 ]
 
 

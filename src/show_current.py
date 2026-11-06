@@ -58,9 +58,11 @@ def make_cam(lookat, distance, azimuth, elevation):
 #   B 斜俯视：机器人 / 车床 / 工件三者关系最清楚，物体占比合适
 #   E 正对卡盘端面：三爪 120° 夹住轴端最清楚
 #   I 侧向：能看到轴水平伸进卡盘
-CENTER = [0.184, 0.120, 0.060]
-CAM_MAIN = make_cam([0.21, 0.01, 0.07], 0.55, -38, -22)
-CAM_CHUCK = make_cam(CENTER, 0.24, 0, -10)
+# Lathe moved to x=0.28 so the 5-DoF arm can actually hold the rod axis;
+# the final shaft centre is 0.205 and the jaw front is 0.225.
+CENTER = [0.205, 0.120, 0.060]
+CAM_MAIN = make_cam([0.23, 0.01, 0.075], 0.60, -38, -22)
+CAM_CHUCK = make_cam([0.225, 0.120, 0.060], 0.24, 0, -10)
 CAM_SIDE = make_cam(CENTER, 0.22, 90, -10)
 CAM_PART = make_cam(list(F.SHAFT_POS), 0.28, 30, -20)
 
@@ -285,9 +287,9 @@ def main():
     def frame_hook(tag, _model, _data):
         counter[0] += 1
         img = shot(CAM_MAIN)
-        if tag is not None or counter[0] % 2 == 0:
-            small = Image.fromarray(img).resize((480, 360), RESAMPLE)
-            gif_frames.append(np.asarray(small))
+        # One rendered frame per simulation frame: no dropped odd frames.
+        small = Image.fromarray(img).resize((480, 360), RESAMPLE)
+        gif_frames.append(np.asarray(small))
         if tag is not None:
             stages.append((normalize(tag), img.copy()))
             if tag.startswith("\u2460"):        # ① 起始
@@ -298,6 +300,7 @@ def main():
     print("正在跑送料仿真并逐帧渲染（画面与 PASS 指标同源）...")
     buf = io.StringIO()
     with contextlib.redirect_stdout(Tee(sys.stdout, buf)):
+        D.FRAME_EVERY = 20          # dt=0.002 s -> 25 fps, one GIF frame each
         rc = D.main(frame_hook=frame_hook, model=model, data=data,
                     v_jaw=True, lift=True, carry_lock=False)
     rend.close()
@@ -310,7 +313,7 @@ def main():
     save_stages(stages)
 
     import imageio.v2 as imageio
-    imageio.mimsave(FEED_GIF, gif_frames, fps=14, loop=0)
+    imageio.mimsave(FEED_GIF, gif_frames, fps=25, loop=0)
     save_gallery(metric, status, len(gif_frames), len(stages))
 
     print("\n已生成：")

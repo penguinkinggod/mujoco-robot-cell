@@ -69,13 +69,29 @@ def reload_modules():
     return sys.modules["diag_feed_chuck"]
 
 
+PUSH_STATS = {"ok": 0, "fail": 0}
+
+
 def push(qpos):
-    np.save(TMP, qpos)
+    """Atomically publish one qpos frame, tolerating Windows file locks.
+
+    A single fixed temp name can still be held open by a reader or AV scan;
+    np.save() then raises PermissionError and aborts the whole run. Rotate
+    four temp names and catch the whole save+replace transaction, so a busy
+    file costs one frame instead of killing the simulation.
+    """
+    slot = (PUSH_STATS["ok"] + PUSH_STATS["fail"]) % 4
+    tmp = TMP.replace(".npy", ".%d.npy" % slot)
     try:
-        os.replace(TMP, STATE)
+        np.save(tmp, qpos)
+        os.replace(tmp, STATE)
+        PUSH_STATS["ok"] += 1
     except OSError:
-        # Windows 上窗口正在读这一帧时替换会被拒绝；跳过这帧，下一帧再写。
-        pass
+        PUSH_STATS["fail"] += 1
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def _cam_of(v):
@@ -137,7 +153,7 @@ def view():
                             last = q
                     except (OSError, ValueError):
                         pass        # 正在原子替换，下一帧再读
-                time.sleep(0.02)
+                time.sleep(0.01)
         if not stale:
             print("VIEW_CLOSED", flush=True)
             return 0
@@ -157,11 +173,15 @@ def run(loop=False):
     def hook(tag, _m, d):
         push(d.qpos.copy())
         frames[0] += 1
-        time.sleep(0.015)
+        # The view process polls the state file at ~100 Hz. A long sleep here
+        # used to throttle the whole playback to a visibly jerky ~15 fps.
+        time.sleep(0.002)
 
     while True:
         try:
-            D.FRAME_EVERY = 20          # reload 会把模块常量还原成 60
+            # dt=0.002 s, so 10 steps = ~50 fps. The old 20-step stride plus
+            # a 15 ms hook sleep made the motion look like stop-motion.
+            D.FRAME_EVERY = 10          # reload 会把模块常量还原成 60
             model = D.build_model(**SCENE)
             data = mujoco.MjData(model)
             rc = D.main(frame_hook=hook, model=model, data=data,
@@ -171,7 +191,10 @@ def run(loop=False):
         except Exception as exc:
             print("RUN_ERROR %s: %s" % (type(exc).__name__, exc), flush=True)
             rc = 1
-        print("PUSH_DONE frames=%d rc=%d" % (frames[0], rc), flush=True)
+        ok, bad = PUSH_STATS["ok"], PUSH_STATS["fail"]
+        print("PUSH_DONE frames=%d ok=%d fail=%d (丢帧 %.1f%%) rc=%d"
+              % (frames[0], ok, bad, 100.0 * bad / max(1, ok + bad), rc),
+              flush=True)
         if not loop:
             return rc
         time.sleep(1.5)         # 喘口气再跑一遍，窗口不会一下停住

@@ -77,6 +77,13 @@ CT_ROBOT = (1, 3)
 CT_WORK = (2, 3)
 CT_FIXTURE = (4, 2)
 CT_STATIC = (4, 3)
+# 机床实体（卡盘本体 / 床头箱 / 主轴）：只挡机器人，不挡工件。
+# 之前这里是 (0,0)，即"完全不参与碰撞"——所以爪子能整块从卡盘里穿过去，
+# 画面上看得见穿模，而指标照过（工件只和三根爪接触）。
+#   vs 机器人 (1,3):  ca=1 & ct=1 = 1  -> 碰
+#   vs 工件   (2,3):  ca=1 & ct=2 = 0, ca=3 & ct=8 = 0  -> 不碰
+# 工件仍然不碰盘面，才能沿轴线进给到卡爪里；机器人碰，才不能穿模。
+CT_MACHINE = (8, 1)
 
 # ---- workpiece: D-shaft 20 x 80 mm with a milled flat so it will not roll
 SHAFT_D = 0.020
@@ -152,8 +159,98 @@ def jaw_geometry():
     }
 
 
+def _cam_quat(x_axis, y_axis):
+    """Quat for a camera given its world x/y axes (MuJoCo cam looks down -z)."""
+    x = np.asarray(x_axis, float)
+    y = np.asarray(y_axis, float)
+    x /= np.linalg.norm(x)
+    y -= (y @ x) * x
+    y /= np.linalg.norm(y)
+    z = np.cross(x, y)
+    R = np.column_stack([x, y, z])
+    q = np.zeros(4)
+    mujoco.mju_mat2Quat(q, np.ascontiguousarray(R).reshape(-1))
+    return q
+
+
+# Official lerobot/so101-tabletop-mujoco world, copied verbatim from
+# so101_tabletop.xml (Apache-2.0). Its table surface is z = 0 -- the same
+# datum this project already calibrates every pose to -- so adopting it
+# changes NOTHING about IK targets, the lathe origin or the V-jaw geometry.
+OFFICIAL_TABLE_SIZE = (0.80, 0.80, 0.03)     # 80 x 80 cm top, 3 cm thick
+OFFICIAL_TABLE_POS = (0.20, 0.0, -0.015)
+OFFICIAL_FLOOR_Z = -0.75                      # table stands on 75 cm legs
+OFFICIAL_CAMS = (
+    ("front", (0.5, 0.0, 0.2), (0, 1, 0), (-0.493, 0, 0.87), 60.0),
+    ("top", (0.2, 0.0, 0.48), (0, -1, 0), (1, 0, 0), 60.0),
+)
+# `front` 是官方给"方块进盒子"定的机位：它在 x=+0.5，也就是卡盘**背面**。
+# 我们这类车床工位最关键的一段（工件插进三爪）正好被床头箱挡死 —— 实测录
+# 出来的 gif 里只能看见手臂把一个圆柱推到卡盘后面去。
+# 所以另给一个 `cell` 机位，从 -y 侧斜看工作区，卡盘口朝 -x 正好对着它。
+CELL_CAM_POS = (0.02, -0.52, 0.28)
+CELL_CAM_TARGET = (0.21, 0.04, 0.075)
+CELL_CAM_FOVY = 48.0
+
+
+def _look_at(pos, target, up=(0.0, 0.0, 1.0)):
+    """Camera quat for a camera at `pos` pointing at `target` (looks down -z)."""
+    f = np.asarray(target, float) - np.asarray(pos, float)
+    f /= np.linalg.norm(f)
+    z = -f                                    # MuJoCo cameras look along -z
+    x = np.cross(np.asarray(up, float), z)
+    if np.linalg.norm(x) < 1e-8:              # looking straight up/down
+        x = np.array([1.0, 0.0, 0.0])
+    x /= np.linalg.norm(x)
+    y = np.cross(z, x)
+    R = np.column_stack([x, y, z])
+    q = np.zeros(4)
+    mujoco.mju_mat2Quat(q, np.ascontiguousarray(R).reshape(-1))
+    return q
+# Wrist camera: official `camera_mount` body sits at identity under `gripper`,
+# so the same offset can be hung straight on the gripper body. Our arm model
+# (lerobot_env_so101-0.4.0) does not ship this camera.
+WRIST_CAM_POS = (-0.00296, 0.05436, -0.05310)
+WRIST_CAM_QUAT = (0.958280, -0.285792, -0.001556, 0.004547)
+WRIST_CAM_FOVY = 61.0
+
+
+ARM_SERVO_KV = 2.6      # Nm·s/rad，位置伺服缺失的微分项（见 _damp_arm_servos）
+ARM_SERVO_KP = 70.0     # N/m·rad 等效刚度；XML 里是 17.8（下垂 17 mm）
+ARM_ACT_NAMES = ("shoulder_pan", "shoulder_lift", "elbow_flex",
+                 "wrist_flex", "wrist_roll")
+
+
+def _damp_arm_servos(spec, kv=ARM_SERVO_KV):
+    """给 SO101 的五个位置伺服补上微分项（Kd）。
+
+    so101_new_calib.xml 里 <position kp="17.8"/> 只给了刚度、没给阻尼，
+    XML 自己那行注释也写着「Kd 与 Kp 不是 1:1，需要按 lerobot Kp=16 Kd=32
+    重新辨识」—— 也就是说这一版模型只做了 Kp 辨识，Kd 是缺的。
+
+    缺 Kd 的后果实测（elbow_flex 阶跃 0.15 rad，静置 0.8 s 后给阶跃）：
+
+        kv=0.0  超调 45.6%   0.36 s 一个来回，末端看就是「一跳一跳」
+        kv=1.6  超调 13.9%   同样的阶跃，一次到位不再回弹
+
+    超调 45% 意味着每次加速/减速，末端都会先冲过头再荡回来，频率约
+    2.8 Hz —— 窗口里看到的「不是顿，是一跳一跳」就是这个，和轨迹规划
+    无关：轨迹再光滑，伺服自己会振。关节自带的 damping=0.6 太小
+    （临界阻尼要 2.4 左右）。
+
+    只动五个臂关节，不动 gripper：夹持力是按现在这组参数标定的。
+    """
+    kv = float(os.environ.get("SO101_KV", kv))
+    kp_env = os.environ.get("SO101_KP")
+    for act in spec.actuators:
+        if act.name in ARM_ACT_NAMES:
+            kp = ARM_SERVO_KP if kp_env is None else float(kp_env)
+            act.set_to_position(kp=kp, kv=kv)
+
+
 def build_scene(shaft_mass=None, with_lathe=False, lathe_origin=None,
-                with_vise=True, with_fixture=True, with_shaft_flat=True):
+                with_vise=True, with_fixture=True, with_shaft_flat=True,
+                machine_solid=True, official_world=False):
     """Build the merged scene.
 
     The three with_* switches default to True so demo_08 / demo_09 and every
@@ -165,6 +262,7 @@ def build_scene(shaft_mass=None, with_lathe=False, lathe_origin=None,
         shaft_mass = SHAFT_MASS
 
     spec = mujoco.MjSpec.from_file(SO101_XML)
+    _damp_arm_servos(spec)
     mesh_out = SO101_MESH_DIR
     spec.meshdir = SO101_MESH_DIR
     spec.visual.global_.offwidth = 1600
@@ -182,18 +280,72 @@ def build_scene(shaft_mass=None, with_lathe=False, lathe_origin=None,
     floor = wb.add_geom()
     floor.name = "floor"
     floor.type = mujoco.mjtGeom.mjGEOM_PLANE
-    floor.size = [2.0, 2.0, 0.02]
-    floor.pos = [0.0, 0.0, TABLE_TOP_Z - TABLE_SIZE[2]]
     floor.rgba = [0.27, 0.29, 0.33, 1.0]
+    if official_world:
+        # Official room: the table stands on 75 cm legs, so the ground plane
+        # is far below the work surface. Nothing in the feed flow goes there
+        # unless the part is dropped, which is exactly when we want to see it.
+        floor.size = [1.0, 1.5, 0.05]
+        floor.pos = [0.0, 0.0, OFFICIAL_FLOOR_Z]
+    else:
+        floor.size = [2.0, 2.0, 0.02]
+        floor.pos = [0.0, 0.0, TABLE_TOP_Z - TABLE_SIZE[2]]
     _mask(floor, *CT_STATIC)
 
     table = wb.add_geom()
     table.name = "table"
     table.type = mujoco.mjtGeom.mjGEOM_BOX
-    table.size = [TABLE_SIZE[0] / 2, TABLE_SIZE[1] / 2, TABLE_SIZE[2] / 2]
-    table.pos = [0.28, 0.02, TABLE_TOP_Z - TABLE_SIZE[2] / 2]
+    if official_world:
+        table.size = [OFFICIAL_TABLE_SIZE[0] / 2, OFFICIAL_TABLE_SIZE[1] / 2,
+                      OFFICIAL_TABLE_SIZE[2] / 2]
+        table.pos = list(OFFICIAL_TABLE_POS)
+    else:
+        table.size = [TABLE_SIZE[0] / 2, TABLE_SIZE[1] / 2, TABLE_SIZE[2] / 2]
+        table.pos = [0.28, 0.02, TABLE_TOP_Z - TABLE_SIZE[2] / 2]
     table.rgba = [0.37, 0.39, 0.43, 1.0]
     _mask(table, *CT_STATIC)
+
+    if official_world:
+        # Three 2 m walls, visual only (contype 0): they exist so a rendered
+        # frame is recognisable as the official tabletop scene, not so the
+        # arm can bump into a room.
+        for i, (size, pos) in enumerate(
+                (([0.02, 1.5, 1.0], [-1.0, 0.0, 0.25]),
+                 ([1.0, 0.02, 1.0], [0.0, 1.5, 0.25]),
+                 ([1.0, 0.02, 1.0], [0.0, -1.5, 0.25]))):
+            w = wb.add_geom()
+            w.name = "room_wall_%d" % i
+            w.type = mujoco.mjtGeom.mjGEOM_BOX
+            w.size = size
+            w.pos = pos
+            w.rgba = [0.85, 0.84, 0.80, 1.0]
+            _mask(w, 0, 0)
+
+    if official_world:
+        # Same two world cameras as so101_tabletop.xml, same poses.
+        for name, pos, xa, ya, fovy in OFFICIAL_CAMS:
+            c = wb.add_camera()
+            c.name = name
+            c.pos = list(pos)
+            c.quat = _cam_quat(xa, ya)
+            c.fovy = fovy
+        cc = wb.add_camera()
+        cc.name = "cell"
+        cc.pos = list(CELL_CAM_POS)
+        cc.quat = _look_at(CELL_CAM_POS, CELL_CAM_TARGET)
+        cc.fovy = CELL_CAM_FOVY
+        # Wrist view: what the official env calls `wrist_cam`, hung on the
+        # gripper body at the offset its `camera_mount` body uses (identity
+        # pose, so the two are equivalent).
+        try:
+            gc = spec.body("gripper").add_camera()
+            gc.name = "wrist_cam"
+            gc.pos = list(WRIST_CAM_POS)
+            gc.quat = list(WRIST_CAM_QUAT)
+            gc.fovy = WRIST_CAM_FOVY
+        except Exception as exc:            # noqa: BLE001 - model may vary
+            print("    wrist_cam not attached: %s" % exc)
+
 
     # ---- lights ----
     for nm, pos, dir_, dif, sh in [
@@ -333,8 +485,10 @@ def build_scene(shaft_mass=None, with_lathe=False, lathe_origin=None,
         # demo_09 and every existing diagnostic keep their baseline.
         # CT_FIXTURE (4,2) makes the jaws touch the workpiece but NOT the
         # gripper pads, which is the same trick used for the slot fixture
-        # (the wrist sits only 8.2 mm above the pads). The headstock and
-        # disc are visual-only so the inserted shaft does not hit them.
+        # (the wrist sits only 8.2 mm above the pads). The shaft must not hit
+        # the disc or it can never seat -- but the ARM must, or the gripper
+        # walks straight through the chuck. CT_MACHINE gives exactly that:
+        # blocks contype=1 (robot), ignores contype=2 (workpiece).
         import scene_machining as SM
         if lathe_origin is None:
             lathe_origin = (0.26, 0.12, TABLE_TOP_Z + 0.060)
@@ -343,7 +497,10 @@ def build_scene(shaft_mass=None, with_lathe=False, lathe_origin=None,
             origin=lathe_origin,
             table_z=TABLE_TOP_Z,
             jaw_mask=CT_FIXTURE,
-            static_mask=(0, 0),
+            # machine_solid=False reproduces the old pass-through scene. It
+            # exists ONLY so the legacy flat-pad baseline can be re-run and
+            # compared; every new path must keep the machine solid.
+            static_mask=CT_MACHINE if machine_solid else (0, 0),
         )
 
     return spec

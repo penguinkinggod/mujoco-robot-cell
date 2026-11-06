@@ -156,14 +156,26 @@ def main():
     # ---------------- physics ----------------
     mujoco.mj_resetData(model, data)
     data.qpos[sq:sq + 3] = [
-        S.LATHE_X + S.SHAFT_L / 2 - 0.020, S.LATHE_Y, S.LATHE_Z]
+        S.LATHE_X - 0.050, S.LATHE_Y, S.LATHE_Z]
     data.qpos[sq + 3:sq + 7] = SHAFT_Q0
     data.qvel[:] = 0.0
     mujoco.mj_forward(model, data)
 
-    for _ in range(200):
+    for a in ja:
+        data.qpos[a] = S.JAW_ARC_Q0
+    data.qvel[:] = 0.0
+    mujoco.mj_forward(model, data)
+
+    # 软爪先停在镗孔位（孔 = Φ20.4），Φ20 棒料放进去由孔托住，再拧紧丝杠。
+    # 从张开位（通道 Φ32）起步会让棒料在夹紧前就掉到台面（实测 z -50 mm），
+    # 爪于是夹空 —— 那是这个体检脚本的摆位不对，真实上料是机械臂扶着送进去的。
+    ramp = 500
+    for i in range(ramp):
+        t = (i + 1) / ramp
+        s = t * t * (3.0 - 2.0 * t)
         for a in acts:
-            data.ctrl[a] = S.CHUCK_OPEN_CTRL
+            data.ctrl[a] = (S.JAW_ARC_Q0
+                            + s * (S.CHUCK_CLAMP_CTRL - S.JAW_ARC_Q0))
         mujoco.mj_step(model, data)
     for _ in range(1500):
         for a in acts:
@@ -176,8 +188,12 @@ def main():
     quat = data.qpos[sq + 3:sq + 7]
     ecc = float(np.hypot((p[1] - S.LATHE_Y) * 1000,
                          (p[2] - S.LATHE_Z) * 1000))
-    tilt = float(np.degrees(
-        2 * np.arccos(min(1.0, abs(float(np.dot(SHAFT_Q0, quat)))))))
+    # 圆柱绕自身轴线滚动不影响车削装夹，真正要管的是「工件轴线」与主轴
+    # 轴线（world x）的夹角。四元数总转角会把无害的滚动误报成倾斜，
+    # 主流程 diag_feed_chuck.axdev() 早就改成了这个口径，这里统一。
+    shaft_body = int(model.geom_bodyid[shaft_geom])
+    rod_ax = data.xmat[shaft_body].reshape(3, 3)[:, 2]
+    tilt = float(np.degrees(np.arccos(min(1.0, abs(float(rod_ax[0]))))))
 
     contacts = 0
     forces = [0.0, 0.0, 0.0]
@@ -190,7 +206,10 @@ def main():
         if shaft_geom not in (c.geom1, c.geom2):
             continue
         for k in range(3):
-            if ("jaw_geom_%d" % k) in (n1, n2):
+            # 软爪由 JAW_ARC_SEGS 个小弧片拼成，名字是 jaw_geom_<k>_<seg>；
+            # 按前缀归到同一个爪，不能再用精确名字相等来判断。
+            prefix = "jaw_geom_%d" % k
+            if n1.startswith(prefix) or n2.startswith(prefix):
                 f = np.zeros(6)
                 mujoco.mj_contactForce(model, data, i, f)
                 contacts += 1

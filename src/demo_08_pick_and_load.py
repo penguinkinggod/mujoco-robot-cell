@@ -146,6 +146,128 @@ class Arm:
         mujoco.mj_forward(self.m, tmp)
         return q, np.linalg.norm(target - tmp.site_xpos[self.site])
 
+    def ik_pose(self, target_pos, target_rot, q_init=None, iters=900,
+                lam=0.03, step=0.6, lock_wrist_roll=None, rot_len=0.06):
+        """6-DoF IK: site position AND site orientation.
+
+        Why this exists: the 3-DoF ik() can put the rod's CENTRE on the
+        chuck axis while the rod itself is still 4.3 deg off it. On an
+        80 mm rod that is a 6 mm error at the far end -- no amount of
+        translation fixes it, only rotating the wrist does.
+
+        target_rot : 3x3 world rotation the site should end up with.
+        rot_len    : characteristic length (m) used to put radians and
+                     metres on the same scale. 1 rad of wrist error moves
+                     the rod tip by ~L*1, so L is the natural weight.
+                     Too large (tried 0.35) and the solver sacrifices
+                     position to chase angle: residual went to 9 mm.
+        """
+        d = self.d
+        q = np.array([d.qpos[a] for a in self.qadr]) if q_init is None \
+            else np.array(q_init, dtype=float)
+        free_idx = [0, 1, 2, 3] if lock_wrist_roll is not None else [0, 1, 2, 3, 4]
+        dadr_sub = [self.dadr[i] for i in free_idx]
+        if lock_wrist_roll is not None:
+            q[4] = lock_wrist_roll
+
+        target_pos = np.asarray(target_pos, dtype=float)
+        target_rot = np.asarray(target_rot, dtype=float)
+
+        tmp = mujoco.MjData(self.m)
+        tmp.qpos[:] = d.qpos
+        for a, v in zip(self.qadr, q):
+            tmp.qpos[a] = v
+        mujoco.mj_forward(self.m, tmp)
+
+        jacp = np.zeros((3, self.m.nv))
+        jacr = np.zeros((3, self.m.nv))
+        pos_err = 1.0
+        rot_err = 1.0
+        for _ in range(iters):
+            mujoco.mj_forward(self.m, tmp)
+            pos_err = float(np.linalg.norm(target_pos - tmp.site_xpos[self.site]))
+            R_err = target_rot @ tmp.site_xmat[self.site].reshape(3, 3).T
+            c = np.clip((np.trace(R_err) - 1.0) / 2.0, -1.0, 1.0)
+            ang = float(np.arccos(c))
+            if ang < 1e-7:
+                rv = np.zeros(3)
+            else:
+                rv = (ang / (2.0 * np.sin(ang))) * np.array([
+                    R_err[2, 1] - R_err[1, 2],
+                    R_err[0, 2] - R_err[2, 0],
+                    R_err[1, 0] - R_err[0, 1],
+                ])
+            rot_err = float(np.linalg.norm(rv))
+            if pos_err < 5e-5 and rot_err < 5e-4:
+                break
+            mujoco.mj_jacSite(self.m, tmp, jacp, jacr, self.site)
+            J = np.vstack([jacp[:, dadr_sub], jacr[:, dadr_sub] * rot_len])
+            e = np.concatenate([target_pos - tmp.site_xpos[self.site],
+                                rv * rot_len])
+            dq = J.T @ np.linalg.solve(J @ J.T + lam ** 2 * np.eye(6), e)
+            for k, idx in enumerate(free_idx):
+                q[idx] = np.clip(q[idx] + step * dq[k],
+                                 self.lo[idx], self.hi[idx])
+            for a, v in zip(self.qadr, q):
+                tmp.qpos[a] = v
+        mujoco.mj_forward(self.m, tmp)
+        return q, pos_err, rot_err
+
+    def ik_axis(self, target_pos, target_axis, axis_local, q_init=None,
+                iters=500, lam=0.025, step=0.6, rot_len=0.06):
+        """Position + CYLINDER AXIS IK for a 5-DoF arm.
+
+        A round rod has a free rotation about its own axis.  Demanding a full
+        3-D orientation (ik_pose, six constraints) on this five-joint arm
+        leaves an unreachable problem: measured 19 mm / 37 deg residual.
+        Only two orientation constraints are actually needed to align the
+        rod with the chuck.  This solver keeps site position and rotates the
+        site so that `axis_local` points along `target_axis`, leaving the
+        roll about that axis unconstrained.
+
+        axis_local is the rod axis expressed in the gripperframe site frame;
+        it is re-measured from the real shaft before each move, so small slip
+        in the V jaws is compensated instead of accumulating.
+        """
+        target_pos = np.asarray(target_pos, dtype=float)
+        target_axis = np.asarray(target_axis, dtype=float)
+        target_axis /= max(float(np.linalg.norm(target_axis)), 1e-12)
+        axis_local = np.asarray(axis_local, dtype=float)
+        axis_local /= max(float(np.linalg.norm(axis_local)), 1e-12)
+
+        q = np.array([self.d.qpos[a] for a in self.qadr]) if q_init is None \
+            else np.array(q_init, dtype=float)
+        tmp = mujoco.MjData(self.m)
+        tmp.qpos[:] = self.d.qpos
+        for a, v in zip(self.qadr, q):
+            tmp.qpos[a] = v
+        mujoco.mj_forward(self.m, tmp)
+
+        jacp = np.zeros((3, self.m.nv))
+        jacr = np.zeros((3, self.m.nv))
+        pos_err = 1.0
+        axis_err = np.pi
+        for _ in range(iters):
+            mujoco.mj_forward(self.m, tmp)
+            pos_err = float(np.linalg.norm(target_pos - tmp.site_xpos[self.site]))
+            R_site = tmp.site_xmat[self.site].reshape(3, 3)
+            a = R_site @ axis_local
+            a /= max(float(np.linalg.norm(a)), 1e-12)
+            dot = float(np.clip(np.dot(a, target_axis), -1.0, 1.0))
+            axis_err = float(np.arccos(abs(dot)))
+            rv = np.cross(a, target_axis)
+            if pos_err < 5e-5 and axis_err < 5e-4:
+                break
+            mujoco.mj_jacSite(self.m, tmp, jacp, jacr, self.site)
+            J = np.vstack([jacp[:, self.dadr], jacr[:, self.dadr] * rot_len])
+            e = np.concatenate([target_pos - tmp.site_xpos[self.site],
+                                rv * rot_len])
+            dq = J.T @ np.linalg.solve(J @ J.T + lam ** 2 * np.eye(6), e)
+            q = np.clip(q + step * dq, self.lo, self.hi)
+            for a, v in zip(self.qadr, q):
+                tmp.qpos[a] = v
+        return q, pos_err, axis_err
+
     def move_to(self, target_pad, n_steps=400, grip=None, wrist_roll=None):
         """把 pad 中心移到 target_pad。
 

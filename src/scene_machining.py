@@ -81,8 +81,101 @@ JAW_OPEN = 0.022              # 张开时卡爪内表面到轴线的距离
 # mjEQ_JOINT 关节联动约束被动跟随（见 build_scene）。
 # 数值由受控扫描选定：位移差 0.12 mm、各爪力 [6.5,4.6,7.1] N、
 # 偏心 0.00 mm、20 N 拉不动。-0.012 也能夹住但位移差升到 0.17 mm。
-CHUCK_OPEN_CTRL = 0.005
-CHUCK_CLAMP_CTRL = -0.010
+# 卡盘控制量是「丝杠目标位置」，单位 m（负 = 夹紧方向），力由
+# <position> 执行器的 forcerange 限幅 —— 这就是真机：丝杠把爪送到某个
+# 位置，扭矩上限决定最大夹紧力，工件挡住时爪停在工件上、力封顶。
+#
+# 中间试过纯 <motor> 力控（force = ctrl），方向对但有个致命问题：
+# 爪失去位置约束，会一路滑到 -30 mm，弧片穿过卡盘中心，三爪互撞
+# （216 个接触对），力全耗在自身穿模上，工件反而夹不住。
+# 关节限位拦不住 150 N（solreflimit 太软，被压穿 14 mm）。
+#
+# 位置伺服的 kp 受稳定性限制：kp < armature/dt^2。原来 armature=0.01
+# 时只能到 kp=4000、过盈 7 mm 才 28 N。真机的爪 + 丝杠 + 平面螺纹
+# 等效惯量远不止 10 g，所以把 armature 提到 0.2，kp 就能开到 20000：
+# 同样 5 mm 过盈给出 ~100 N，而且爪仍然被目标位置约束着，不会穿。
+CHUCK_OPEN_CTRL = 0.010       # m，丝杠退到张开位
+# 「拧到底」= 目标位置给到远超滑座行程的深度，夹紧力由 forcerange 封顶。
+# 实测（2026-11-06，diag_jaw_wrap.py + verify_all.py 9/9）：
+#   -0.020 -> 执行器 -84.5 N（未封顶），三爪 [29.3 13.9 35.9] N，力比 2.58
+#   -0.030 -> 执行器 -150.0 N（封顶），  三爪 [52.7 41.7 41.8] N，力比 1.27
+# 力限抬到 300/500/800/1200 N 全部无效（执行器恒定 -84.5 N）：瓶颈是
+# kp x 位移误差，forcerange 在 -0.020 下是个够不着的天花板。
+# 再往深也不行：力限 300 N 时滑座 -15.99 -> -16.38 mm，三爪端面出现
+# 6 对互顶，料上的力反而只剩 224 N、下沉涨到 0.233 mm。
+# 全流程实测：三爪 168.7 N、20 N 拉拔 0.00 mm、同轴 0.71 mm、接触 30。
+# 前提：slide.armature 必须 0.2。add_lathe 里原来是 0.01，而 kp=20000
+# 要求 armature > kp*dt^2 = 0.08，差了 8 倍 —— 伺服在发散边缘抖，爪
+# 抖到把料甩飞（同轴 250 mm、机械臂跟着乱晃）。这条比夹紧参数重要。
+CHUCK_CLAMP_CTRL = -0.030     # m，丝杠拧到底（力由 forcerange 封顶）
+CHUCK_CTRL_RANGE = (-0.032, 0.012)     # m，丝杠目标行程（比滑座行程深）
+CHUCK_FORCE_LIMIT = 150.0     # N，扭矩上限（三爪合计；每爪名义 50 N）
+
+# ---- 按料径镗出的圆弧软爪（soft jaws）----
+# 原来的卡爪是 18x18 mm 方盒，中心在半径 22 mm 处；闭合时三个盒子互相
+# 穿插，围出来的是一个三角区而不是圆孔，Φ20 圆柱能在里面滚、能沿重力
+# 方向沉到平衡位（实测夹紧后 11 s 内 z 掉 4.3 mm，"变正"是滑出来的）。
+# 真实三爪卡盘用软爪按料径镗圆弧，三个 120 deg 弧片合成一个圆孔，靠
+# 几何自定心。
+#
+# MuJoCo 的 mesh 碰撞走凸包：单独一个凹圆弧网格会被填平，凹槽消失。
+# 所以用 N 个小凸 box 沿圆弧拼，每段自身是凸的，整体近似凹面。
+# 段数是精度与数值稳定性的折中：9 段时三爪法向力比 2.33（>2 判据挂），
+# 7 段 2.01，5 段 1.63，3 段 1.61。取 5 段：弦弧误差仅 0.17 mm，
+# 接触点少，力分配不被 0.13 mm 的三爪同步差放大。
+JAW_ARC_SEGS = 5
+JAW_ARC_HALF_DEG = 52.0       # 每爪包角 104 deg，三爪共 312 deg，留 3x16 deg 缝
+JAW_ARC_CLEAR = 0.0002        # 镗孔半径比料半径大 0.2 mm（真机软爪留的间隙）
+JAW_ARC_THICK = 0.005         # 弧片径向厚度
+JAW_BACK_THICK = 0.008        # 背板厚度（只在视觉上补成实心块）
+# 软爪的「设计闭合位」：镗孔时卡爪停的位置，与实际控制量解耦。
+# 夹紧力来自丝杠继续拧紧（ctrl 比这个位置更深），不是来自几何过盈。
+JAW_ARC_Q0 = -0.015
+
+
+def add_soft_jaws(jb, k, ang, jaw_open, apply_mask):
+    """把第 k 个卡爪的方盒换成拼出来的圆弧软爪。
+
+    闭合时（q = CHUCK_CLAMP_CTRL）弧片内表面正好落在 r_hole 上；张开时
+    整组随滑座沿自身径向平移 20 mm，轴向通道最小内半径约 27 mm，Φ20
+    棒料仍可沿 +x 插入。基板、作动器、三条联动约束一行都不用改。
+    """
+    r_clamp = jaw_open + JAW_ARC_Q0
+    r_hole = SHAFT_D / 2 + JAW_ARC_CLEAR
+    r_c = r_hole + JAW_ARC_THICK / 2
+    half = np.deg2rad(JAW_ARC_HALF_DEG)
+    da = 2 * half / JAW_ARC_SEGS
+    ca, sa = np.cos(ang), np.sin(ang)
+    for s in range(JAW_ARC_SEGS):
+        a = ang - half + (s + 0.5) * da
+        g = jb.add_geom()
+        # 名字必须保留 jaw_geom_<k> 前缀：jaw_state() / diag_chuck_health
+        # / probe_chuck_mask 都靠这个名字统计接触点和法向力。
+        g.name = "jaw_geom_%d_%02d" % (k, s)
+        g.type = mujoco.mjtGeom.mjGEOM_BOX
+        g.size = [JAW_LEN / 2, JAW_ARC_THICK / 2,
+                  r_c * np.sin(da / 2) * 1.02]   # 相邻段轻微重叠，避免缝隙
+        # body 原点在 r*u(ang)；闭合时它移到 r_clamp*u(ang)，所以这里
+        # 用 r_clamp 反推局部偏移，保证闭合位姿的弧心与主轴重合。
+        g.pos = [0.0,
+                 r_c * np.cos(a) - r_clamp * ca,
+                 r_c * np.sin(a) - r_clamp * sa]
+        g.quat = [np.cos(a / 2), np.sin(a / 2), 0.0, 0.0]
+        g.rgba = [0.72, 0.68, 0.52, 1.0]
+        g.friction = [1.8, 0.06, 0.004]
+        apply_mask(g)
+
+    # 背板：闭合时内表面在 r_hole + JAW_ARC_THICK 以外，碰不到 Φ20 棒料，
+    # 只是让爪在画面里看起来是实心块。
+    b = jb.add_geom()
+    b.name = "jaw_back_%d" % k
+    b.type = mujoco.mjtGeom.mjGEOM_BOX
+    r_back = r_c + JAW_ARC_THICK / 2 + JAW_BACK_THICK / 2
+    b.size = [JAW_LEN / 2, JAW_BACK_THICK / 2, JAW_W / 2]
+    b.pos = [0.0, (r_back - r_clamp) * ca, (r_back - r_clamp) * sa]
+    b.quat = [np.cos(ang / 2), np.sin(ang / 2), 0.0, 0.0]
+    b.rgba = [0.55, 0.52, 0.42, 1.0]
+    apply_mask(b)
 
 
 def build_scene(shaft_mass=None, jaw_open=None):
@@ -98,6 +191,17 @@ def build_scene(shaft_mass=None, jaw_open=None):
         jaw_open = JAW_OPEN
 
     spec = mujoco.MjSpec.from_file(SO101)
+    # 同上（scene_full._damp_arm_servos）：XML 里 <position kp="17.8"/> 没有
+    # Kd，阶跃超调 45.6%、2.8 Hz 回弹，末端看就是「一跳一跳」。
+    # 这里是另一条独立建模路径，参数必须和 scene_full 保持一致。
+    try:
+        from scene_full import ARM_SERVO_KP as _KP, ARM_SERVO_KV as _KV
+    except Exception:
+        _KP, _KV = 70.0, 2.6
+    for _a in spec.actuators:
+        if _a.name in ("shoulder_pan", "shoulder_lift", "elbow_flex",
+                       "wrist_flex", "wrist_roll"):
+            _a.set_to_position(kp=_KP, kv=_KV)
 
     # 机器人底座抬到台面上
     base = spec.body("base")
@@ -277,10 +381,14 @@ def build_scene(shaft_mass=None, jaw_open=None):
         slide.name = "jaw_slide_%d" % k
         slide.type = mujoco.mjtJoint.mjJNT_SLIDE
         slide.axis = [0.0, cy, cz]
-        slide.range = [-0.015, 0.008]
-        # damping 是向量，armature 是标量，类型不一样（踩过）
-        slide.damping[:] = 30.0
-        slide.armature = 0.01
+        # 行程限位。位置伺服本身已经不会越过目标位置，这里只是兜底。
+        slide.range = [-0.022, 0.018]
+        slide.limited = mujoco.mjtLimited.mjLIMITED_TRUE
+        # damping 是向量，armature 是标量，类型不一样（踩过）。
+        # armature 从 0.01 提到 0.2：爪 + 丝杠 + 平面螺纹的等效惯量，
+        # 也是 kp 能开到 20000 而不抖的前提（kp < armature/dt^2）。
+        slide.damping[:] = 300.0
+        slide.armature = 0.2
 
         # 卡爪主体：截面是 (轴向长, 径向厚, 切向宽)。
         # 必须把 box 绕 x 轴转到该爪的径向上！早期版本三个 geom 都是
@@ -289,32 +397,27 @@ def build_scene(shaft_mass=None, jaw_open=None):
         # 导致「三爪不同步、受力差 4 倍」的假象（实测位移差 4.24 mm、
         # 力 [7.1,23.8,25.8] N）。旋转后驱动架构一行不改，位移差降到
         # 0.23 mm、力 [19.1,18.4,19.4] N、偏心 0.00 mm。
-        jgeom = jb.add_geom()
-        jgeom.name = "jaw_geom_%d" % k
-        jgeom.type = mujoco.mjtGeom.mjGEOM_BOX
-        jgeom.size = [JAW_LEN / 2, JAW_W / 2, JAW_W / 2]
-        # 绕 x 轴转 ang：局部 y 轴 (0,1,0) -> (0,cos(ang),sin(ang))，
-        # 正好与该爪的 slide axis [0, cy, cz] 同向。
-        jgeom.quat = [np.cos(ang / 2), np.sin(ang / 2), 0.0, 0.0]
-        jgeom.rgba = [0.72, 0.68, 0.52, 1.0]
-        jgeom.friction = [1.8, 0.06, 0.004]
-        jgeom.contype = 2
-        jgeom.conaffinity = 3
+        def _mask_box(g):
+            g.contype = 2
+            g.conaffinity = 3
+
+        add_soft_jaws(jb, k, ang, jaw_open, _mask_box)
 
         jaw_bodies.append(jb)
 
     # 卡盘驱动：一根丝杠 = 一个执行器 + 两条关节联动约束。
     #
-    # 用 MuJoCo 的 <position> 简写等价形式（set_to_position），别手写
-    # gainprm/biasprm —— 第一版把符号写反，卡爪不动还把轴顶飞了。
-    # 正确关系：force = gainprm[0]*(ctrl - qpos) - biasprm[2]*qvel。
+    # 用 <motor>，ctrl 就是牛顿。前面几版用 <position> 加 kp=4000：
+    # 力 = kp x (ctrl - q)，过盈 7 mm 才 28 N，夹 Φ20 的 45 钢根本不够
+    # （师傅夹 55x75、只咬 5 mm 都不掉，那是 kN 级）。力控还顺便解决了
+    # 「过盈一调就炸」——位置伺服硬顶 27 个弧片会互相打架，力控不会。
     act = spec.add_actuator()
     act.name = "jaw_act"
     act.target = "jaw_slide_0"
     act.trntype = mujoco.mjtTrn.mjTRN_JOINT
-    act.set_to_position(kp=4000.0, kv=120.0)
-    act.ctrlrange = [-0.015, 0.008]
-    act.forcerange = [-500.0, 500.0]
+    act.set_to_position(kp=20000.0, kv=600.0)
+    act.ctrlrange[:] = CHUCK_CTRL_RANGE
+    act.forcerange[:] = (-CHUCK_FORCE_LIMIT, CHUCK_FORCE_LIMIT)
 
     # 联动约束：q_jaw_slide_0 = q_jaw_slide_1 = q_jaw_slide_2。
     # MjsEquality.data 默认是 [0,1,0,0,0,...]，即 q1 = q2 的多项式恒等，
@@ -476,22 +579,20 @@ def add_lathe(spec, *, origin=None, table_z=0.0, jaw_open=None,
         slide.name = "jaw_slide_%d" % k
         slide.type = mujoco.mjtJoint.mjJNT_SLIDE
         slide.axis = [0.0, cy, cz]
-        slide.range = [-0.015, 0.008]
+        # 行程限位必须显式打开。以前卡盘是位置伺服，ctrl 的 ctrlrange
+        # [-0.030, 0.008] 顺手当了限位，所以没暴露；改成力控（ctrl = N）
+        # 以后爪一路滑到 -27 mm、弧片穿过卡盘中心，216 个接触对，力全耗
+        # 在自身穿模上，工件反而夹不住。真机丝杠行程是有限的。
+        slide.range = [-0.020, 0.020]
+        slide.limited = mujoco.mjtLimited.mjLIMITED_TRUE
         slide.damping[:] = 30.0
-        slide.armature = 0.01
+        # 与 build_scene 一致：kp=20000 的稳定前提是 armature > kp*dt^2
+        # = 20000*0.002^2 = 0.08。0.01 会让伺服一直在发散边缘振荡
+        # （窗口里看到的“卡爪疯狂动来动去”），0.2 才是调通的值。
+        slide.armature = 0.2
 
-        jgeom = jb.add_geom()
-        jgeom.name = "jaw_geom_%d" % k
-        jgeom.type = mujoco.mjtGeom.mjGEOM_BOX
-        jgeom.size = [JAW_LEN / 2, JAW_W / 2, JAW_W / 2]
-        # Rotate the box so its local y points along THIS jaw's radius.
-        # Leaving all three axis-aligned makes their effective radial
-        # half-widths 9.0 / 12.3 / 12.3 mm, which fakes a 4.24 mm
-        # synchronisation error.
-        jgeom.quat = [np.cos(ang / 2), np.sin(ang / 2), 0.0, 0.0]
-        jgeom.rgba = [0.72, 0.68, 0.52, 1.0]
-        jgeom.friction = [1.8, 0.06, 0.004]
-        _m(jgeom, *jaw_mask)
+        add_soft_jaws(jb, k, ang, jaw_open,
+                      lambda g: _m(g, *jaw_mask))
 
     # One screw = one actuator. MjsEquality.data defaults to
     # [0,1,0,0,0,...], i.e. polycoef 0+1x => q2 = q1. Verified in
@@ -501,9 +602,10 @@ def add_lathe(spec, *, origin=None, table_z=0.0, jaw_open=None,
     act.name = "jaw_act"
     act.target = "jaw_slide_0"
     act.trntype = mujoco.mjtTrn.mjTRN_JOINT
-    act.set_to_position(kp=4000.0, kv=120.0)
-    act.ctrlrange = [-0.015, 0.008]
-    act.forcerange = [-500.0, 500.0]
+    # 位置伺服 + 力限幅 = 丝杠：目标位置给行程，forcerange 给扭矩上限。
+    act.set_to_position(kp=20000.0, kv=600.0)
+    act.ctrlrange[:] = CHUCK_CTRL_RANGE
+    act.forcerange[:] = (-CHUCK_FORCE_LIMIT, CHUCK_FORCE_LIMIT)
 
     for k in (1, 2):
         eq = spec.add_equality()

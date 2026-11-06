@@ -68,9 +68,10 @@ def main():
                 if tag:
                     print("  " + tag)
                 v.sync()
-                time.sleep(0.012)
+                time.sleep(0.002)
 
             try:
+                D.FRAME_EVERY = 10       # dt=0.002 s -> ~50 fps
                 D.main(frame_hook=hook, model=model, data=data)
             except KeyboardInterrupt:
                 print("窗口已关闭，提前结束。")

@@ -110,10 +110,18 @@ def run_once(verbose=True):
 
         err = None
         for _ in range(3):
-            err = arm.move_to(tgt_pad, n_steps=max(90, ns // 3), grip=grip,
+            # ns//3 是当年为了配「软而无阻尼」的伺服调的：那时候伺服跟
+            # 不上，运动反而慢。2026-11-06 给伺服补了 Kd、Kp 17.8->70，
+            # 同样的步数会真的跑出更高加速度，工件在爪里被甩出 10~15 mm。
+            # 给满 ns 步，加速度回到工件夹得住的范围。
+            err = arm.move_to(tgt_pad, n_steps=ns, grip=grip,
                               wrist_roll=WRIST_ROLL_GRASP)
             if err < 0.005:
                 break
+        if name.startswith("⑤"):
+            for _ in range(300):
+                data.ctrl[arm.grip_act] = grip
+                mujoco.mj_step(model, data)
         pad = arm.pad_center()
         sh = data.qpos[sq:sq + 3].copy()
         trace.append({

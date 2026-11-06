@@ -1,6 +1,8 @@
 mujoco>=3.17.0
 numpy>=2.0
+scipy>=1.11           # src/diag_feed_chuck.py 的关节路径三次样条（CubicSpline）
 matplotlib>=3.8
 imageio>=2.38
 imageio-ffmpeg>=0.5
 pillow>=10.0
+gymnasium>=1.0        # 仅 src/env_cell.py 需要；不装也能跑，只是不能 gym.make

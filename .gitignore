@@ -4,6 +4,8 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+# 半成品/损坏的虚拟环境，可再生
+.venv*/
 
 # 生成的产物（demo 会自动重建，统一落在 _build/）
 _build/
