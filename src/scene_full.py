@@ -216,7 +216,7 @@ WRIST_CAM_FOVY = 61.0
 
 
 ARM_SERVO_KV = 2.6      # Nm·s/rad，位置伺服缺失的微分项（见 _damp_arm_servos）
-ARM_SERVO_KP = 70.0     # N/m·rad 等效刚度；XML 里是 17.8（下垂 17 mm）
+ARM_SERVO_KP = 70.0     # Nm/rad；XML 里是 17.8（下垂 17 mm），官方新版是 998
 ARM_ACT_NAMES = ("shoulder_pan", "shoulder_lift", "elbow_flex",
                  "wrist_flex", "wrist_roll")
 

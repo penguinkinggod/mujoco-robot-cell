@@ -511,6 +511,13 @@ DEBUG_MOVE = os.environ.get("FEED_DEBUG") == "1"
 GRIP_SETTLE = 120        # 每次 move3 前先把夹爪指令落实的步数
 MIN_FIX_STEPS = 150      # 闭环修正轮的最短时长（0.30 s）：再短伺服落不了地
 
+# SMOOTH=1 走「一条连续轨迹」：抬升 -> 横移 -> 下降 -> 进给 合并成一次
+# Ruckig 规划，中途不减速、不停车。0 = 老的分段 rest-to-rest 路径。
+SMOOTH_PATH = os.environ.get("SMOOTH", "1") == "1"
+# 位置伺服的速度前馈系数 = kv/kp（秒）。纯 PD 在匀速段的跟踪误差是
+# (kv/kp)*qdot，把参考速度按这个比例提前量加进指令即可补偿。
+ARM_LEAD = F.ARM_SERVO_KV / F.ARM_SERVO_KP
+
 
 def main(frame_hook=None, model=None, data=None, carry_lock=True,
          v_jaw=False, lift=False, wrist=None, machine_solid=True):
@@ -888,18 +895,17 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         for k in range(iters):
             if err < tol:
                 break
-            # 修正轮只差几毫米，却和第一轮拿一样的步数 -> 长距离那轮
-            # 冲过去，剩下几轮用同样的时间搬 2~3 mm，末端速度不到
-            # 0.01 m/s，看着就是「跳一下然后长时间不动」。按剩余距离
-            # 缩时，但不少于 90 步（0.18 s），否则伺服落不了地、量到
-            # 的误差是「还在路上」的位置。
-            steps_k = (move_steps if k == 0
-                       else int(min(move_steps,
-                                    max(90, move_steps * err / dist0))))
-            kw = {}
-            if state["axis_hold"]:
-                # 多轮闭环共享同一条五次时间律，轮间不停车。
-                kw = {"s0": k / iters, "s1": (k + 1) / iters}
+            # 时间律共享之后，每轮的行程必须配同样的时长，否则「缩短的
+            # 修正轮」会用更短的时间走同样的 s 区间，末端速度反而更高。
+            # 收敛轮的位移小、速度自然低，看起来是减速收车，不再是一顿
+            # 一顿。
+            steps_k = move_steps
+            # 多轮闭环共享一条时间律，轮间不停车。原来只在 axis_hold
+            # 时这么做，其余段每轮各跑一条 0->1 的五次曲线，速度每轮
+            # 归零一次 —— 进给 3 轮就是 3 次急停急起。五次曲线的导数
+            # 只在 t=0/1 处为零，按 [k/iters,(k+1)/iters] 切分后轮间
+            # 速度是连续的。
+            kw = {"s0": k / iters, "s1": (k + 1) / iters}
             kw["settle_steps"] = 90 if k == iters - 1 else 60
             move(tgt, steps_k, grip, locked, jaw_ctrl, **kw)
             err = float(np.linalg.norm(meas() - gmeas))
@@ -915,6 +921,127 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                   % (label, " ".join("%.1f" % (e * 1000) for e in trace),
                      len(trace) - 1, sign_flips))
         return err
+
+    def move_path(targets, grip, locked, jaw_ctrl=SM.CHUCK_OPEN_CTRL,
+                  label="搬运", samples=None, v_cruise=0.55, a_max=2.0,
+                  j_max=25.0, lead=None):
+        """一条连续轨迹走完整串路点：中途不减速、不停车。
+
+        老写法每个路点一次 move3（rest -> rest），抬升/横移/下降/进给
+        四次就是四次完整起停，速度每个路点归零一次。Ruckig 的做法是
+        路点只约束位置，速度由全局时间律安排：jerk 受限的梯形速度曲线，
+        整条作业只有一次起步、一次收车。
+
+        路径按弧长均匀重采样后逐点链式解 IK（保持工件轴线），再用
+        PCHIP 连接。用 PCHIP 而不是三次样条：自然样条在路点密的地方
+        会过冲，关节速度因此出现负向小摆动，窗口里就是「一顿一顿」。
+
+        播放时叠加速度前馈 ctrl = q_ref + (kv/kp)*qdot_ref。纯 PD 在
+        匀速段的滞后是 (kv/kp)*qdot，这一项把它抵掉。
+        """
+        from scipy.interpolate import PchipInterpolator
+        from ruckig import Ruckig, InputParameter, Trajectory
+
+        if lead is None:
+            lead = ARM_LEAD
+        state["label"] = label
+        mujoco.mj_forward(model, data)
+        off = arm.pad_offset()
+        site_start = data.site_xpos[arm.site].copy()
+        pts = [site_start] + [np.asarray(t, float) - off for t in targets]
+        uniq = [pts[0]]
+        for p in pts[1:]:
+            if np.linalg.norm(p - uniq[-1]) > 1e-6:
+                uniq.append(p)
+        seg = np.array([np.linalg.norm(b - a) for a, b in zip(uniq, uniq[1:])])
+        cum = np.concatenate([[0.0], np.cumsum(seg)])
+        total = float(cum[-1])
+        if total < 1e-6:
+            return 0.0
+        if samples is None:
+            samples = int(np.clip(total / 0.012, 24, 80))
+
+        s_grid = np.linspace(0.0, 1.0, samples + 1)
+        dense = []
+        for s in s_grid:
+            d = s * total
+            i = int(np.clip(np.searchsorted(cum, d) - 1, 0, len(seg) - 1))
+            f = 0.0 if seg[i] < 1e-9 else (d - cum[i]) / seg[i]
+            dense.append(uniq[i] + np.clip(f, 0.0, 1.0) * (uniq[i + 1] - uniq[i]))
+
+        # 逐点链式 IK：每一点的初值取上一点的解，避免跳分支。
+        q_start = np.array([data.qpos[a] for a in arm.qadr])
+        R_site = data.site_xmat[arm.site].reshape(3, 3)
+        a_local = R_site.T @ rod_axis()
+        qs = [q_start]
+        q_prev = q_start.copy()
+        worst = 0.0
+        for p in dense[1:]:
+            # 每个点都从同一个初值解，不要链式传递。4 个自由关节解 3 维
+            # 位置本身就是冗余的（有 1 维零空间），逐点以上一点为初值，
+            # 47 个点走下来会沿零空间一路漂，实测末端在 x 方向少走 100 mm、
+            # 机械臂自己折起来（同轴 32 mm、接触 0）。
+            if state["axis_hold"]:
+                q_sol, pe, _ae = arm.ik_axis(
+                    p, np.array([1.0, 0.0, 0.0]), a_local,
+                    q_init=q_start, iters=300)
+            else:
+                q_sol, pe = arm.ik(p, lock_wrist_roll=wrist)
+            worst = max(worst, float(pe))
+            qs.append(np.asarray(q_sol, float).copy())
+        Q = np.asarray(qs)
+
+        # 归一化弧长上做 jerk 受限的时间参数化。
+        dt = float(model.opt.timestep)
+        otg = Ruckig(1, dt)
+        inp = InputParameter(1)
+        inp.current_position = [0.0]
+        inp.current_velocity = [0.0]
+        inp.current_acceleration = [0.0]
+        inp.target_position = [1.0]
+        inp.target_velocity = [0.0]
+        inp.target_acceleration = [0.0]
+        inp.max_velocity = [v_cruise / total]
+        inp.max_acceleration = [a_max / total]
+        inp.max_jerk = [j_max / total]
+        traj = Trajectory(1)
+        otg.calculate(inp, traj)
+        n = max(2, int(np.ceil(traj.duration / dt)))
+
+        prof = [traj.at_time(min(i * dt, traj.duration)) for i in range(n + 1)]
+        pchip = PchipInterpolator(s_grid, Q, axis=0)
+
+        for i in range(n):
+            s = float(np.clip(prof[i][0][0], 0.0, 1.0))
+            sd = float(prof[i][1][0])
+            s2 = float(np.clip(prof[min(i + 1, n)][0][0], 0.0, 1.0))
+            q = pchip(s)
+            qd = (pchip(s2) - q) / dt
+            for a, v, w in zip(arm.qadr, q, qd):
+                data.ctrl[a] = v + lead * w
+            data.ctrl[arm.grip_act] = grip
+            data.ctrl[jaw_act] = jaw_ctrl
+            mujoco.mj_step(model, data)
+            state.setdefault("traj", []).append(
+                data.site_xpos[arm.site].copy())
+            state.setdefault("traj_t", []).append(float(data.time))
+            state.setdefault("traj_label", []).append(state.get("label", "?"))
+            if locked:
+                lock()
+            track_pen(label)
+            if DEBUG_MOVE and i % 100 == 0:
+                print("      i=%4d s=%.3f cmd=%s qpos=%s pad=%s ncon=%d"
+                      % (i, s, np.round(q, 2).tolist(),
+                         np.round([data.qpos[a] for a in arm.qadr], 2).tolist(),
+                         np.round(arm.pad_center(), 3).tolist(), data.ncon))
+            if frame_hook is not None and i % FRAME_EVERY == 0:
+                tick()
+
+        if DEBUG_MOVE:
+            print("    path[%s] 弧长 %.0f mm / %d 点 / 规划 %.2f s / IK 最大残差 %.1f mm"
+                  % (label, total * 1000, samples + 1, traj.duration,
+                     worst * 1000))
+        return float(np.linalg.norm(arm.pad_center() - np.asarray(targets[-1])))
 
     def settle(n, jaw_ctrl, grip, locked=False):
         for i in range(n):
@@ -1016,49 +1143,70 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         ("高位横移", [stage_x, axis[1], 0.16], 900),
         ("下到轴线", [stage_x, axis[1], axis[2]], 700),
     ]
-    for name, tgt, ns in carry:
-        # 只有最后一段闭环到「工件」，前三段必须闭环到「pad」：
-        # 工件此刻还躺在台面的 V 槽夹具里，把它当作被控对象就等于
-        # 命令机械臂去拽一个还被夹具夹着的零件。实测过：对中/抬起
-        # 一旦 probe=shaft，工件被硬拽出槽，轴向偏从 2.4 deg 飙到 81 deg，
-        # 后面三爪一个接触点都没有。
-        close_on_part = (name == "下到轴线") and not carry_lock
-        err = move3(pad_target(tgt), ns,
-                    grip_close, carry_lock,
-                    probe=shaft if close_on_part else None,
-                    probe_goal=np.array(tgt) if close_on_part else None,
-                    label=name)
-        ngc, fgrip = grip_state()
-        a_site = (data.site_xmat[arm.site].reshape(3, 3)
-                  @ state["a_local"])
-        site_dev = float(np.degrees(np.arccos(
-            min(1.0, abs(float(a_site[0]))))))
-        print("  %-6s IK残差=%5.1f mm 轴=%s 同轴=%6.2f mm 倾斜=%4.1f deg "
-              "轴向偏=%4.1f deg 工具轴偏=%4.1f deg V槽=%d/%.0fN"
-              % (name, err * 1000, np.round(shaft(), 4), coax(),
-                 tilt_deg(data.qpos[sq + 3:sq + 7]), axdev(), site_dev,
-                 ngc, fgrip))
-        tick({"对中": "⑤ 对中｜搬运锁接管",
-              "抬起": "⑥ 抬起",
-              "高位横移": "⑦ 高位横移｜到卡盘外侧",
-              "下到轴线": "⑧ 下到轴线｜停在卡盘外"}[name])
-        if name == "高位横移" and not carry_lock:
-            print("  轴线保持    %4.1f deg（搬运中持续用 5 轴位置+轴线 IK）"
-                  % axdev())
-
     # 直线进给：只动 x，y/z 和工件轴线由 ik_axis 全程保持。
-    print("  进给     目标 x=%.3f（自由端进卡爪 %.0f mm，工件留在外 %.0f mm，"
-          "高度补偿 %.1f mm）"
-          % (axis[0], INSERT_MM * 1000,
-             (F.SHAFT_L - INSERT_MM) * 1000, FEED_Z_COMP * 1000))
     feed_goal = axis.copy()
     if not carry_lock:
         feed_goal[2] += FEED_Z_COMP
-    err = move3(pad_target(feed_goal), 500, grip_close,
-                carry_lock,
-                probe=None if carry_lock else shaft,
-                probe_goal=None if carry_lock else feed_goal,
-                label="进给")
+
+    if SMOOTH_PATH:
+        # 抬升 / 横移 / 下降 / 进给 合成一条连续轨迹。老写法是四个
+        # move3，每个都是一次 rest -> rest，等于四次完整起停。
+        err = move_path([pad_target(t) for _n, t, _ns in carry]
+                        + [pad_target(feed_goal)],
+                        grip_close, carry_lock, label="搬运")
+        print("  搬运     四段路点 -> 一条连续轨迹  IK残差=%5.1f mm "
+              "同轴=%6.2f mm 轴向偏=%4.1f deg 倾斜=%4.1f deg"
+              % (err * 1000, coax(), axdev(),
+                 tilt_deg(data.qpos[sq + 3:sq + 7])))
+        tick("⑤–⑧ 连续搬运｜对中·抬升·横移·下降")
+        # 连续轨迹是开环 + 前馈，末端还剩十几毫米的稳态误差（kp=70 的
+        # 下垂）。进给是唯一必须精确到位的地方，所以只在这里补一次闭环，
+        # 而不是把整条轨迹切回逐段 rest-to-rest。
+        err = move3(pad_target(feed_goal), 260, grip_close, carry_lock,
+                    probe=None if carry_lock else shaft,
+                    probe_goal=None if carry_lock else feed_goal,
+                    label="进给", iters=4)
+    else:
+        for name, tgt, ns in carry:
+            # 只有最后一段闭环到「工件」，前三段必须闭环到「pad」：
+            # 工件此刻还躺在台面的 V 槽夹具里，把它当作被控对象就等于
+            # 命令机械臂去拽一个还被夹具夹着的零件。实测过：对中/抬起
+            # 一旦 probe=shaft，工件被硬拽出槽，轴向偏从 2.4 deg 飙到 81 deg，
+            # 后面三爪一个接触点都没有。
+            close_on_part = (name == "下到轴线") and not carry_lock
+            err = move3(pad_target(tgt), ns,
+                        grip_close, carry_lock,
+                        probe=shaft if close_on_part else None,
+                        probe_goal=np.array(tgt) if close_on_part else None,
+                        label=name)
+            ngc, fgrip = grip_state()
+            a_site = (data.site_xmat[arm.site].reshape(3, 3)
+                      @ state["a_local"])
+            site_dev = float(np.degrees(np.arccos(
+                min(1.0, abs(float(a_site[0]))))))
+            print("  %-6s IK残差=%5.1f mm 轴=%s 同轴=%6.2f mm 倾斜=%4.1f deg "
+                  "轴向偏=%4.1f deg 工具轴偏=%4.1f deg V槽=%d/%.0fN"
+                  % (name, err * 1000, np.round(shaft(), 4), coax(),
+                     tilt_deg(data.qpos[sq + 3:sq + 7]), axdev(), site_dev,
+                     ngc, fgrip))
+            tick({"对中": "⑤ 对中｜搬运锁接管",
+                  "抬起": "⑥ 抬起",
+                  "高位横移": "⑦ 高位横移｜到卡盘外侧",
+                  "下到轴线": "⑧ 下到轴线｜停在卡盘外"}[name])
+            if name == "高位横移" and not carry_lock:
+                print("  轴线保持    %4.1f deg（搬运中持续用 5 轴位置+轴线 IK）"
+                      % axdev())
+
+        # 直线进给：只动 x，y/z 和工件轴线由 ik_axis 全程保持。
+        print("  进给     目标 x=%.3f（自由端进卡爪 %.0f mm，工件留在外 %.0f mm，"
+              "高度补偿 %.1f mm）"
+              % (axis[0], INSERT_MM * 1000,
+                 (F.SHAFT_L - INSERT_MM) * 1000, FEED_Z_COMP * 1000))
+        err = move3(pad_target(feed_goal), 500, grip_close,
+                    carry_lock,
+                    probe=None if carry_lock else shaft,
+                    probe_goal=None if carry_lock else feed_goal,
+                    label="进给")
     # 夹爪站位按 pad 中心量；真实碰撞再查机器人与机床的接触对。
     station_x = arm.pad_center()[0]
     machine_hits = 0
