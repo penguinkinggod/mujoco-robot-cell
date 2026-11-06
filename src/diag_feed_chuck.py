@@ -1174,14 +1174,14 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         print("  松手退出     IK残差=%5.1f mm 同轴=%5.2f mm "
               "轴向偏=%4.1f deg 接触=%d"
               % (rerr * 1000, coax(), axdev(), jaw_state()[0]))
-    tick("⑨ 三爪夹紧｜单丝杠联动")
+    tick("⑩ 三爪夹紧｜单丝杠联动")
 
     # Hand the shaft back to PHYSICS before any load test.
     state["lock_active"] = False
     settle(1600, SM.CHUCK_CLAMP_CTRL, GRIP_OPEN)
     print("  解锁静置     轴=%s 同轴=%5.2f mm 轴向偏=%5.1f deg 接触=%d"
           % (np.round(shaft(), 4), coax(), axdev(), jaw_state()[0]))
-    tick("⑩ 解锁｜交还真实物理")
+    tick("⑪ 解锁｜交还真实物理")
 
     # The full-physics path has already released and retreated in one move.
     # Only the legacy kinematic-lock path still needs its separate retreat.
@@ -1200,7 +1200,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
           "接触=%d 三爪法向力=%.1f N"
           % (np.round(shaft(), 4), final_coax, final_tilt,
              contacts, force))
-    tick("⑪ 机器人退出｜装夹完成")
+    tick("⑫ 机器人退出｜装夹完成")
 
     z0 = shaft()[2]
     settle(800, SM.CHUCK_CLAMP_CTRL, GRIP_OPEN)
@@ -1213,7 +1213,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         if frame_hook is not None and i % (FRAME_EVERY * 2) == 0:
             tick()
     pull = abs(shaft()[0] - x0) * 1000
-    tick("⑫ 20 N 拉拔｜夹得住")
+    tick("⑬ 20 N 拉拔｜夹得住")
     print("  重力下沉  %.2f mm      20 N 拉  %.2f mm" % (slip, pull))
     print()
 

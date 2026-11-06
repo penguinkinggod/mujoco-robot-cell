@@ -95,8 +95,8 @@ class Tee:
 
 
 def normalize(tag):
-    """带圈数字 ⑪⑫ 在微软雅黑里缺字会变方框，统一换成两位数字。"""
-    for i in range(12):
+    """带圈数字 ⑪⑫⑬ 在微软雅黑里缺字会变方框，统一换成两位数字。"""
+    for i in range(14):
         tag = tag.replace(chr(0x2460 + i), "%02d" % (i + 1))
     return tag
 
