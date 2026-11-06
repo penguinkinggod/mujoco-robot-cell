@@ -63,7 +63,7 @@ python src/live_bridge.py run --loop  # 跑仿真并推帧，负责演
 （160 N、同轴 0.40 mm），但主线三爪力比会挂，所以没改全局。
 
 重跑：`python src/diag_jaw_face_sweep.py --full`，数据落 `_build/jaw_face_sweep_full.csv`。
-旧摆位那张表和包角扫描的过程留在 [06-sweeps.md](docs/cell/06-sweeps.md)，已标作废。
+旧摆位那张表在 [06-sweeps.md](docs/cell/06-sweeps.md) 已标作废，新摆位重扫的表在同文件末尾。
 
 ## 已经做到了什么
 
@@ -83,12 +83,11 @@ python src/diag_feed_chuck.py --v-jaw --lift --no-lock
 
 ## 下一步
 
-1. 把 44° 的选择依据在新摆位下重验一遍。包角那张表（45° 是临界、42° 力比 4.24）也是
-   旧摆位测的；主线力比那一列来自 `diag_chuck_health`，与摆位无关，互顶那一列得重扫。
-2. 把参数扫描扩成一份能引用的报告。直径这维有 A/B 对照了，爪型和摩擦两维还没扫。
-3. 相机标定加视觉引导抓取，位姿从图像来，不再手给。
-4. 手势遥操作，顺带录 `(观测, 动作)`；那批序列出来之后才是 BC / ACT。
+1. 相机标定加视觉引导抓取，位姿从图像来，不再手给。
+2. 手势遥操作，顺带录 `(观测, 动作)`；那批序列出来之后才是 BC / ACT。
 
+参数化这条线到此收住：直径和包角两维都出了表，爪型、摩擦两维不再扫，除非主线判据先挂。
+重扫的表和结论在 [06-sweeps.md](docs/cell/06-sweeps.md)。
 四个工位的长线计划在 [13-roadmap.md](docs/cell/13-roadmap.md)。
 
 ## 为什么做这个
