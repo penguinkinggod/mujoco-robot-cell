@@ -33,6 +33,31 @@
 
 > 注意：这个包是第三方 vendored 代码，不是本仓库的原创部分。若需更新版本，请从上游重新获取，不要就地修改。
 
+### 2.1 官方 tabletop 场景几何
+
+| | |
+|---|---|
+| 来源 | [`lerobot/so101-tabletop-mujoco`](https://huggingface.co/lerobot/so101-tabletop-mujoco) 的 `so101_tabletop.xml` |
+| 许可证 | **Apache-2.0** |
+| 用在哪 | `src/scene_full.py` 的 `official_world=True` 分支（常量 `OFFICIAL_*` / `CELL_CAM_*`） |
+
+只抄了**几何尺寸与机位**，没有拷贝文件：台面 0.80×0.80×0.03 m、台面顶在 z=0、
+地面 z=−0.75、三面 2 m 墙（视觉件，`contype=0`）、`front` / `top` 两个相机的位置与朝向、
+腕部相机 `wrist_cam` 的偏移与 fovy。房间与台面的配色为近似值。
+
+> 这份场景本身带的是 `robotstudio_so101/so101.xml`，那个版本**没有** `fixed_jaw_pad` /
+> `moving_jaw_pad` geom，无法承载本项目的 V 槽几何，所以臂模型仍用
+> `models/_tmp_so101/` 那份（同为 Apache-2.0）。两套模型的关节命名与量程一致，
+> 已逐个核对。
+
+---
+
+### 2.2 运行时依赖
+
+| | |
+|---|---|
+| `gymnasium` | MIT（Farama Foundation），仅 `src/env_cell.py` 需要；未安装时该文件降级为普通类 |
+
 ---
 
 ## 3. SimReady 工业资产
@@ -65,4 +90,5 @@ CC-BY-4.0 允许再分发和修改，**但要求署名原始作者并标明是�
 | 本仓库代码与文档 | MIT | ✅ |
 | `models/panda/` | Apache-2.0 | ✅ 需保留 LICENSE |
 | `models/_tmp_so101/` | Apache-2.0 | ✅ 需保留 LICENSE |
+| 官方 tabletop 场景几何 | Apache-2.0 | ✅ 已在本文档署名 |
 | `models/simready/` | CC-BY-4.0 | ✅ 需署名，**作者待补** |
