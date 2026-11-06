@@ -68,6 +68,11 @@ LATHE_Y = 0.12                # 卡盘中心 y（可达性实测最优）
 LATHE_Z = TABLE_TOP_Z + 0.06  # 卡盘轴线高度（离台面 60 mm）
 CHUCK_R = 0.055               # 卡盘半径（Φ110，小型二轴车）
 CHUCK_L = 0.035               # 卡盘厚度
+# 盘体通孔半径。真机 Φ110 三爪的通孔一般 Φ25~Φ32，这里取 Φ30。
+# 原来盘体是个实心圆柱，棒料插进去 20 mm 就嵌在实心里，MuJoCo 给出
+# 1~4 kN 的穿透罚力，全被误当成了"工件顶着卡盘内壁"。
+BORE_R = 0.015                # Φ30
+BORE_SEGS = 24                # 盘体拆成 24 片环，够圆，碰撞对也不至于太多
 JAW_W = 0.018                 # 卡爪截面宽
 # 卡爪沿轴向长度。28 mm 时轴在爪里像球铰：夹紧后接触 6 点，但解锁静置
 # 就在自重下转到 10.9 deg，一个爪脱开（接触掉到 4），20 N 轴向拉拔直接
@@ -190,6 +195,60 @@ def add_soft_jaws(jb, k, ang, jaw_open, apply_mask):
     b.quat = [np.cos(ang / 2), np.sin(ang / 2), 0.0, 0.0]
     b.rgba = [0.55, 0.52, 0.42, 1.0]
     apply_mask(b)
+
+
+def add_chuck_body(wb, face_x, ly, lz, mask,
+                   rgba=(0.44, 0.46, 0.50, 1.0)):
+    """卡盘盘体：带通孔的环，不是实心圆柱。
+
+    face_x 是卡盘端面（卡爪伸出的那一面），盘体占 x ∈ [face_x, face_x+CHUCK_L]。
+
+    用 24 个环片拼出来的原因：MuJoCo 没有"空心圆柱"这个图元。实心圆柱时，
+    插进去的棒料有几十毫米嵌在实心里，解算器给出 1~4 kN 的穿透罚力，
+    看起来像"工件顶着卡盘内壁"。真机通孔 Φ30，Φ25 以内的料碰不到孔壁。
+    """
+    r_mid = (BORE_R + CHUCK_R) / 2.0
+    half_rad = (CHUCK_R - BORE_R) / 2.0
+    # 相邻环片的弧长一半（πr/N），乘 1.06 让边缘轻微重叠，避免缝里漏光
+    half_tan = (np.pi * r_mid / BORE_SEGS) * 1.06
+    for k in range(BORE_SEGS):
+        t = 2.0 * np.pi * k / BORE_SEGS
+        g = wb.add_geom()
+        g.name = "chuck_body_%02d" % k
+        g.type = mujoco.mjtGeom.mjGEOM_BOX
+        g.size = [CHUCK_L / 2.0, half_rad, half_tan]
+        g.pos = [face_x + CHUCK_L / 2.0,
+                 ly + r_mid * np.cos(t), lz + r_mid * np.sin(t)]
+        g.quat = [np.cos(t / 2.0), np.sin(t / 2.0), 0.0, 0.0]
+        g.rgba = list(rgba)
+        g.friction = [0.8, 0.01, 0.001]
+        mask(g)
+
+
+def add_headstock(wb, x_center, ly, lz, mask,
+                  rgba=(0.30, 0.32, 0.36, 1.0)):
+    """主轴箱：中间留一条通孔，棒料能穿过去。
+
+    原来是一整块 box，棒料插深了会顶在箱体后壁上，又是一个假接触。
+    这里拆成上下左右四块，留下 30×30 mm 的方孔，Φ30 通孔套在 Φ30 上，
+    Φ25 的料四周还有 2.5 mm 余量。外轮廓和原来完全一致。
+    """
+    hx, hy, hz = 0.045, 0.075, 0.060
+    # (中心y, 半宽y, 中心z, 半高z)，四块围出一个 |Δy|<BORE_R、|Δz|<BORE_R 的方孔
+    boxes = [
+        (0.0, hy, (BORE_R + hz) / 2.0, (hz - BORE_R) / 2.0),      # 上
+        (0.0, hy, -(BORE_R + hz) / 2.0, (hz - BORE_R) / 2.0),     # 下
+        (-(BORE_R + hy) / 2.0, (hy - BORE_R) / 2.0, 0.0, BORE_R),  # 左
+        ((BORE_R + hy) / 2.0, (hy - BORE_R) / 2.0, 0.0, BORE_R),   # 右
+    ]
+    for k, (cy, hyy, cz, hzz) in enumerate(boxes):
+        g = wb.add_geom()
+        g.name = "lathe_headstock_%d" % k
+        g.type = mujoco.mjtGeom.mjGEOM_BOX
+        g.size = [hx, hyy, hzz]
+        g.pos = [x_center, ly + cy, lz + cz]
+        g.rgba = list(rgba)
+        mask(g)
 
 
 def build_scene(shaft_mass=None, jaw_open=None):
@@ -323,26 +382,12 @@ def build_scene(shaft_mass=None, jaw_open=None):
     # 布局要点（第一版踩过的坑）：
     #   卡盘必须朝 -x（朝向机器人），主轴箱在卡盘【后面】(+x)，
     #   否则主轴箱会把卡盘整个挡住。
-    head = wb.add_geom()
-    head.name = "lathe_headstock"
-    head.type = mujoco.mjtGeom.mjGEOM_BOX
-    head.size = [0.045, 0.075, 0.060]
-    head.pos = [LATHE_X + CHUCK_L + 0.045, LATHE_Y, TABLE_TOP_Z + 0.060]
-    head.rgba = [0.30, 0.32, 0.36, 1.0]
-    _mask(head, 1, 3)
-
-    # 卡盘盘体：轴向沿 x，端面朝 -x（朝向机器人）
-    # 位置取 LATHE_X + CHUCK_L/2，所以盘体占 x ∈ [LATHE_X, LATHE_X+CHUCK_L]，
-    # 端面正好在 LATHE_X，卡爪从这里往 -x 伸出。
-    chuck = wb.add_geom()
-    chuck.name = "chuck_body"
-    chuck.type = mujoco.mjtGeom.mjGEOM_CYLINDER
-    chuck.size = [CHUCK_R, CHUCK_L / 2, 0.0]
-    chuck.pos = [LATHE_X + CHUCK_L / 2, LATHE_Y, LATHE_Z]
-    chuck.quat = [0.7071068, 0.0, 0.7071068, 0.0]   # 圆柱轴 z -> x
-    chuck.rgba = [0.44, 0.46, 0.50, 1.0]
-    chuck.friction = [0.8, 0.01, 0.001]
-    _mask(chuck, 1, 3)
+    # 两个都带通孔：棒料要能穿进去，否则看起来"顶着内壁"的那 1~4 kN
+    # 其实是穿透罚力（见 add_chuck_body 的说明）。
+    add_headstock(wb, LATHE_X + CHUCK_L + 0.045, LATHE_Y, LATHE_Z,
+                  lambda g: _mask(g, 1, 3))
+    add_chuck_body(wb, LATHE_X, LATHE_Y, LATHE_Z,
+                   lambda g: _mask(g, 1, 3))
 
     # 卡盘端面上加三道滑槽，视觉上区分三爪位置（纯装饰，不参与碰撞）
     for k in range(3):
@@ -539,23 +584,10 @@ def add_lathe(spec, *, origin=None, table_z=0.0, jaw_open=None,
 
     qx = [0.7071068, 0.0, 0.7071068, 0.0]   # cylinder local z -> world x
 
-    head = wb.add_geom()
-    head.name = "lathe_headstock"
-    head.type = mujoco.mjtGeom.mjGEOM_BOX
-    head.size = [0.045, 0.075, 0.060]
-    head.pos = [lx + CHUCK_L + 0.045, ly, table_z + 0.060]
-    head.rgba = [0.30, 0.32, 0.36, 1.0]
-    _m(head, *static_mask)
-
-    chuck = wb.add_geom()
-    chuck.name = "chuck_body"
-    chuck.type = mujoco.mjtGeom.mjGEOM_CYLINDER
-    chuck.size = [CHUCK_R, CHUCK_L / 2, 0.0]
-    chuck.pos = [lx + CHUCK_L / 2, ly, lz]
-    chuck.quat = qx
-    chuck.rgba = [0.44, 0.46, 0.50, 1.0]
-    chuck.friction = [0.8, 0.01, 0.001]
-    _m(chuck, *static_mask)
+    # 主轴箱和盘体都带通孔，棒料能穿过去（原因见 add_chuck_body）。
+    add_headstock(wb, lx + CHUCK_L + 0.045, ly, lz,
+                  lambda g: _m(g, *static_mask))
+    add_chuck_body(wb, lx, ly, lz, lambda g: _m(g, *static_mask))
 
     for k in range(3):
         ang = 2 * np.pi * k / 3 + np.pi / 2

@@ -35,6 +35,10 @@ DIAMETERS = [0.015, 0.018, 0.020, 0.022, 0.025]
 MODES = ("fit", "phi20")
 _SHAFT_XY = S.SHAFT_POS[:2].copy()
 Q0 = np.array([0.7071068, 0.0, 0.7071068, 0.0])
+# 工件露在卡盘外面的长度。主线送料是插入 25 mm、外留 55 mm（和
+# diag_feed_chuck.FEED_INSERT_MM 对得上），扫描必须用同一个摆位，
+# 否则量到的是"料被塞进卡盘孔里"的工况，不是夹持。
+INSET = float(os.environ.get("SWEEP_INSET_MM", "55")) / 1000.0
 # import 时抓一次默认值。configure() 每次显式写回，避免扫描改过全局后串扰。
 _DEF_HALF = S.JAW_ARC_HALF_DEG
 _DEF_OVERLAP = S.JAW_ARC_OVERLAP
@@ -67,7 +71,8 @@ def run_case(D, mode, half_deg=None, overlap=None, thick=None):
     acts = ids["jaw_acts"]
     axis = np.array([S.LATHE_X, S.LATHE_Y, S.LATHE_Z])
 
-    def place(inset=0.020):
+    def place(inset=None):
+        inset = INSET if inset is None else inset
         mujoco.mj_resetData(model, data)
         data.qpos[sq:sq + 3] = [
             S.LATHE_X + S.SHAFT_L / 2 - inset, S.LATHE_Y, S.LATHE_Z]
@@ -100,8 +105,8 @@ def run_case(D, mode, half_deg=None, overlap=None, thick=None):
                     force += fmag
                 elif any(k in n1 + n2 for k in
                          ("chuck_body", "spindle", "lathe_headstock")):
-                    # 悬空摆位下工件同时顶着卡盘内壁。所有直径都一样，
-                    # A/B 对照会抵消，但绝对值不能当真机夹紧力引用。
+                    # 盘体现在有 Φ30 通孔，正常夹持时这里应该是 0。
+                    # 只要冒出 kN 级，就说明工件又穿进实体里了。
                     body_force += fmag
             # 爪与爪互顶：名字第三段是爪号，不同号才算。
             # 只数 > 1 N 的：Φ20 主线有 2 对 0.4 N 的擦边接触，不是互顶。
@@ -117,9 +122,16 @@ def run_case(D, mode, half_deg=None, overlap=None, thick=None):
         return n, force, inter, jj_force, body_force, back_force
 
     # ---- 张开 -> 夹紧，量几何和力 ----
+    # 真机上张开、送进、夹紧这整段都是机械臂托着料，三爪抱死之后才松手。
+    # 扫描里没有机械臂，用关重力等效：工件外留 55 mm、重心悬在爪外侧，
+    # 只要夹紧没完成就放重力，它会被力矩掀翻（实测倾斜 60°），量到的
+    # 是掉下去的角度，不是夹持精度。夹紧完再恢复，接着测下沉才有意义。
     place()
+    g0 = model.opt.gravity.copy()
+    model.opt.gravity[:] = 0.0
     drive(S.CHUCK_OPEN_CTRL, 200)
     drive(S.CHUCK_CLAMP_CTRL, 1500)
+    model.opt.gravity[:] = g0
     n, force, inter, jj_force, body_force, back_force = contacts()
 
     p = data.qpos[sq:sq + 3]
@@ -133,8 +145,11 @@ def run_case(D, mode, half_deg=None, overlap=None, thick=None):
     sink = float((z0 - data.qpos[sq + 2]) * 1000)
 
     # ---- 20 N 轴向拉拔（重新夹紧一遍，避免和上面的历史耦合）----
+    # 同样先托住再夹紧，拉拔本身在恢复重力之后做。
     place()
+    model.opt.gravity[:] = 0.0
     drive(S.CHUCK_CLAMP_CTRL, 1200)
+    model.opt.gravity[:] = g0
     x0 = data.qpos[sq]
     drive(S.CHUCK_CLAMP_CTRL, 800, pull=20.0)
     pull = float((data.qpos[sq] - x0) * 1000)
@@ -173,8 +188,10 @@ def main():
                      r["pull20_mm"], r["jaw_jam_pairs"], r["jaw_jam_N"],
                      "PASS" if r["ok"] else "FAIL"))
     print()
-    print("  注：悬空摆位下工件还顶着卡盘内壁（各档约 1~4 kN，已单列 chuck_body_N），")
-    print("      爪力 N 只用于 A/B 对照，不是真机夹紧力。互顶对只数 > 1 N 的接触。")
+    print("  注：卡盘盘体和主轴箱现在都有 Φ30 通孔，工件只由三爪夹持，外留 %.0f mm。"
+          % (INSET * 1000))
+    print("      chuck_body_N 应为 0（重力擦到孔壁算几牛以内）；若是 kN 级，说明又穿模了。")
+    print("      爪力 N 是第一手实测接触力，可以引用。互顶对只数 > 1 N 的接触。")
 
     csv_path = os.path.join(OUT, "diameter_sweep.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
