@@ -509,6 +509,10 @@ FRAME_EVERY = 60         # 每 N 步采一帧；仅 frame_hook 非 None 时生�
 # 到底是伺服跟不上，还是闭环在来回摆（误差反号就是摆）。
 DEBUG_MOVE = os.environ.get("FEED_DEBUG") == "1"
 GRIP_SETTLE = 120        # 每次 move3 前先把夹爪指令落实的步数
+GRIP_RAMP = int(os.environ.get("GRIP_RAMP", 400))   # 夹爪闭合斜坡步数（400 = 0.80 s）
+FEED_ITERS = int(os.environ.get("FEED_ITERS", 3))   # 进给闭环修正轮数
+FEED_GAIN = float(os.environ.get("FEED_GAIN", 0.8))  # 闭环修正增益
+FEED_STEPS = int(os.environ.get("FEED_STEPS", 600))  # 进给每轮步数（1.2 s，慢到不激起工件摆动）
 MIN_FIX_STEPS = 150      # 闭环修正轮的最短时长（0.30 s）：再短伺服落不了地
 
 # SMOOTH=1 走「一条连续轨迹」：抬升 -> 横移 -> 下降 -> 进给 合并成一次
@@ -576,11 +580,16 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     # 「有没有穿模」唯一可信的数字，肉眼在窗口里看到的深浅取决于机位。
     PEN = {"min": 0.0, "label": "", "pair": ""}
 
+    _cf6 = np.zeros(6)
+
     def track_pen(label):
+        _fmax = 0.0
         for i in range(data.ncon):
             c = data.contact[i]
             if not any(g_ in (c.geom1, c.geom2) for g_ in shaft_geoms):
                 continue
+            mujoco.mj_contactForce(model, data, i, _cf6)
+            _fmax = max(_fmax, abs(float(_cf6[0])))
             if c.dist < PEN["min"]:
                 n1 = mujoco.mj_id2name(
                     model, mujoco.mjtObj.mjOBJ_GEOM, c.geom1) or "?"
@@ -589,6 +598,9 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 PEN["min"] = float(c.dist)
                 PEN["label"] = label
                 PEN["pair"] = "%s|%s" % (n1, n2)
+        state.setdefault("rod_p", []).append(data.qpos[sq:sq + 3].copy())
+        state.setdefault("rod_f", []).append(_fmax)
+        state.setdefault("rod_lab", []).append(label)
 
     def shaft():
         return data.qpos[sq:sq + 3].copy()
@@ -792,7 +804,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                              np.round([data.qpos[a] for a in arm.qadr], 3)))
             if locked:
                 lock()
-            track_pen("move")
+            track_pen(state.get("label", "move"))
             if frame_hook is not None and i % FRAME_EVERY == 0:
                 tick()
         # Only the LAST pass of a stage gets a servo settle. Holding 180
@@ -860,7 +872,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         # sat 19-23 mm off the axis, and the shaft never left the table.
         # Measured before this fix: ncon had zero pad-shaft contacts.
         for _ in range(30 if hold_done else GRIP_SETTLE):
-            data.ctrl[arm.grip_act] = grip
+            data.ctrl[arm.grip_act] = grip_cmd(grip)
             data.ctrl[jaw_act] = jaw_ctrl
             mujoco.mj_step(model, data)
             state.setdefault("traj", []).append(
@@ -906,12 +918,13 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             # 只在 t=0/1 处为零，按 [k/iters,(k+1)/iters] 切分后轮间
             # 速度是连续的。
             kw = {"s0": k / iters, "s1": (k + 1) / iters}
+            state["label"] = "%s#%d" % (label, k + 1)
             kw["settle_steps"] = 90 if k == iters - 1 else 60
             move(tgt, steps_k, grip, locked, jaw_ctrl, **kw)
             err = float(np.linalg.norm(meas() - gmeas))
             trace.append(err)
             # 0.8 damping: full step overshoots once the load unloads
-            tgt = tgt + 0.8 * (gmeas - meas())
+            tgt = tgt + FEED_GAIN * (gmeas - meas())
         if DEBUG_MOVE:
             # 正负号变化 = 闭环在目标两侧来回；单调下降 = 只是慢。
             sign_flips = sum(
@@ -1019,7 +1032,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             qd = (pchip(s2) - q) / dt
             for a, v, w in zip(arm.qadr, q, qd):
                 data.ctrl[a] = v + lead * w
-            data.ctrl[arm.grip_act] = grip
+            data.ctrl[arm.grip_act] = grip_cmd(grip)
             data.ctrl[jaw_act] = jaw_ctrl
             mujoco.mj_step(model, data)
             state.setdefault("traj", []).append(
@@ -1043,10 +1056,32 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                      worst * 1000))
         return float(np.linalg.norm(arm.pad_center() - np.asarray(targets[-1])))
 
+    def grip_cmd(target):
+        """夹爪指令走线性斜坡，不一步跳过去。
+
+        张开 0.50、闭合 -0.10（V 槽爪），一步写完等于 0.6 m 的阶跃：
+        手指以最大速度撞上工件，实测工件被撞跳 2.31 mm —— 就是「夹住
+        那一下抖一下」。按步插值后，接触时手指速度已经降下来。
+
+        内部自己数步：目标一变就重置斜坡起点，所以调用处不用管循环
+        索引，也不会因为换一段就重新慢慢爬。
+        """
+        tgt = float(target)
+        cur = float(state.get("grip_now", data.ctrl[arm.grip_act]))
+        if abs(tgt - state.get("grip_tgt", 1e9)) > 1e-9:
+            state["grip_tgt"] = tgt
+            state["grip_from"] = cur
+            state["grip_k"] = 0
+        state["grip_k"] = state.get("grip_k", 0) + 1
+        k = 1.0 if GRIP_RAMP <= 0 else min(1.0, state["grip_k"] / float(GRIP_RAMP))
+        v = state["grip_from"] + (tgt - state["grip_from"]) * k
+        state["grip_now"] = v
+        return v
+
     def settle(n, jaw_ctrl, grip, locked=False):
         for i in range(n):
             data.ctrl[jaw_act] = jaw_ctrl
-            data.ctrl[arm.grip_act] = grip
+            data.ctrl[arm.grip_act] = grip_cmd(grip)
             mujoco.mj_step(model, data)
             state.setdefault("traj", []).append(
                 data.site_xpos[arm.site].copy())
@@ -1114,6 +1149,11 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         tick("② 接近｜下降中" if name == "接近" else
              "③ 下降｜pad 到轴心" if name == "下降" else
              "④ 夹紧｜真实抓取（轴会歪）")
+    # 夹爪是斜坡闭合（GRIP_RAMP 步），"夹紧"那段 320 步走完时它还没合到
+    # 位。一抬臂，工件就从 V 槽里滑出去：实测全物理路径同轴 250 mm、倾斜
+    # 133 deg、接触 0，就是这里漏了一段保持。先让爪子合完再搬。
+    if GRIP_RAMP > 320:
+        settle(GRIP_RAMP - 320 + 80, SM.CHUCK_OPEN_CTRL, grip_close)
     print("  shaft_in_grip = %s mm（搬运锁的相对偏移）"
           % np.round(state["offset"] * 1000, 2))
     if v_jaw and not carry_lock:
@@ -1162,10 +1202,10 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         # 连续轨迹是开环 + 前馈，末端还剩十几毫米的稳态误差（kp=70 的
         # 下垂）。进给是唯一必须精确到位的地方，所以只在这里补一次闭环，
         # 而不是把整条轨迹切回逐段 rest-to-rest。
-        err = move3(pad_target(feed_goal), 260, grip_close, carry_lock,
+        err = move3(pad_target(feed_goal), FEED_STEPS, grip_close, carry_lock,
                     probe=None if carry_lock else shaft,
                     probe_goal=None if carry_lock else feed_goal,
-                    label="进给", iters=4)
+                    label="进给", iters=FEED_ITERS)
     else:
         for name, tgt, ns in carry:
             # 只有最后一段闭环到「工件」，前三段必须闭环到「pad」：
@@ -1401,6 +1441,33 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             print("                运动段 RMS %.3f mm / 最大 %.3f mm"
                   % (np.sqrt((_wob[_mov[:len(_wob)]] ** 2).mean()) * 1000,
                      _wob[_mov[:len(_wob)]].max() * 1000))
+        labs_w = labs[_k // 2: _k // 2 + len(_wob)]
+        per = {}
+        for _lab, _w in zip(labs_w, _wob):
+            per.setdefault(_lab, []).append(_w)
+        rows = sorted(((max(ws) * 1000, float(np.sqrt(np.mean(np.square(ws)))) * 1000, _lab)
+                       for _lab, ws in per.items() if len(ws) > 20), reverse=True)
+        _rp = np.asarray(state.get("rod_p", []))
+        if len(_rp) > 20:
+            _rlab = state.get("rod_lab", [])
+            _rsm = np.vstack([np.convolve(_rp[:, c], np.ones(11) / 11, "valid")
+                              for c in range(3)]).T
+            _rres = _rp[5:5 + len(_rsm)] - _rsm
+            # 只算横向（y/z）：轴向的位移是进给本身，混进来会把
+            # 「插进去」误判成「抖」。
+            _rw = np.sqrt((_rres[:, 1:3] ** 2).sum(axis=1)) * 1000
+            _rl = _rlab[5:5 + len(_rw)]
+            _agg = {}
+            for _l, _w, _f in zip(_rl, _rw, state["rod_f"][5:5 + len(_rw)]):
+                a = _agg.setdefault(_l, [0.0, 0.0])
+                a[0] = max(a[0], _w)
+                a[1] = max(a[1], _f)
+            print("  工件抖动/接触力：%s"
+                  % "  ".join("%s %.2fmm/%.0fN" % (l, v[0], v[1])
+                              for l, v in sorted(_agg.items(),
+                                                 key=lambda kv: -kv[1][0])[:6]))
+        print("  分段抖动 最大/RMS（mm）：%s"
+              % "  ".join("%s %.2f/%.2f" % (l, mx, rm) for mx, rm, l in rows[:6]))
         worst.sort(reverse=True)
         print("  分段最大末端速度：%s"
               % "  ".join("%s %.2f" % (l, s) for s, l in worst[:6]))

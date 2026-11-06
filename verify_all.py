@@ -40,6 +40,7 @@ CORE_FILES = [
     "src/demo_09_try_versions.py",
     "verify_all.py",
     "src/diag_chuck_health.py",
+    "src/gif_slim.py",
     # Also a real CHECKS entry below (kept here for py_compile coverage).
     "src/diag_feed_chuck.py",
 ]

@@ -312,16 +312,19 @@ def main():
     save_views(views)
     save_stages(stages)
 
-    import imageio.v2 as imageio
-    imageio.mimsave(FEED_GIF, gif_frames, fps=25, loop=0)
-    save_gallery(metric, status, len(gif_frames), len(stages))
+    import gif_slim
+    # 逐帧 mimsave 出来 20 MB：425 帧里有 9 s 是同一个像素（闭环在等误差收敛）。
+    # 交给 gif_slim 去重 + 统一 128 色调色板，同一段画面压到 4 MB 上下。
+    n_all, n_kept, n_merged = gif_slim.slim_frames(
+        gif_frames, FEED_GIF, fps=25, colors=128, diff=0.12, max_hold=1.2)
+    save_gallery(metric, status, n_kept, len(stages))
 
     print("\n已生成：")
     for p in (VIEWS_PNG, STAGES_PNG, FEED_GIF, GALLERY):
         print("  %-22s %7.1f KB" % (os.path.basename(p),
                                     os.path.getsize(p) / 1024))
-    print("  动图 %d 帧 / 关键帧 %d 张 / 仿真状态 %s (rc=%d)"
-          % (len(gif_frames), len(stages), status, rc))
+    print("  动图 %d 帧（去重前 %d，合并 %d）/ 关键帧 %d 张 / 仿真状态 %s (rc=%d)"
+          % (n_kept, n_all, n_merged, len(stages), status, rc))
     return 0 if rc == 0 else 1
 
 

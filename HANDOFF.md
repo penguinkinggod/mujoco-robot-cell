@@ -1378,3 +1378,55 @@ verify_all.py 9/9 PASS（25.8 s）
 `src/diag_jaw_wrap.py`（新增，包角/段数/力限扫描）、
 `src/diag_chuck_health.py`（工件摆位与爪名匹配）、`src/diag_feed_chuck.py`
 （松开时序、采样补全、抖动指标）。
+
+---
+
+## 25. 动图移出仓库（2026-11-06）
+
+### 为什么
+
+`assets/now_feed.gif` 2 MB 一个。从 `6b5c5c2` 开始每次重渲都进一次历史，六次提交就是十几 MB。
+git 按内容去重，但每版重新渲染的像素不一样，就是新的 blob；`git rm` 只删得掉最新树里的那份，
+历史照样留着，`git clone` 全都要拖下来。想彻底删，得 `git filter-repo` 重写历史再 force push。
+
+### 两条路
+
+**孤儿分支 `assets`。** 一个文件、无父提交，换图就重建一次。可行，但对象还在仓库里：
+force push 之后旧 blob 变成不可达，要等 GitHub 侧 GC 才真的释放，中间这段时间 `size` 照算。
+严格说还是「放在 git 里面」。
+
+**Release 附件。** 文件存在 Release 的存储里，不进仓库对象库，clone 完全不受影响，
+换图就删旧附件传新的，仓库 `size` 一字节不动。README 用下载链接引。
+
+选了后者。链接：
+
+```
+https://github.com/penguinkinggod/mujoco-robot-cell/releases/download/media-v1/now_feed.gif
+```
+
+### 怎么传
+
+没有 `gh`，用 API。token 从 git 自己的凭据里取，不落盘、不进命令历史：
+
+```bash
+TOKEN=$(printf 'protocol=https\nhost=github.com\n\n' | git credential fill | sed -n 's/^password=//p')
+
+# 建 release（prerelease，免得占掉 Latest）
+curl -s -X POST -H "Authorization: token $TOKEN" \
+  https://api.github.com/repos/penguinkinggod/mujoco-robot-cell/releases \
+  -d '{"tag_name":"media-v1","name":"README images",...}'
+
+# 传附件，id 取自上一步
+curl -s -X POST -H "Authorization: token $TOKEN" -H "Content-Type: image/gif" \
+  --data-binary @assets/now_feed.gif \
+  "https://uploads.github.com/repos/penguinkinggod/mujoco-robot-cell/releases/<id>/assets?name=now_feed.gif"
+```
+
+### 配套改动
+
+- 主分支 `git rm --cached assets/now_feed.gif`，`.gitignore` 加 `assets/*.gif`。
+  本地文件留着，`show_current.py` 照常往 `_build/` 和 `assets/` 写。
+- 历史里已经进去的那六版没动。要清就得重写历史，代价是所有 commit hash 全变，
+  README 里那些时间线引用全部失效，不做。
+- 顺带把动图体积从 20 MB 压到 2 MB（`src/gif_slim.py`）：425 帧里有 207 帧和上一帧
+  是同一个像素（闭环在等误差收敛），去重后合并时长，再加统一 128 色调色板。
