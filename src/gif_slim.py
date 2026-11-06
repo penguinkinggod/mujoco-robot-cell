@@ -27,36 +27,72 @@ from PIL import Image, ImageSequence
 
 
 def load_frames(path):
+    """读帧，连同每帧停留时长一起读。
+
+    只取像素、丢掉 duration 的话，拿已经压过的 GIF 再压一遍会把所有停顿
+    抹平成 1/fps，整段被放快：14.3 s 的流程会变成 9.3 s。
+    """
     im = Image.open(path)
-    frames = [np.asarray(f.convert("RGB")) for f in ImageSequence.Iterator(im)]
-    return frames
+    frames, holds = [], []
+    for f in ImageSequence.Iterator(im):
+        frames.append(np.asarray(f.convert("RGB")))
+        holds.append(float(im.info.get("duration") or 0) / 1000.0)
+    if not any(holds):
+        holds = None
+    return frames, holds
 
 
-def dedupe(frames, fps, diff_thresh, probe=(80, 60), max_hold=None):
+def dedupe(frames, fps, diff_thresh, probe=(80, 60), max_hold=None, src_holds=None):
     """丢掉和上一帧几乎相同的帧，把时长还给上一帧。
 
-    probe   比较用的缩略图尺寸，不是输出尺寸；只为判断「动了没有」。
-    max_hold 单帧最长停留秒数。静止段留下来就是一个 9 秒的定格，
-             观感上是卡住；超过这个值就截断（画面不变，只是不再等）。
+    probe     比较用的缩略图尺寸，不是输出尺寸；只为判断「动了没有」。
+    max_hold  单帧最长停留秒数。静止段留下来就是一个 9 秒的定格，
+              观感上是卡住；超过这个值就截断（画面不变，只是不再等）。
+    src_holds 每帧原本的停留时长；None 表示按 1/fps 均匀。重新压一个
+              已经带时序的 GIF 时必须传，否则停顿会被抹平。
     """
-    dt = 1.0 / fps
     kept, holds = [], []
     prev = None
     merged = 0
-    for f in frames:
+
+    def step(i):
+        return src_holds[i] if src_holds else 1.0 / fps
+
+    for i, f in enumerate(frames):
         small = np.asarray(
             Image.fromarray(f).resize(probe, Image.Resampling.BILINEAR)
         ).astype(np.int16)
         if prev is not None and np.abs(small - prev).mean() < diff_thresh:
             merged += 1
-            hold = holds[-1] + dt
+            hold = holds[-1] + step(i)
             holds[-1] = min(hold, max_hold) if max_hold else hold
             prev = small
             continue
         kept.append(f)
-        holds.append(dt)
+        holds.append(step(i))
         prev = small
     return kept, holds, merged
+
+
+def dip_fade(frames, seconds, fps):
+    """末尾淡出到黑、开头从黑淡入，循环接缝落在纯黑上。
+
+    为什么不直接叠化末帧和首帧：这两帧姿态差得太远（末帧是机械臂退回、
+    三爪夹住料；首帧是机械臂在取料位），叠化出来是两套手臂同时出现在
+    画面里，看起来像渲染故障。淡到黑只有一个画面在变暗变亮，不会重影。
+
+    代价是每次循环有一次约 0.5 s 的黑场，观感上像转场；好处是黑帧几乎
+    不占体积（LZW 之后几百字节），且接缝严格连续。
+    """
+    n = max(2, int(round(seconds * fps)))
+    dt = 1.0 / fps
+    a = frames[0].astype(np.float32)
+    b = frames[-1].astype(np.float32)
+    fade_in = [np.clip(a * (k / n), 0, 255).astype(np.uint8)
+               for k in range(1, n)]
+    fade_out = [np.clip(b * (1.0 - k / n), 0, 255).astype(np.uint8)
+                for k in range(1, n + 1)]
+    return fade_in, fade_out, dt
 
 
 def global_palette(frames, colors, samples=12):
@@ -80,11 +116,25 @@ def build(frames, holds, path, colors):
                 loop=0, optimize=True, disposal=1)
 
 
-def slim_frames(frames, path, fps=25.0, colors=128, diff=0.12, max_hold=1.2):
-    """给 show_current.py 直接调：输入 ndarray 列表，输出瘦身后的 GIF。"""
-    kept, holds, merged = dedupe(frames, fps, diff, max_hold=max_hold or None)
+def slim_frames(frames, path, fps=25.0, colors=128, diff=0.12, max_hold=1.2,
+                fade=0.0, fade_fps=12.0, end_hold=0.6, src_holds=None):
+    """给 show_current.py 直接调：输入 ndarray 列表，输出瘦身后的 GIF。
+
+    fade      末尾淡出 / 开头淡入的时长（秒），0 表示不做，保持硬切。
+    end_hold  末帧定格上限（秒）。循环播放时末帧停太久会像卡住。
+    src_holds 每帧原本的时长；从已有 GIF 二次处理时必须传，否则停顿会被抹平。
+    """
+    kept, holds, merged = dedupe(frames, fps, diff, max_hold=max_hold or None,
+                                 src_holds=src_holds)
+    n_fade = 0
+    if fade > 0 and len(kept) > 2:
+        holds[-1] = min(holds[-1], end_hold)
+        fi, fo, dt = dip_fade(kept, fade, fade_fps)
+        kept = fi + kept + fo
+        holds = [dt] * len(fi) + holds + [dt] * len(fo)
+        n_fade = len(fi) + len(fo)
     build(kept, holds, path, colors)
-    return len(frames), len(kept), merged
+    return len(frames), len(kept), merged, n_fade
 
 
 def main():
@@ -97,18 +147,24 @@ def main():
                     help="缩略图平均通道差低于此值视为没动")
     ap.add_argument("--max-hold", type=float, default=1.2,
                     help="单帧最长停留秒数，0 表示不限制")
+    ap.add_argument("--fade", type=float, default=0.0,
+                    help="末尾淡出 / 开头淡入的秒数，让无限循环不留硬切（0 = 不做）")
+    ap.add_argument("--fade-fps", type=float, default=12.0,
+                    help="淡入淡出段的帧率，低一点更省体积")
+    ap.add_argument("--end-hold", type=float, default=0.6,
+                    help="末帧定格上限，只在做淡出时生效")
     a = ap.parse_args()
 
-    frames = load_frames(a.src)
-    kept, holds, merged = dedupe(frames, a.fps, a.diff,
-                                 max_hold=a.max_hold or None)
-    build(kept, holds, a.dst, a.colors)
+    frames, src_holds = load_frames(a.src)
+    n_all, n_kept, merged, n_fade = slim_frames(
+        frames, a.dst, fps=a.fps, colors=a.colors, diff=a.diff,
+        max_hold=a.max_hold or None, fade=a.fade,
+        fade_fps=a.fade_fps, end_hold=a.end_hold, src_holds=src_holds)
 
-    src_kb = os.path.getsize(a.src) / 1024
-    dst_kb = os.path.getsize(a.dst) / 1024
-    print("%d 帧 -> %d 帧（合并 %d）  %d 色  %.1f MB -> %.1f MB"
-          % (len(frames), len(kept), merged, a.colors,
-             src_kb / 1024, dst_kb / 1024))
+    src_mb = os.path.getsize(a.src) / 1048576
+    dst_mb = os.path.getsize(a.dst) / 1048576
+    print("%d 帧 -> %d 帧（合并 %d，淡入淡出 %d）  %d 色  %.2f -> %.2f MB"
+          % (len(frames), n_kept, merged, n_fade, a.colors, src_mb, dst_mb))
     return 0
 
 

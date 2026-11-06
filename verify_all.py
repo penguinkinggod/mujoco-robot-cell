@@ -41,6 +41,7 @@ CORE_FILES = [
     "verify_all.py",
     "src/diag_chuck_health.py",
     "src/gif_slim.py",
+    "src/release_media.py",
     "src/diag_diameter_sweep.py",
     "src/diag_jaw_face_sweep.py",
     "src/diag_jaw_wrap.py",
