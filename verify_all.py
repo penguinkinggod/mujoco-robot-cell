@@ -42,6 +42,8 @@ CORE_FILES = [
     "src/diag_chuck_health.py",
     "src/gif_slim.py",
     "src/diag_diameter_sweep.py",
+    "src/diag_jaw_face_sweep.py",
+    "src/diag_jaw_wrap.py",
     # Also a real CHECKS entry below (kept here for py_compile coverage).
     "src/diag_feed_chuck.py",
 ]

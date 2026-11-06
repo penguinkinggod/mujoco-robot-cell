@@ -35,19 +35,29 @@ DIAMETERS = [0.015, 0.018, 0.020, 0.022, 0.025]
 MODES = ("fit", "phi20")
 _SHAFT_XY = S.SHAFT_POS[:2].copy()
 Q0 = np.array([0.7071068, 0.0, 0.7071068, 0.0])
+# import 时抓一次默认值。configure() 每次显式写回，避免扫描改过全局后串扰。
+_DEF_HALF = S.JAW_ARC_HALF_DEG
+_DEF_OVERLAP = S.JAW_ARC_OVERLAP
+_DEF_THICK = S.JAW_ARC_THICK
 
 
-def configure(D, mode):
-    """改模块全局再重建场景。make_scene() 每次从头 build_scene()，读的就是这些量。"""
+def configure(D, mode, half_deg=None, overlap=None, thick=None):
+    """改模块全局再重建场景。make_scene() 每次从头 build_scene()，读的就是这些量。
+
+    half_deg / overlap / thick 给包角扫描用，None 表示回到出厂值。
+    """
     S.SHAFT_D = D
     S.SHAFT_MASS = math.pi * (D / 2) ** 2 * S.SHAFT_L * S.STEEL_RHO
     S.SHAFT_POS = np.array([_SHAFT_XY[0], _SHAFT_XY[1],
                             S.TABLE_TOP_Z + D / 2])
     S.JAW_ARC_BORE_R = None if mode == "fit" else 0.010
+    S.JAW_ARC_HALF_DEG = _DEF_HALF if half_deg is None else half_deg
+    S.JAW_ARC_OVERLAP = _DEF_OVERLAP if overlap is None else overlap
+    S.JAW_ARC_THICK = _DEF_THICK if thick is None else thick
 
 
-def run_case(D, mode):
-    configure(D, mode)
+def run_case(D, mode, half_deg=None, overlap=None, thick=None):
+    configure(D, mode, half_deg, overlap, thick)
     model, data, ids = S.make_scene()
 
     sq = model.jnt_qposadr[
@@ -74,7 +84,7 @@ def run_case(D, mode):
         data.xfrc_applied[bid, 0] = 0.0
 
     def contacts():
-        n, force, inter, jj_force, body_force = 0, 0.0, 0, 0.0, 0.0
+        n, force, inter, jj_force, body_force, back_force = 0, 0.0, 0, 0.0, 0.0, 0.0
         for i in range(data.ncon):
             c = data.contact[i]
             n1 = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, c.geom1) or ""
@@ -83,6 +93,7 @@ def run_case(D, mode):
             mujoco.mj_contactForce(model, data, i, f)
             fmag = abs(f[0])
             is_jaw1, is_jaw2 = n1.startswith("jaw_geom"), n2.startswith("jaw_geom")
+            is_back1, is_back2 = n1.startswith("jaw_back"), n2.startswith("jaw_back")
             if gid in (c.geom1, c.geom2):
                 if is_jaw1 or is_jaw2:
                     n += 1
@@ -98,13 +109,18 @@ def run_case(D, mode):
                 jj_force += fmag
                 if fmag > 1.0:
                     inter += 1
-        return n, force, inter, jj_force, body_force
+            # 背板也是刚体，缩弧片之后它可能变成新的互顶源，单独记一路。
+            s1 = n1.split("_")[2] if (is_jaw1 or is_back1) else None
+            s2 = n2.split("_")[2] if (is_jaw2 or is_back2) else None
+            if (is_back1 or is_back2) and s1 and s2 and s1 != s2:
+                back_force += fmag
+        return n, force, inter, jj_force, body_force, back_force
 
     # ---- 张开 -> 夹紧，量几何和力 ----
     place()
     drive(S.CHUCK_OPEN_CTRL, 200)
     drive(S.CHUCK_CLAMP_CTRL, 1500)
-    n, force, inter, jj_force, body_force = contacts()
+    n, force, inter, jj_force, body_force, back_force = contacts()
 
     p = data.qpos[sq:sq + 3]
     coax = float(np.hypot(p[1] - axis[1], p[2] - axis[2]) * 1000)
@@ -130,7 +146,8 @@ def run_case(D, mode):
     return dict(mode=mode, D_mm=D * 1000, coax_mm=coax, tilt_deg=tilt,
                 contacts=n, force_N=force, sink_mm=sink,
                 pull20_mm=pull, jaw_jam_pairs=inter, jaw_jam_N=jj_force,
-                chuck_body_N=body_force, weight_N=weight, ok=ok)
+                back_jam_N=back_force, chuck_body_N=body_force,
+                weight_N=weight, ok=ok)
 
 
 def main():

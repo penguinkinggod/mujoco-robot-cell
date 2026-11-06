@@ -28,7 +28,7 @@ demo_04_panda.mp4
 Thumbs.db
 
 # 动图不进主分支：每改一版 GIF 就在历史里留一份 2 MB，压不掉也删不掉。
-# 图放在孤儿分支 assets 上（一个文件、无父提交，重建一次就干净），README 用外链引。
+# 图放 Releases/media-v1 附件里，不进仓库对象库，README 用下载外链引。
 assets/*.gif
 
 # 手工备份文件

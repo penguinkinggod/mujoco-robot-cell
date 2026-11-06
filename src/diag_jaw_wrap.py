@@ -143,7 +143,8 @@ def sweep_wrap():
     print()
 
     cases = [
-        (52.0, 5, "现状 104deg / 5 段"),
+        (S.JAW_ARC_HALF_DEG, 5,
+         "当前 %.0fdeg / 5 段" % (2 * S.JAW_ARC_HALF_DEG)),
         (60.0, 6, "120deg / 6 段  20deg 一段"),
         (60.0, 3, "120deg / 3 段  40deg 一段"),
         (58.0, 6, "116deg / 6 段  留 4deg 缝"),
@@ -180,12 +181,14 @@ def sweep_wrap():
 
 def sweep_force():
     print("=" * 92)
-    print("夹紧力上限扫描（包角固定 104deg / 5 段，拉拔 200 N）")
+    print("夹紧力上限扫描（包角取当前默认 %.0fdeg / 5 段，拉拔 200 N）"
+          % (2 * S.JAW_ARC_HALF_DEG))
     print("=" * 92)
     print("  判据：下沉 <= 0.5 mm   200 N 拉拔 <= 0.5 mm   爪-爪端面 0   爪-卡盘 0")
     print()
     for fl in (150.0, 300.0, 500.0, 800.0, 1200.0):
-        r = run(52.0, 5, None, force_limit=fl, pull_n=200.0)
+        r = run(S.JAW_ARC_HALF_DEG, 5, None,
+                force_limit=fl, pull_n=200.0)
         r["label"] = "上限 %4.0f N" % fl
         print("  %s   执行器出力 %6.1f N   位移误差 %5.2f mm（%s）"
               % (r["label"], r["act_force"], r["act_err"],
@@ -210,14 +213,16 @@ def sweep_deep():
     变成「扭矩上限决定夹紧力」。
     """
     print("=" * 92)
-    print("深目标 + 力限封顶（包角 104deg / 5 段，丝杠目标 -0.030）")
+    print("深目标 + 力限封顶（包角当前默认 %.0fdeg / 5 段，丝杠目标 -0.030）"
+          % (2 * S.JAW_ARC_HALF_DEG))
     print("=" * 92)
     print("  判据：下沉 <= 0.5 mm   200 N 拉拔 <= 0.5 mm   爪-爪端面 0   爪-卡盘 0")
     print()
     S.CHUCK_CTRL_RANGE = (-0.032, 0.012)
     S.CHUCK_CLAMP_CTRL = -0.030
     for fl in (150.0, 300.0, 500.0, 800.0):
-        r = run(52.0, 5, -0.030, force_limit=fl, pull_n=200.0)
+        r = run(S.JAW_ARC_HALF_DEG, 5, -0.030,
+                force_limit=fl, pull_n=200.0)
         blown = "  <== 拉拔后料被拽飞，数据不可信" if r["pull_ecc"] > 5.0 else ""
         print("  力限 %4.0f N   执行器出力 %6.1f N   位移误差 %5.2f mm（%s）"
               % (fl, r["act_force"], r["act_err"],
