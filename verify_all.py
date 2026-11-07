@@ -47,6 +47,7 @@ CORE_FILES = [
     "src/diag_jaw_wrap.py",
     # Also a real CHECKS entry below (kept here for py_compile coverage).
     "src/diag_feed_chuck.py",
+    "tests/test_feed_failure_detection.py",
 ]
 
 MACHINING_CODE = (
@@ -211,6 +212,15 @@ def check_env_cell(out, err, rc):
         coax, tilt, contacts, ncam.group(1))
 
 
+def check_feed_failure_detection(out, err, rc):
+    combined = out + "\n" + err
+    m = re.search(r"Ran\s+(\d+)\s+tests?", combined)
+    passed = m is not None and "OK" in combined
+    return rc == 0 and passed, (
+        "%s failure-detection tests" % m.group(1) if m
+        else "unittest output missing")
+
+
 CHECKS = [
     dict(name="语法检查", cmd=[PY, "-m", "py_compile"] + CORE_FILES,
          check=check_compile, slow=False, hint="秒级"),
@@ -233,6 +243,11 @@ CHECKS = [
     dict(name="送料·官方场景(SO-101 env)",
          cmd=[PY, "src/env_cell.py", "--run", "--no-video"],
          check=check_env_cell, slow=True, hint="约 5 秒"),
+    dict(name="送料失败检测单测",
+         cmd=[PY, "-m", "unittest", "discover", "-s", "tests",
+              "-p", "test_*.py"],
+         check=check_feed_failure_detection, slow=False,
+         hint="约 5 秒"),
 ]
 
 

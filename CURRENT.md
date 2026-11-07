@@ -1,7 +1,7 @@
 # 现在在做什么
 
 给下一个接手的人或 agent 看的现场记录。只写"此刻"的状态，不写历史；换手前改这里，不要另开日志。
-最后更新：2026-11-07（P1.3 试验有效性与结果分类完成）
+最后更新：2026-11-07（P1.4 故障检测验收完成）
 
 ## 先读：抓取回归已修复，P0 已完成
 
@@ -9,11 +9,11 @@
 
 已修复的首要差异：抓取目标恢复为仿真静置后的实际 `home`，包含 `--lift` 后的抬升高度；全物理 V 槽路径若抓取接触数为 0，则在 `grasp` 阶段 `FEED_ABORT`，不会继续搬运或闭合卡盘。官方兼容场景仍保留历史托力，并作为独立对照。P0.2、P0.3、P0.4 现已完成。
 
-**统一任务入口：[项目任务总账](docs/project-taskbook.md)**。它记录最终成果、分工、P0-P10 小任务、验收和决定。P1.1 指标字典见 [docs/metric-dictionary.md](docs/metric-dictionary.md)。P0.4 基准身份记录见 [docs/baseline-identity-2026-11-07.md](docs/baseline-identity-2026-11-07.md)，P3 退出段诊断见 [docs/exit-diagnostics-2026-11-07.md](docs/exit-diagnostics-2026-11-07.md)，P1.2/P1.3 验收分别见 [docs/p1.2-state-transitions-2026-11-07.md](docs/p1.2-state-transitions-2026-11-07.md) 和 [docs/p1.3-validity-and-outcomes-2026-11-07.md](docs/p1.3-validity-and-outcomes-2026-11-07.md)。旧 T 清单是实现参考，不是允许一次做完所有步骤的授权。
+**统一任务入口：[项目任务总账](docs/project-taskbook.md)**。它记录最终成果、分工、P0-P10 小任务、验收和决定。P1.1 指标字典见 [docs/metric-dictionary.md](docs/metric-dictionary.md)。P0.4 基准身份记录见 [docs/baseline-identity-2026-11-07.md](docs/baseline-identity-2026-11-07.md)，P3 退出段诊断见 [docs/exit-diagnostics-2026-11-07.md](docs/exit-diagnostics-2026-11-07.md)，P1.2/P1.3/P1.4 验收分别见 [docs/p1.2-state-transitions-2026-11-07.md](docs/p1.2-state-transitions-2026-11-07.md)、[docs/p1.3-validity-and-outcomes-2026-11-07.md](docs/p1.3-validity-and-outcomes-2026-11-07.md) 和 [docs/p1.4-failure-detection-2026-11-07.md](docs/p1.4-failure-detection-2026-11-07.md)。旧 T 清单是实现参考，不是允许一次做完所有步骤的授权。
 
-P0.1 审计结论见 [docs/audit-current-diff-2026-11-07.md](docs/audit-current-diff-2026-11-07.md)。P0.2/P0.3 基础回归证据：`verify_all.py` 为 **9/9**；`diag_feed_chuck.py --v-jaw --lift --no-lock` 为 `FEED_METRIC PASS`，同轴约 `0.64 mm`、倾角约 `0.2°`、交接位移约 `1.58 mm`、余量偏心约 `0.70/2.0 mm`、20 N 拉拔约 `0.00 mm`。负向 `dy=+50 mm` 在抓取阶段终止，未进入三爪闭合。P0.3 四档复验、8 mm 画面核验、P0.4 基准身份、P1.1 指标字典和 P3 退出段三模式诊断均已完成。P1.2 完成状态转换、ABORT/ERROR 和记账；P1.3 完成结果有效性与统计范围分类：正常 PASS 可入主实验，8 mm 质量 FAIL 与抓空 ABORT 是可计数的失败尝试，带锁 PASS 仅作对照；完整回归 **9/9**。下一步做 P1.4 故障检测验证。
+P0.1 审计结论见 [docs/audit-current-diff-2026-11-07.md](docs/audit-current-diff-2026-11-07.md)。P0.2/P0.3 基础回归证据：`verify_all.py` 为 **9/9**；`diag_feed_chuck.py --v-jaw --lift --no-lock` 为 `FEED_METRIC PASS`，同轴约 `0.64 mm`、倾角约 `0.2°`、交接位移约 `1.58 mm`、余量偏心约 `0.70/2.0 mm`、20 N 拉拔约 `0.00 mm`。负向 `dy=+50 mm` 在抓取阶段终止，未进入三爪闭合。P0.3 四档复验、8 mm 画面核验、P0.4 基准身份、P1.1 指标字典和 P3 退出段三模式诊断均已完成。P1.2 完成状态转换、ABORT/ERROR 和记账；P1.3 完成结果有效性与统计范围分类；P1.4 修复并验证机器人外壳碰撞漏报，夹空、碰撞、NaN 与正常分支均已测试，完整回归 **10/10**。高 IK 残差仍不自动判为不可达。下一步做 P2.1 实验 JSON 字段规范。
 
-**尚未验收的实现：** P1.4 故障检测验证、姿态扰动入口和正式批量实验数据规范仍未完成；本次扫描器只验收状态映射与分类字段，不代表通用批量扰动流程已完成。证据与配置见 [docs/insert-sweep-2026-11-07.md](docs/insert-sweep-2026-11-07.md)、[docs/baseline-identity-2026-11-07.md](docs/baseline-identity-2026-11-07.md)、[docs/exit-diagnostics-2026-11-07.md](docs/exit-diagnostics-2026-11-07.md)、[docs/p1.2-state-transitions-2026-11-07.md](docs/p1.2-state-transitions-2026-11-07.md) 和 [docs/p1.3-validity-and-outcomes-2026-11-07.md](docs/p1.3-validity-and-outcomes-2026-11-07.md)。当前仅本地 checkpoint；不 push，直到完成可公开展示的项目成果。
+**尚未验收的实现：** P2.1 正式实验 JSON 必填字段、姿态扰动入口和批量实验流程仍未完成；当前扫描器不是通用批量扰动工具。不可达专用判据也尚未实现。证据见 [docs/insert-sweep-2026-11-07.md](docs/insert-sweep-2026-11-07.md)、[docs/baseline-identity-2026-11-07.md](docs/baseline-identity-2026-11-07.md)、[docs/exit-diagnostics-2026-11-07.md](docs/exit-diagnostics-2026-11-07.md)、[docs/p1.2-state-transitions-2026-11-07.md](docs/p1.2-state-transitions-2026-11-07.md)、[docs/p1.3-validity-and-outcomes-2026-11-07.md](docs/p1.3-validity-and-outcomes-2026-11-07.md) 和 [docs/p1.4-failure-detection-2026-11-07.md](docs/p1.4-failure-detection-2026-11-07.md)。当前仅本地 checkpoint；不 push，直到完成可公开展示的项目成果。
 
 **要拿去问别人/别的 AI**：直接用 [docs/handoff-brief.md](docs/handoff-brief.md)，
 那份是自包含的，不需要读代码，末尾有 6 个待判断的问题。
@@ -35,7 +35,7 @@ P0.1 审计结论见 [docs/audit-current-diff-2026-11-07.md](docs/audit-current-
 - 新增 `src/diag_feed_insert_sweep.py`，运行 `python src/diag_feed_insert_sweep.py` 可扫描完整机械臂送料流程并写入 `_build/feed_insert_sweep.csv`。它只改变插入深度，其他 `FEED_*` 环境覆盖会清除。
 - 当前恢复后的四档复验：7.75 mm FAIL（余量偏心 2.19 mm），8 mm FAIL（2.28 mm），10 mm PASS（0.92 mm），25 mm PASS（0.70 mm）。
 - 本次固定初态四档中，最浅 PASS 是 **10 mm**；它不是生产标准或任意尺寸通用值。旧记录中的“8 mm PASS”属于另一轮代码/结果，已被本次复验覆盖。
-- 7.75/8 mm 首次超过 2.0 mm 余量偏心发生在轴向退出之后；进给完成、三爪夹紧、原地松爪仍未超线。8 mm 画面未见明显挤飞或穿模，但数值仍 FAIL。P3 对照显示：正常两段退出是 8 mm 三种模式中最不坏的路径，但唯一根因仍未证明。P1.2/P1.3 已完成，下一步做 P1.4 故障检测验证。
+- 7.75/8 mm 首次超过 2.0 mm 余量偏心发生在轴向退出之后；进给完成、三爪夹紧、原地松爪仍未超线。8 mm 画面未见明显挤飞或穿模，但数值仍 FAIL。P3 对照显示：正常两段退出是 8 mm 三种模式中最不坏的路径，但唯一根因仍未证明。P1.2-P1.4 已完成，下一步做 P2.1 实验 JSON 字段规范。
 
 ## 状态：阶段 B 第三轮已落地为新默认
 
@@ -249,7 +249,7 @@ P0.1 审计结论见 [docs/audit-current-diff-2026-11-07.md](docs/audit-current-
 ## 怎么复现
 
 ```bash
-python verify_all.py                                    # 9/9
+python verify_all.py                                    # 10/10
 python src/diag_chuck_seat.py                           # 卡盘基准（24 组）
 python src/diag_feed_chuck.py --v-jaw --lift --no-lock  # 机械臂送料（新默认）
 FEED_CLAMP_TRACE=1 python src/diag_feed_chuck.py --v-jaw --lift --no-lock  # 逐帧跟踪

@@ -1,11 +1,11 @@
 # 交班简报：SO-101 机械臂给三爪卡盘送一根棒料
 
-> 状态更正（2026-11-07）：P0.2-P0.4、P1.1-P1.3 已完成，基础回归为 9/9；固定初态四档中 10 mm 是最浅通过档，但不是通用标准。8/10 mm 退出段诊断已记录，下一张任务为 P1.4 故障检测验证。详细状态见 [CURRENT.md](../CURRENT.md) 与 [任务总账](project-taskbook.md)。
+> 状态更正（2026-11-07）：P0.2-P0.4、P1.1-P1.4 已完成，完整回归为 10/10；固定初态四档中 10 mm 是最浅通过档，但不是通用标准。P1.4 修复并验证机器人外壳碰撞漏报；高 IK 残差仍不直接判为不可达。下一张任务为 P2.1 实验 JSON 字段规范。详细状态见 [CURRENT.md](../CURRENT.md)、[任务总账](project-taskbook.md) 与 [P1.4 验收](p1.4-failure-detection-2026-11-07.md)。
 
 这份文件是**对外**的：给别的 AI / 别人看，不需要读代码也能判断问题在哪。
 内部现场记录在 [CURRENT.md](../CURRENT.md)，代码在 `src/diag_feed_chuck.py`。
 
-代码版本：`7f8c814`（2026-11-07），`python verify_all.py` 9/9 通过。
+P1.3 基线提交：`142b253`（2026-11-07）；P1.4 已在当前分支本地提交，尚未推送。当前 `python verify_all.py` 为 10/10。
 
 ---
 
@@ -150,7 +150,7 @@ D35 关掉托架仍 FAIL（三爪咬空、交接 10.91 mm、最终 2.82 mm/2.6°
 ## 6. 怎么复现
 
 ```bash
-python verify_all.py                                        # 全量回归 9/9
+python verify_all.py                                        # 全量回归 10/10
 python src/diag_chuck_seat.py                               # 卡盘基准（24 组，与机械臂无关）
 python src/diag_feed_chuck.py --v-jaw --lift --no-lock      # 机械臂送料（默认）
 FEED_CLAMP_TRACE=1 python src/diag_feed_chuck.py --v-jaw --lift --no-lock   # 逐帧

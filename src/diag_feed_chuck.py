@@ -138,6 +138,38 @@ def _case_classification(execution_status, evaluation_scope, hard_pass,
     }
 
 
+def _robot_machine_geom_ids(model):
+    """Return semantic robot and machine geom sets for contact detection."""
+    base_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_BODY, "base")
+    robot_bodies = set()
+    if base_id >= 0:
+        for body_id in range(model.nbody):
+            parent_id = body_id
+            while parent_id > 0 and parent_id != base_id:
+                parent_id = int(model.body_parentid[parent_id])
+            if parent_id == base_id:
+                robot_bodies.add(body_id)
+
+    robot_geom_ids = {
+        geom_id for geom_id in range(model.ngeom)
+        if int(model.geom_bodyid[geom_id]) in robot_bodies
+    }
+    machine_mask = F.CT_MACHINE
+    machine_geom_ids = {
+        geom_id for geom_id in range(model.ngeom)
+        if (int(model.geom_contype[geom_id]),
+            int(model.geom_conaffinity[geom_id])) == machine_mask
+    }
+    return robot_geom_ids, machine_geom_ids
+
+
+def _is_robot_machine_contact(geom1, geom2, robot_geom_ids,
+                              machine_geom_ids):
+    return ((geom1 in robot_geom_ids and geom2 in machine_geom_ids)
+            or (geom2 in robot_geom_ids and geom1 in machine_geom_ids))
+
+
 COAX_LIMIT = 2.0       # mm
 TILT_LIMIT = 10.0      # deg
 CONTACT_MIN = 6
@@ -908,6 +940,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, i) or "")
         .startswith("shaft_")
     ]
+    robot_geom_ids, machine_geom_ids = _robot_machine_geom_ids(model)
     bushing_ids = [
         i for i in range(model.ngeom)
         if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, i) or "")
@@ -986,9 +1019,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 model, mujoco.mjtObj.mjOBJ_GEOM, c.geom1) or "?"
             n2 = mujoco.mj_id2name(
                 model, mujoco.mjtObj.mjOBJ_GEOM, c.geom2) or "?"
-            t1 = int(model.geom_contype[c.geom1])
-            t2 = int(model.geom_contype[c.geom2])
-            if (t1, t2) in ((1, 8), (8, 1)):
+            if _is_robot_machine_contact(
+                    c.geom1, c.geom2, robot_geom_ids, machine_geom_ids):
                 mujoco.mj_contactForce(model, data, i, _cf6)
                 machine_contacts.append({
                     "geoms": [n1, n2], "normal_force_N": abs(float(_cf6[0]))})
@@ -1262,9 +1294,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 model, mujoco.mjtObj.mjOBJ_GEOM, c.geom1) or "?"
             n2 = mujoco.mj_id2name(
                 model, mujoco.mjtObj.mjOBJ_GEOM, c.geom2) or "?"
-            t1 = int(model.geom_contype[c.geom1])
-            t2 = int(model.geom_contype[c.geom2])
-            if (t1, t2) in ((1, 8), (8, 1)):
+            if _is_robot_machine_contact(
+                    c.geom1, c.geom2, robot_geom_ids, machine_geom_ids):
                 mujoco.mj_contactForce(model, data, i, _cf6)
                 key = "%s|%s" % (n1, n2)
                 machine_pairs[key] = max(
@@ -2128,9 +2159,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     machine_hits = 0
     for ci in range(data.ncon):
         c = data.contact[ci]
-        t1 = int(model.geom_contype[c.geom1])
-        t2 = int(model.geom_contype[c.geom2])
-        if (t1, t2) in ((1, 8), (8, 1)):
+        if _is_robot_machine_contact(
+                c.geom1, c.geom2, robot_geom_ids, machine_geom_ids):
             machine_hits += 1
     print("  进给     IK残差=%5.1f mm 轴=%s 同轴=%6.2f mm 轴向偏=%4.1f deg"
           % (err * 1000, np.round(shaft(), 4), coax(), axdev()))
