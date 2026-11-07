@@ -98,8 +98,17 @@ CONTACT_MIN = 6
 SLIP_LIMIT = 2.0       # mm
 PULL_LIMIT = 2.0       # mm
 # 交接全程（夹紧+松爪+退出）棒料 z 的峰谷。slip_mm 只测解锁后静置，
-# 覆盖不到人眼看到的那一下位移。6 mm 是「明显恶化」的护栏，不是目标值。
-CLAMP_SWING_LIMIT = 6.0   # mm
+# 覆盖不到人眼看到的那一下位移。
+# 2026-11-07 用户确认：真机三爪本来就是这个分布，夹紧瞬态的可见位移
+# 会被第一刀切掉，不影响成品，不作为工艺质量目标。这里只保留一个宽松
+# 护栏，防止回归时真的把料甩飞；不再为了「画面看不出动」去调参数。
+CLAMP_SWING_LIMIT = 12.0   # mm（甩料护栏，非精度指标）
+
+# 加工验收判据：整根棒料相对主轴轴线的最大径向偏心必须小于单边余量。
+# 一次装夹内车出的所有表面天然同轴于主轴，来料偏心只决定第一刀能否
+# 见光（会不会留黑皮），不决定成品精度。默认按 Φ20 棒料粗车到 Φ16、
+# 单边 2.0 mm 余量；实际工件尺寸变了要改这里。
+STOCK_ALLOW_MM = 2.0      # mm
 
 # 0.20 was picked by an old x-scan that only checked POSITION. With the rod
 # axis held horizontal, a 5-DoF SO-101 cannot reach that part of the table:
@@ -628,6 +637,21 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     def coax():
         p = shaft()
         return float(np.hypot(p[1] - axis[1], p[2] - axis[2]) * 1000)
+
+    def stock_ecc():
+        """整根棒料相对主轴轴线的最大径向偏心（mm），取两端点较坏值。
+
+        同轴度只量中心，倾斜的那一段会漏掉；车外圆时真正决定「第一刀
+        能不能见光」的是最外端的偏心。夹紧后料与主轴刚性固连，车出来
+        的表面自动同轴，所以这里只判断余量够不够，不是成品精度。
+        """
+        p = shaft()
+        a = data.xmat[shaft_body].reshape(3, 3)[:, 2]
+        e = 0.0
+        for s in (-1.0, 1.0):
+            q = p + s * (F.SHAFT_L / 2) * a
+            e = max(e, float(np.hypot(q[1] - axis[1], q[2] - axis[2])))
+        return e * 1000
 
     def axdev():
         """Angle between the ROD AXIS and world x -- not the quaternion.
@@ -1519,6 +1543,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     settle(800, SM.CHUCK_CLAMP_CTRL, GRIP_OPEN)
 
     final_coax = coax()
+    stock = stock_ecc()
+    state["stock_ecc_mm"] = stock
     # A cylinder may ROLL about its own axis freely; tilt_deg() reports that
     # harmless roll as >100 deg. What matters for a chuck is the angle
     # between the rod AXIS and the spindle axis, which axdev() measures.
@@ -1634,12 +1660,15 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 print(line)
         print()
 
-    # 全物理交接才有 clamp_swing_mm；运动学锁基线不测这一项。
+    # 全物理交接才有 clamp_swing_mm；运动学锁基线不测交接/余量判据。
     swing = state.get("clamp_swing_mm")
+    stock = state.get("stock_ecc_mm")
+    handover_ok = (swing is None or
+                   (swing <= CLAMP_SWING_LIMIT
+                    and (stock is None or stock <= STOCK_ALLOW_MM)))
     ok = (final_coax <= COAX_LIMIT and final_tilt <= TILT_LIMIT
           and contacts >= CONTACT_MIN and slip <= SLIP_LIMIT
-          and pull <= PULL_LIMIT
-          and (swing is None or swing <= CLAMP_SWING_LIMIT))
+          and pull <= PULL_LIMIT and handover_ok)
     print("=" * 74)
     print("FEED_METRIC coax_mm=%.2f tilt_deg=%.1f contacts=%d "
           "slip_mm=%.2f pull_mm=%.2f jaw_force_N=%.1f "
@@ -1648,14 +1677,17 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
              grasp_tilt, "kinematic_lock" if carry_lock else "physics",
              0 if state["lock_active"] else 1))
     if swing is not None:
-        print("FEED_METRIC_HANDOVER clamp_swing_mm=%.2f limit=%.1f"
+        print("FEED_METRIC_HANDOVER clamp_swing_mm=%.2f guard=%.1f"
               % (swing, CLAMP_SWING_LIMIT))
+    if stock is not None:
+        print("FEED_METRIC_MACHINING stock_ecc_mm=%.2f allow_mm=%.1f"
+              % (stock, STOCK_ALLOW_MM))
     print("FEED_METRIC %s" % ("PASS" if ok else "FAIL"))
     if not ok:
         print("  未通过判据：同轴≤%.1fmm 倾斜≤%.1fdeg 接触≥%d "
-              "下沉≤%.1fmm 20N拉≤%.1fmm 交接位移≤%.1fmm"
+              "下沉≤%.1fmm 20N拉≤%.1fmm 交接甩料≤%.1fmm 余量偏心≤%.1fmm"
               % (COAX_LIMIT, TILT_LIMIT, CONTACT_MIN,
-                 SLIP_LIMIT, PULL_LIMIT, CLAMP_SWING_LIMIT))
+                 SLIP_LIMIT, PULL_LIMIT, CLAMP_SWING_LIMIT, STOCK_ALLOW_MM))
     print("=" * 74)
     print("OK")
     return 0 if ok else 1

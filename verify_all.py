@@ -161,21 +161,29 @@ def check_feed_physics(out, err, rc):
     contacts = int(m.group(3))
     slip, pull = float(m.group(4)), float(m.group(5))
     force, unlocked = float(m.group(6)), int(m.group(8))
-    # 交接全程可见位移（夹紧+松爪+退出）。slip_mm 只测解锁后静置，
-    # 覆盖不到人眼看到的「下沉—回升」，必须单独守住，否则又会退化到
-    # 「指标 0.02 mm、画面明显在动」。
+    # 交接全程可见位移（夹紧+松爪+退出）。用户确认真机三爪就是这个分布，
+    # 这段位移会被第一刀切掉、不影响成品，所以这里只作「别把料甩飞」的
+    # 宽松护栏，不再是工艺质量目标。
     sw = re.search(r"FEED_METRIC_HANDOVER clamp_swing_mm=([\d.]+) "
-                   r"limit=([\d.]+)", out)
+                   r"guard=([\d.]+)", out)
     swing = float(sw.group(1)) if sw else None
-    swing_limit = float(sw.group(2)) if sw else 6.0
+    swing_guard = float(sw.group(2)) if sw else 12.0
+    # 真正对应加工的判据：整根料最坏处偏心 ≤ 单边余量，第一刀才能见光。
+    st = re.search(r"FEED_METRIC_MACHINING stock_ecc_mm=([\d.]+) "
+                   r"allow_mm=([\d.]+)", out)
+    stock = float(st.group(1)) if st else None
+    stock_allow = float(st.group(2)) if st else 2.0
     good = (rc == 0 and "FEED_METRIC PASS" in out and unlocked == 1
             and coax <= 2.0 and tilt <= 10.0 and contacts >= 6
             and slip <= 2.0 and pull <= 2.0
-            and swing is not None and swing <= swing_limit)
+            and swing is not None and swing <= swing_guard
+            and stock is not None and stock <= stock_allow)
     return good, ("无锁同轴%.2fmm 倾斜%.1f° 接触%d 拉%.2fmm 力%.1fN "
-                  "交接位移%s" % (
+                  "交接位移%s 余量偏心%s" % (
                       coax, tilt, contacts, pull, force,
-                      "%.2fmm" % swing if swing is not None else "缺失"))
+                      "%.2fmm" % swing if swing is not None else "缺失",
+                      "%.2f/%.1fmm" % (stock, stock_allow)
+                      if stock is not None else "缺失"))
 
 
 def check_env_cell(out, err, rc):
