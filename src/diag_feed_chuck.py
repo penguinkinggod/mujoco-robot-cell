@@ -97,6 +97,13 @@ from demo_08_pick_and_load import (
     Arm, WRIST_ROLL_GRASP, GRIP_OPEN, GRIP_CLOSE,
 )
 
+
+def _finite_sim_state(qpos, qvel, ctrl, qacc, qfrc_applied,
+                      xfrc_applied):
+    return all(np.all(np.isfinite(values)) for values in (
+        qpos, qvel, ctrl, qacc, qfrc_applied, xfrc_applied))
+
+
 COAX_LIMIT = 2.0       # mm
 TILT_LIMIT = 10.0      # deg
 CONTACT_MIN = 6
@@ -924,6 +931,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     _cf6 = np.zeros(6)
 
     def track_pen(label):
+        ensure_finite_state(label)
         _fmax = 0.0
         machine_contacts = []
         shaft_contacts = 0
@@ -1088,6 +1096,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     offset_mm = np.asarray(initial_offset_mm, dtype=float)
     if offset_mm.shape != (3,):
         raise ValueError("initial_offset_mm must have three values: dx, dy, dz")
+    if not np.all(np.isfinite(offset_mm)) or not np.isfinite(initial_roll_deg):
+        raise ValueError("initial pose values must be finite")
     _KP0 = [float(model.actuator_gainprm[a, 0]) for a in arm.qadr]
     # 夹爪执行器力矩上限（N·m）。SO-101 出厂 ±3.35，挂 80 mm 料时料重经
     # V 槽楔形放大，实测把两指撑开 3.8 mm、料跟着下沉 1.4 mm。这里只是
@@ -1110,6 +1120,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             model.actuator_gainprm[a, 0] = _KP0[k] * scale
             model.actuator_biasprm[a, 1] = -_KP0[k] * scale
 
+    no_retreat_diagnostic = (
+        os.environ.get("FEED_DIAG_NO_RETREAT") == "1")
     state = {"offset": None, "off_site": None, "abs_pos": None,
              "lock_active": True, "axis_hold": False,
              "stage_records": [], "case_id": case_id,
@@ -1127,13 +1139,73 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                  "v_jaw": bool(v_jaw), "lift": bool(lift),
                  "carry_lock": bool(carry_lock),
                  "machine_solid": bool(machine_solid),
-                 "retreat_axial": bool(RETREAT_AXIAL),
+                 "retreat_axial": bool(
+                     RETREAT_AXIAL and not no_retreat_diagnostic),
+                 "diagnostic_mode": (
+                     "stationary_after_release"
+                     if no_retreat_diagnostic
+                     else "no_axial_retreat"
+                     if not RETREAT_AXIAL else "standard"),
              }}
 
     robot_machine_peaks = {}
 
+    def write_result_json(result):
+        json_path = os.environ.get("FEED_RESULT_JSON")
+        if not json_path:
+            return
+        path = os.path.abspath(json_path)
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(result, stream, ensure_ascii=False, indent=2)
+        print("FEED_RESULT_JSON %s" % path)
+
+    def ensure_finite_state(label):
+        if (np.isfinite(data.time)
+                and _finite_sim_state(
+                    data.qpos, data.qvel, data.ctrl, data.qacc,
+                    data.qfrc_applied, data.xfrc_applied)):
+            return
+        print("FEED_ABORT stage=%s reason=non_finite_state" % label)
+        write_result_json({
+            "schema_version": 2,
+            "case_id": state["case_id"],
+            "random_seed": state["random_seed"],
+            "created_at_unix": time.time(),
+            "duration_s": time.perf_counter() - started_at,
+            "platform": platform.platform(),
+            "python": platform.python_version(),
+            "mujoco": getattr(mujoco, "__version__", "unknown"),
+            "config": state["config"],
+            "execution_status": "error",
+            "abort_stage": label,
+            "abort_reason": "non_finite_state",
+            "metrics": {},
+            "hard_pass": False,
+            "quality_pass": None,
+            "overall_pass": False,
+            "hard_failures": ["non_finite_state"],
+            "quality_failures": [],
+            "phase_stats": state.get("phase_stats", {}),
+            "ik_solver": state.get("ik_solver", []),
+            "ik_residuals_mm": state.get("ik_residuals_mm", {}),
+            "stages": state.get("stage_records", []),
+        })
+        raise FloatingPointError(
+            "non-finite simulation state at stage %s" % label)
+
+    def step_sim():
+        label = state.get("label", "simulation")
+        ensure_finite_state("%s:before_step" % label)
+        mujoco.mj_step(model, data)
+        ensure_finite_state("%s:after_step" % label)
+
     def record_stage(name):
+        ensure_finite_state(name)
         mujoco.mj_forward(model, data)
+        ensure_finite_state("%s:after_forward" % name)
         contacts, jaw_force = jaw_state()
         axis_now = rod_axis()
         p = shaft()
@@ -1348,7 +1420,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             gcmd = grip if grip_end is None else grip + s * (grip_end - grip)
             data.ctrl[arm.grip_act] = grip_cmd(gcmd)
             data.ctrl[jaw_act] = jaw_ctrl
-            mujoco.mj_step(model, data)
+            step_sim()
             state.setdefault("traj", []).append(
                 data.site_xpos[arm.site].copy())
             state.setdefault("traj_t", []).append(float(data.time))
@@ -1381,7 +1453,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 data.ctrl[a] = v
             data.ctrl[arm.grip_act] = grip_cmd(final_grip)
             data.ctrl[jaw_act] = jaw_ctrl
-            mujoco.mj_step(model, data)
+            step_sim()
             state.setdefault("traj", []).append(
                 data.site_xpos[arm.site].copy())
             state.setdefault("traj_t", []).append(float(data.time))
@@ -1434,7 +1506,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         for _ in range(30 if hold_done else GRIP_SETTLE):
             data.ctrl[arm.grip_act] = grip_cmd(grip)
             data.ctrl[jaw_act] = jaw_ctrl
-            mujoco.mj_step(model, data)
+            step_sim()
             state.setdefault("traj", []).append(
                 data.site_xpos[arm.site].copy())
             state.setdefault("traj_t", []).append(float(data.time))
@@ -1599,7 +1671,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 data.ctrl[a] = v + lead * w
             data.ctrl[arm.grip_act] = grip_cmd(grip)
             data.ctrl[jaw_act] = jaw_ctrl
-            mujoco.mj_step(model, data)
+            step_sim()
             state.setdefault("traj", []).append(
                 data.site_xpos[arm.site].copy())
             state.setdefault("traj_t", []).append(float(data.time))
@@ -1729,7 +1801,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             data.ctrl[arm.grip_act] = grip_cmd(grip)
             if floating:
                 float_arm()
-            mujoco.mj_step(model, data)
+            step_sim()
             state.setdefault("traj", []).append(
                 data.site_xpos[arm.site].copy())
             state.setdefault("traj_t", []).append(float(data.time))
@@ -1763,7 +1835,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     for _ in range(600):
         for k in range(5):
             data.ctrl[k] = data.qpos[arm.qadr[k]]
-        mujoco.mj_step(model, data)
+        step_sim()
     # Pick uses the calibrated position-only IK. Axis holding starts only
     # AFTER the V jaws close; applying it during approach changes the
     # calibrated grasp pose and the blades shove the rod into the table.
@@ -1840,8 +1912,57 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         settle(GRIP_RAMP - 320 + 80, SM.CHUCK_OPEN_CTRL, grip_close)
     state["grasp_contact_count"] = grip_state()[0]
     if v_jaw and not carry_lock and state["grasp_contact_count"] == 0:
+        record_stage("grasp_abort")
         print("FEED_ABORT stage=grasp reason=no_v_jaw_contact; "
               "搬运和卡盘闭合已取消")
+        result = {
+            "schema_version": 2,
+            "case_id": state["case_id"],
+            "random_seed": state["random_seed"],
+            "created_at_unix": time.time(),
+            "duration_s": time.perf_counter() - started_at,
+            "platform": platform.platform(),
+            "python": platform.python_version(),
+            "mujoco": getattr(mujoco, "__version__", "unknown"),
+            "git_revision": subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=os.path.dirname(
+                    os.path.dirname(os.path.abspath(__file__))),
+                capture_output=True, text=True, check=False).stdout.strip(),
+            "config": state["config"],
+            "execution_status": "aborted",
+            "abort_stage": "grasp",
+            "abort_reason": "no_v_jaw_contact",
+            "metrics": {
+                "coax_mm": None,
+                "tilt_deg": None,
+                "contacts": None,
+                "slip_mm": None,
+                "pull_mm": None,
+                "jaw_force_N": None,
+                "grasp_tilt_deg": grasp_tilt,
+                "grasp_contact_count": 0,
+                "clamp_swing_mm": None,
+                "stock_ecc_mm": None,
+                "rod_external_force_max_N": state.get(
+                    "rod_force_max", 0.0),
+                "robot_machine_contact_max": state.get(
+                    "robot_machine_contact_max", 0),
+                "shaft_contact_max": state.get("shaft_contact_max", 0),
+                "penetration_min_m": float(PEN["min"]),
+                "penetration_pair": PEN["pair"],
+                "penetration_phase": PEN["label"],
+            },
+            "hard_pass": False,
+            "quality_pass": None,
+            "overall_pass": False,
+            "hard_failures": ["grasp_empty"],
+            "quality_failures": [],
+            "phase_stats": state.get("phase_stats", {}),
+            "ik_solver": state.get("ik_solver", []),
+            "ik_residuals_mm": state.get("ik_residuals_mm", {}),
+            "stages": state.get("stage_records", []),
+        }
+        write_result_json(result)
         return 1
     record_stage("grasp_complete")
     print("  shaft_in_grip = %s mm（搬运锁的相对偏移）"
@@ -2006,7 +2127,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                                   + s * (SM.CHUCK_CLAMP_CTRL
                                          - SM.CHUCK_OPEN_CTRL))
             data.ctrl[arm.grip_act] = grip_cmd(GRIP_OPEN)
-            mujoco.mj_step(model, data)
+            step_sim()
             state.setdefault("traj", []).append(
                 data.site_xpos[arm.site].copy())
             state.setdefault("traj_label", []).append(state.get("label", "?"))
@@ -2060,7 +2181,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                                             + s * (q_goal[k] - q_now[k]))
                         data.ctrl[arm.grip_act] = grip_cmd(grip_close)
                         data.ctrl[jaw_act] = SM.CHUCK_OPEN_CTRL
-                        mujoco.mj_step(model, data)
+                        step_sim()
                         state.setdefault("traj", []).append(
                             data.site_xpos[arm.site].copy())
                         state.setdefault("traj_label", []).append("料轴调平")
@@ -2116,7 +2237,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 data.ctrl[jaw_act] = SM.CHUCK_OPEN_CTRL
                 data.ctrl[arm.grip_act] = grip_cmd(grip_close)
                 float_arm()
-                mujoco.mj_step(model, data)
+                step_sim()
                 _used = _j + 1
                 _qvel = float(np.linalg.norm(
                     [data.qvel[a] for a in arm.qadr]))
@@ -2153,7 +2274,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 grip_direct(grip_close + s * (GRIP_OPEN - grip_close))
                 seat_rod(seat_x0)
                 float_arm()
-                mujoco.mj_step(model, data)
+                step_sim()
                 _z = float(shaft()[2])
                 clamp_z_min = min(clamp_z_min, _z)
                 clamp_z_max = max(clamp_z_max, _z)
@@ -2172,7 +2293,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 data.ctrl[arm.grip_act] = grip_cmd(GRIP_OPEN)
                 seat_rod(seat_x0)
                 float_arm()
-                mujoco.mj_step(model, data)
+                step_sim()
                 _z = float(shaft()[2])
                 clamp_z_min = min(clamp_z_min, _z)
                 clamp_z_max = max(clamp_z_max, _z)
@@ -2200,7 +2321,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 pusher_rod(seat_x0)
                 seat_rod(seat_x0)
                 float_arm()
-                mujoco.mj_step(model, data)
+                step_sim()
                 clamp_p = shaft()
                 clamp_z_min = min(clamp_z_min, float(clamp_p[2]))
                 clamp_z_max = max(clamp_z_max, float(clamp_p[2]))
@@ -2217,7 +2338,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 pusher_rod(seat_x0)
                 seat_rod(seat_x0)
                 float_arm()
-                mujoco.mj_step(model, data)
+                step_sim()
                 clamp_p = shaft()
                 clamp_z_min = min(clamp_z_min, float(clamp_p[2]))
                 clamp_z_max = max(clamp_z_max, float(clamp_p[2]))
@@ -2252,7 +2373,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             data.ctrl[arm.grip_act] = grip_cmd(clamp_grip)
             seat_rod(seat_x0)
             float_arm()
-            mujoco.mj_step(model, data)
+            step_sim()
             clamp_p = shaft()
             clamp_z_min = min(clamp_z_min, float(clamp_p[2]))
             clamp_z_max = max(clamp_z_max, float(clamp_p[2]))
@@ -2288,7 +2409,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             data.ctrl[arm.grip_act] = grip_cmd(clamp_grip)
             seat_rod(seat_x0)
             float_arm()
-            mujoco.mj_step(model, data)
+            step_sim()
             clamp_p = shaft()
             clamp_z_min = min(clamp_z_min, float(clamp_p[2]))
             clamp_z_max = max(clamp_z_max, float(clamp_p[2]))
@@ -2365,7 +2486,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                            - cr2 * float(data.qvel[sv + 2])))
                 data.ctrl[jaw_act] = SM.CHUCK_CLAMP_CTRL
                 data.ctrl[arm.grip_act] = grip_cmd(clamp_grip)
-                mujoco.mj_step(model, data)
+                step_sim()
                 _z = float(shaft()[2])
                 clamp_z_min = min(clamp_z_min, _z)
                 clamp_z_max = max(clamp_z_max, _z)
@@ -2383,7 +2504,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             s = t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
             data.ctrl[jaw_act] = SM.CHUCK_CLAMP_CTRL
             grip_direct(clamp_grip + s * (GRIP_OPEN - clamp_grip))
-            mujoco.mj_step(model, data)
+            step_sim()
             _z = float(shaft()[2])
             clamp_z_min = min(clamp_z_min, _z)
             clamp_z_max = max(clamp_z_max, _z)
@@ -2494,7 +2615,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     for i in range(700):
         data.ctrl[jaw_act] = SM.CHUCK_CLAMP_CTRL
         data.xfrc_applied[shaft_body, 0] = -20.0
-        mujoco.mj_step(model, data)
+        step_sim()
         if frame_hook is not None and i % (FRAME_EVERY * 2) == 0:
             tick()
     pull = abs(shaft()[0] - x0) * 1000
@@ -2653,7 +2774,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     print("OK")
 
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "case_id": state["case_id"],
         "random_seed": state["random_seed"],
         "created_at_unix": time.time(),
@@ -2666,10 +2787,12 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 os.path.dirname(os.path.abspath(__file__))),
             capture_output=True, text=True, check=False).stdout.strip(),
         "config": state["config"],
+        "execution_status": "completed",
         "metrics": {
             "coax_mm": final_coax, "tilt_deg": final_tilt,
             "contacts": contacts, "slip_mm": slip, "pull_mm": pull,
             "jaw_force_N": force, "grasp_tilt_deg": grasp_tilt,
+            "grasp_contact_count": state.get("grasp_contact_count", 0),
             "clamp_swing_mm": swing, "stock_ecc_mm": stock,
             "rod_external_force_max_N": state.get("rod_force_max", 0.0),
             "robot_machine_contact_max": state.get(
@@ -2689,13 +2812,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         "ik_residuals_mm": state.get("ik_residuals_mm", {}),
         "stages": state.get("stage_records", []),
     }
-    json_path = os.environ.get("FEED_RESULT_JSON")
-    if json_path:
-        path = os.path.abspath(json_path)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as stream:
-            json.dump(result, stream, ensure_ascii=False, indent=2)
-        print("FEED_RESULT_JSON %s" % path)
+    write_result_json(result)
     return 0 if ok else 1
 
 

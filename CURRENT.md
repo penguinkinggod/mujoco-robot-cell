@@ -1,7 +1,7 @@
 # 现在在做什么
 
 给下一个接手的人或 agent 看的现场记录。只写"此刻"的状态，不写历史；换手前改这里，不要另开日志。
-最后更新：2026-11-07（P3 退出段诊断完成）
+最后更新：2026-11-07（P1.2 状态转换验收完成）
 
 ## 先读：抓取回归已修复，P0 已完成
 
@@ -9,11 +9,11 @@
 
 已修复的首要差异：抓取目标恢复为仿真静置后的实际 `home`，包含 `--lift` 后的抬升高度；全物理 V 槽路径若抓取接触数为 0，则在 `grasp` 阶段 `FEED_ABORT`，不会继续搬运或闭合卡盘。官方兼容场景仍保留历史托力，并作为独立对照。P0.2、P0.3、P0.4 现已完成。
 
-**统一任务入口：[项目任务总账](docs/project-taskbook.md)**。它记录最终成果、分工、P0-P10 小任务、验收和决定。P1.1 指标字典已写入 [docs/metric-dictionary.md](docs/metric-dictionary.md)。P0.4 基准身份记录见 [docs/baseline-identity-2026-11-07.md](docs/baseline-identity-2026-11-07.md)，P3 退出段诊断见 [docs/exit-diagnostics-2026-11-07.md](docs/exit-diagnostics-2026-11-07.md)。下一步做 P1.2 状态转换验收。旧 T 清单是实现参考，不是允许一次做完所有步骤的授权。
+**统一任务入口：[项目任务总账](docs/project-taskbook.md)**。它记录最终成果、分工、P0-P10 小任务、验收和决定。P1.1 指标字典见 [docs/metric-dictionary.md](docs/metric-dictionary.md)。P0.4 基准身份记录见 [docs/baseline-identity-2026-11-07.md](docs/baseline-identity-2026-11-07.md)，P3 退出段诊断见 [docs/exit-diagnostics-2026-11-07.md](docs/exit-diagnostics-2026-11-07.md)，P1.2 状态转换验收见 [docs/p1.2-state-transitions-2026-11-07.md](docs/p1.2-state-transitions-2026-11-07.md)。旧 T 清单是实现参考，不是允许一次做完所有步骤的授权。
 
-P0.1 审计结论见 [docs/audit-current-diff-2026-11-07.md](docs/audit-current-diff-2026-11-07.md)。P0.2 与 P0.3 基础回归证据：`verify_all.py` 为 **9/9**；`diag_feed_chuck.py --v-jaw --lift --no-lock` 为 `FEED_METRIC PASS`，同轴约 `0.64 mm`、倾角约 `0.2°`、交接位移约 `1.58 mm`、余量偏心约 `0.70/2.0 mm`、20 N 拉拔约 `0.00 mm`。负向 `dy=+50 mm` 在抓取阶段终止，未进入三爪闭合。P0.3 四档复验、8 mm 画面核验和 P0.4 基准身份记录已完成；P1.1 文档已完成。P3 退出段三模式诊断见 [docs/exit-diagnostics-2026-11-07.md](docs/exit-diagnostics-2026-11-07.md)。
+P0.1 审计结论见 [docs/audit-current-diff-2026-11-07.md](docs/audit-current-diff-2026-11-07.md)。P0.2/P0.3 基础回归证据：`verify_all.py` 为 **9/9**；`diag_feed_chuck.py --v-jaw --lift --no-lock` 为 `FEED_METRIC PASS`，同轴约 `0.64 mm`、倾角约 `0.2°`、交接位移约 `1.58 mm`、余量偏心约 `0.70/2.0 mm`、20 N 拉拔约 `0.00 mm`。负向 `dy=+50 mm` 在抓取阶段终止，未进入三爪闭合。P0.3 四档复验、8 mm 画面核验、P0.4 基准身份、P1.1 指标字典和 P3 退出段三模式诊断均已完成。P1.2 状态转换验收已完成：正常/质量 FAIL/抓空 ABORT/两种诊断模式/两种运行时 NaN 注入均有 JSON 证据；扫描器 error 与缺失 JSON 均标为 ERROR，完整回归 **9/9**。下一步做 P1.3 失败标签与有效性分层。
 
-**尚未验收的实现：** 姿态扰动入口、全过程接触/阶段日志及扫描器错误处理还不能作为正式批量扰动实验工具。它们目前用于本轮受限的四档扫描与退出段诊断，后续按 P1/P2 分卡验收。证据与配置见 [docs/insert-sweep-2026-11-07.md](docs/insert-sweep-2026-11-07.md)、[docs/baseline-identity-2026-11-07.md](docs/baseline-identity-2026-11-07.md) 和 [docs/exit-diagnostics-2026-11-07.md](docs/exit-diagnostics-2026-11-07.md)。当前计划本地 checkpoint；不 push，直到完成可公开展示的项目成果。
+**尚未验收的实现：** 姿态扰动入口和全过程实验数据仍不能作为正式批量扰动实验工具；P1.3/P1.4 和 P2 仍未完成。本次扫描器只验收状态映射与旧结果清理，不代表通用批量扰动流程已完成。证据与配置见 [docs/insert-sweep-2026-11-07.md](docs/insert-sweep-2026-11-07.md)、[docs/baseline-identity-2026-11-07.md](docs/baseline-identity-2026-11-07.md)、[docs/exit-diagnostics-2026-11-07.md](docs/exit-diagnostics-2026-11-07.md) 和 [docs/p1.2-state-transitions-2026-11-07.md](docs/p1.2-state-transitions-2026-11-07.md)。当前仅本地 checkpoint；不 push，直到完成可公开展示的项目成果。
 
 **要拿去问别人/别的 AI**：直接用 [docs/handoff-brief.md](docs/handoff-brief.md)，
 那份是自包含的，不需要读代码，末尾有 6 个待判断的问题。
@@ -35,7 +35,7 @@ P0.1 审计结论见 [docs/audit-current-diff-2026-11-07.md](docs/audit-current-
 - 新增 `src/diag_feed_insert_sweep.py`，运行 `python src/diag_feed_insert_sweep.py` 可扫描完整机械臂送料流程并写入 `_build/feed_insert_sweep.csv`。它只改变插入深度，其他 `FEED_*` 环境覆盖会清除。
 - 当前恢复后的四档复验：7.75 mm FAIL（余量偏心 2.19 mm），8 mm FAIL（2.28 mm），10 mm PASS（0.92 mm），25 mm PASS（0.70 mm）。
 - 本次固定初态四档中，最浅 PASS 是 **10 mm**；它不是生产标准或任意尺寸通用值。旧记录中的“8 mm PASS”属于另一轮代码/结果，已被本次复验覆盖。
-- 7.75/8 mm 首次超过 2.0 mm 余量偏心发生在轴向退出之后；进给完成、三爪夹紧、原地松爪仍未超线。8 mm 画面未见明显挤飞或穿模，但数值仍 FAIL。P3 对照显示：正常两段退出是 8 mm 三种模式中最不坏的路径，但唯一根因仍未证明。下一步做 P1.2 状态转换验收。
+- 7.75/8 mm 首次超过 2.0 mm 余量偏心发生在轴向退出之后；进给完成、三爪夹紧、原地松爪仍未超线。8 mm 画面未见明显挤飞或穿模，但数值仍 FAIL。P3 对照显示：正常两段退出是 8 mm 三种模式中最不坏的路径，但唯一根因仍未证明。P1.2 状态转换验收完成；下一步做 P1.3 失败标签与有效性分层。
 
 ## 状态：阶段 B 第三轮已落地为新默认
 

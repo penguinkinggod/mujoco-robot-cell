@@ -22,13 +22,16 @@ DEFAULT_INSERTS_MM = (5, 6, 7, 8, 9, 10, 15, 20, 25, 30)
 def run_case(insert_mm, json_path, case_id=None, dy_mm=0.0, dz_mm=0.0,
              roll_deg=0.0, random_seed=None):
     case_id = case_id or uuid.uuid4().hex[:12]
+    json_path = Path(json_path)
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_path.unlink(missing_ok=True)
     env = os.environ.copy()
     for key in tuple(env):
         if key.startswith("FEED_"):
             env.pop(key)
     env["FEED_INSERT_MM"] = format(insert_mm, "g")
     env["FEED_CASE_ID"] = case_id
-    env["FEED_RESULT_JSON"] = str(Path(json_path).resolve())
+    env["FEED_RESULT_JSON"] = str(json_path.resolve())
 
     completed = subprocess.run(
         [sys.executable, str(FEED_SCRIPT), "--v-jaw", "--lift", "--no-lock",
@@ -53,6 +56,9 @@ def run_case(insert_mm, json_path, case_id=None, dy_mm=0.0, dz_mm=0.0,
         "dz_mm": dz_mm,
         "roll_deg": roll_deg,
         "status": "ERROR",
+        "execution_status": "",
+        "diagnostic_mode": "",
+        "abort_stage": "",
         "hard_pass": "",
         "quality_pass": "",
         "hard_failures": "",
@@ -61,6 +67,7 @@ def run_case(insert_mm, json_path, case_id=None, dy_mm=0.0, dz_mm=0.0,
         "coax_mm": "",
         "tilt_deg": "",
         "contacts": "",
+        "grasp_contact_count": "",
         "slip_mm": "",
         "pull_mm": "",
         "jaw_force_N": "",
@@ -81,9 +88,25 @@ def run_case(insert_mm, json_path, case_id=None, dy_mm=0.0, dz_mm=0.0,
     except (OSError, json.JSONDecodeError):
         result = None
     if result:
+        execution_status = result.get("execution_status", "completed")
+        if execution_status == "error":
+            row.update({
+                "execution_status": execution_status,
+                "diagnostic_mode": result.get("config", {}).get(
+                    "diagnostic_mode", ""),
+                "abort_stage": result.get("abort_stage", ""),
+                "error": result.get("abort_reason", "simulation_error"),
+            })
+            return row
         metrics = result["metrics"]
         row.update({
-            "status": "PASS" if result["overall_pass"] else "FAIL",
+            "status": (
+                "ABORT" if execution_status == "aborted"
+                else "PASS" if result["overall_pass"] else "FAIL"),
+            "execution_status": execution_status,
+            "diagnostic_mode": result.get("config", {}).get(
+                "diagnostic_mode", ""),
+            "abort_stage": result.get("abort_stage", ""),
             "hard_pass": result["hard_pass"],
             "quality_pass": result["quality_pass"],
             "hard_failures": ";".join(result["hard_failures"]),
@@ -91,6 +114,7 @@ def run_case(insert_mm, json_path, case_id=None, dy_mm=0.0, dz_mm=0.0,
             "coax_mm": metrics["coax_mm"],
             "tilt_deg": metrics["tilt_deg"],
             "contacts": metrics["contacts"],
+            "grasp_contact_count": metrics.get("grasp_contact_count", ""),
             "slip_mm": metrics["slip_mm"],
             "pull_mm": metrics["pull_mm"],
             "jaw_force_N": metrics["jaw_force_N"],
