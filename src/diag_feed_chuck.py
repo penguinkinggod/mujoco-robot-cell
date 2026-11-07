@@ -488,6 +488,103 @@ def _lift_workpiece(spec):
     print("    cradle: rod lifted %.0f mm, V under both ends" % (LIFT_DZ * 1000))
 
 
+# ---- 实体托料导套（2026-11-07，CURRENT.md「下一步」唯一一条）----
+# 真机长棒料送料会在卡爪口外装导套/中心架，55 mm 悬空段才有【不可撤销】
+# 的径向约束。之前 SEAT_RADIAL_K 只是「力等效」支撑，夹紧后必须撤销：
+# 一步撤销弹飞 10.27 mm / 13.3 deg，quintic 渐变卸载也只压到 2.38 mm，
+# 撤完仍跷 2.2 deg。这里改成常驻实体几何，从对轴一路带到拉拔测试。
+# 2026-11-07 第二轮定案：单独加实体导套是【阴性】——软导套被三爪
+# 挤穿（顶回 9~17 N），硬导套又与三爪抢料（7.24 mm / 8.6 deg FAIL）。
+# 只有配合「先松夹爪 + 径向托力渐变卸载」才成立：导套在夹爪松开到
+# 三爪咬合之间顶住料，咬合后自己卸载（解锁静置导套=0/0.0N，拉拔
+# 不是假通过）。实测交接位移 4.77->1.05 mm、首次接触推挤 4.20->0.53。
+# 这一组已设为默认，见 CURRENT.md；关掉用 FEED_BUSHING=0。
+BUSHING = os.environ.get("FEED_BUSHING", "1") == "1"
+BUSHING_GAP = float(os.environ.get("FEED_BUSHING_GAP", "0.2")) / 1000.0
+BUSHING_FRONT = float(os.environ.get("FEED_BUSHING_FRONT", "6")) / 1000.0
+BUSHING_LEN = float(os.environ.get("FEED_BUSHING_LEN", "14")) / 1000.0
+BUSHING_N = int(os.environ.get("FEED_BUSHING_N", "12"))
+BUSHING_MODE = os.environ.get("FEED_BUSHING_MODE", "full")  # full / lower
+BUSHING_MU = float(os.environ.get("FEED_BUSHING_MU", "0.05"))
+BUSHING_WALL = 0.004
+# 中心架初始张开量（径向）。搬运路径横穿卡爪口外，闭合的常驻环会被
+# 棒料撞上；真机中心架送料时本来就是张开的，到位才合上。
+BUSHING_OPEN = float(os.environ.get("FEED_BUSHING_OPEN", "40")) / 1000.0
+# 1 = 硬接触（短 solref + 陡 solimp）。默认开：软接触只顶回 9~17 N、
+# 被三爪挤穿；硬接触才顶得住交接瞬间的悬空段。单独用（不先松爪）会
+# 与三爪抢料变 7.24 mm / 8.6 deg，所以必须与 HANDOVER_FIRST 同开。
+BUSHING_STIFF = os.environ.get("FEED_BUSHING_STIFF", "1") == "1"
+BUSHING_CLOSED = {}   # geom name -> 闭合位 pos，供 close_bushing() 用
+
+
+def _install_bushing(spec):
+    """卡爪口外装一段常驻导套，给悬空段真实径向约束。
+
+    MuJoCo 没有空心圆柱 primitive，用 N 块切向 box 拼多边形环，内切圆
+    半径 = 棒料半径 + 单边间隙。
+    掩码刻意用 (contype=0, conaffinity=2) 而不是卡爪的 CT_FIXTURE(4,2)：
+    工件是 (2,3)，(2 & 2) 相碰；机器人本体 (8,12)、指垫 (1,3)、
+    机床 (8,1) 的 contype 都不含 bit1，一概不碰。第一次试 CT_FIXTURE
+    时 4 & 12 = 4，机械臂搬运途中撞上导套，IK 残差 27.7 mm、料直接
+    掉到桌面（夹紧前同轴 55.8 mm / 倾斜 56 deg）。
+
+    但即使换成 (0,2)，常驻环仍然横在搬运路径上：棒料抬升/横移途中撞到
+    导套外壁，夹紧前同轴 51.4 mm、倾斜 74.7 deg；扫 5 档轴向位置全 FAIL。
+    零碰撞对照能逐位复现基线，确证是碰撞而非几何本身。真机中心架也是
+    送料时张开、棒料到位后合上，所以 12 块几何构建期就带 (0,2) 掩码，
+    初始沿径向张开 40 mm（不碰棒料），由 close_bushing() 在进给到位时
+    把 geom_pos 移回闭合位，之后一路不撤销。
+    坑：掩码不能运行时改 —— 编译期 (0,0) 的 geom 即使后来把
+    model.geom_conaffinity 写成 2，mj_step 也不产生接触（探针 ncon=0）；
+    而构建期就是 (0,2) 时同样摆位立刻 ncon=12。位置是每步从
+    model.geom_pos 重算的，所以改用移动几何来「合上」。
+    """
+    BUSHING_CLOSED.clear()
+    lx, ly, lz = LATHE_ORIGIN
+    r_in = F.SHAFT_D / 2 + BUSHING_GAP
+    r_out = r_in + BUSHING_WALL
+    r_mid = (r_in + r_out) / 2
+    x_front = lx - SM.JAW_LEN - BUSHING_FRONT
+    xc = x_front - BUSHING_LEN / 2
+    # 切向半宽按内切多边形算，+2% 让相邻块在角上重叠、不留缝。
+    half_tan = r_in * np.tan(np.pi / BUSHING_N) * 1.02
+    n = 0
+    for k in range(BUSHING_N):
+        ang = 2.0 * np.pi * (k + 0.5) / BUSHING_N
+        cy, cz = np.cos(ang), np.sin(ang)
+        if BUSHING_MODE == "lower" and cz > 0.0:
+            continue
+        # local x -> world x(轴向), local z -> 径向, local y -> 切向
+        R = np.array([[1.0, 0.0, 0.0],
+                      [0.0, np.sin(ang), cy],
+                      [0.0, -cy, cz]])
+        g = spec.worldbody.add_geom()
+        g.name = "bushing_%02d" % k
+        g.type = mujoco.mjtGeom.mjGEOM_BOX
+        g.size = [BUSHING_LEN / 2, half_tan, BUSHING_WALL / 2]
+        closed = np.array([xc, ly + r_mid * cy, lz + r_mid * cz])
+        BUSHING_CLOSED[g.name] = closed
+        g.pos = closed + BUSHING_OPEN * np.array([0.0, cy, cz])
+        q = np.zeros(4)
+        mujoco.mju_mat2Quat(q, np.ascontiguousarray(R).reshape(-1))
+        g.quat = q
+        g.rgba = [0.30, 0.42, 0.52, 0.95]
+        g.friction = [BUSHING_MU, BUSHING_MU * 0.1, 0.0001]
+        # BUSHING_STIFF=1 时把接触做硬（默认 MuJoCo 接触对 0.197 kg
+        # 的料偏软，只顶回 9~17 N）。但硬顶会与三爪抢料：实测导套
+        # 顶到 60 N、峰值 250 N，反而把料别到 7.24 mm / 8.6 deg。
+        if BUSHING_STIFF:
+            g.solref = [0.001, 1.0]
+            g.solimp = [0.95, 0.999, 0.0001, 0.5, 100.0]
+        g.contype, g.conaffinity = (0, 2)   # 只接工件；张开靠位置
+        n += 1
+    print("    bushing: %s R_in=%.2f gap=%.2f mm "
+          "x=[%.0f,%.0f] mm from jaw_front  %d segs"
+          % (BUSHING_MODE, r_in * 1000, BUSHING_GAP * 1000,
+             -(BUSHING_FRONT + BUSHING_LEN) * 1000,
+             -BUSHING_FRONT * 1000, n))
+
+
 def build_model(grip_fix=None, v_jaw=False, lift=False, arc_jaw=False,
                 machine_solid=True, official_world=False):
     """Feed scene: no vise, no slot platform, PLAIN cylinder workpiece.
@@ -507,6 +604,11 @@ def build_model(grip_fix=None, v_jaw=False, lift=False, arc_jaw=False,
                          arm_kv=FEED_ARM_KV)
     if lift:
         _lift_workpiece(spec)
+    # 官方 env 场景是另一套世界（自有 timestep / 相机 / 几何），导套按
+    # 主场景 LATHE_ORIGIN 标定，放进去会把料别歪（实测 3.20 mm / 7.2 deg、
+    # 余量 8.17 FAIL）。它保持旧交接顺序，作为独立对照。
+    if BUSHING and not official_world:
+        _install_bushing(spec)
     if arc_jaw:
         import arc_jaws
         arc_jaws.install(spec)
@@ -552,13 +654,16 @@ _FLOAT = [CLAMP_FLOAT_GAIN]
 # 正是肉眼看到的「下沉又回来一点」）。解锁前必须撤销，否则下沉指标假通过。
 CLAMP_LIFT = os.environ.get("FEED_CLAMP_LIFT", "1") == "1"
 
-# ---- 2026-11-07 文献/论坛对照：交接顺序（默认关闭，验证后再换默认值）----
+# ---- 2026-11-07 文献/论坛对照：交接顺序（第二轮已设为默认）----
 # 机械社区论坛原话：「机器人送入，然后卡盘夹紧，然后机器人再松开。造成
 # 两者交替时，有一个两者都夹紧的状态，较劲」。FANUC 软浮动专利
 # DE69837741T2 与 CNC 上下料手册都要求：卡爪闭合【之前】先让夹爪松开，
 # 但松开的料必须靠端面挡块/弹簧推料器顶住，否则会掉。
 # 1 = 先松夹爪（手臂原地、soft floating）-> 端面轴向定位 -> 卡爪闭合。
-HANDOVER_FIRST = os.environ.get("FEED_HANDOVER_FIRST", "0") == "1"
+# 上一轮单独用会 FAIL（撤支撑后跷 2.2 deg）；配上实体硬导套后 PASS，
+# 且「夹爪先松」时同轴 0.00 mm、不下沉，三爪首次接触不再把料怼偏。
+# 关掉用 FEED_HANDOVER_FIRST=0（但那样也要一并关导套，否则会抢料）。
+HANDOVER_FIRST = os.environ.get("FEED_HANDOVER_FIRST", "1") == "1"
 # 轴向弹性定位（等效端面挡块 + 弹簧推料器），只在交接期生效，径向完全
 # 放开让三爪自由找正。棒料约 0.197 kg，k=300 N/m 时临界阻尼约 15 N·s/m。
 SEAT_K = float(os.environ.get("FEED_SEAT_K", "300"))
@@ -566,14 +671,18 @@ SEAT_C = float(os.environ.get("FEED_SEAT_C", "12"))
 SEAT_DWELL = int(os.environ.get("FEED_SEAT_DWELL", "200"))
 # 径向约束：等效真机导套/中心架/托料架。必须软（留出三爪找正的自由
 # 度），只用来防止夹爪张开瞬间把料弹走。0 = 不约束（实测必 FAIL）。
-SEAT_RADIAL_K = float(os.environ.get("FEED_SEAT_RADIAL_K", "0"))
+# 与实体硬导套叠加后定案 5000：它在交接期托住悬空段，实体导套负责
+# 松爪瞬间的几何限位，两者缺一都会把料带偏。
+SEAT_RADIAL_K = float(os.environ.get("FEED_SEAT_RADIAL_K", "5000"))
 # 0 = 按临界阻尼自动取 1.4*sqrt(k*m)，避免为每档刚度再调阻尼。
 SEAT_RADIAL_C = float(os.environ.get("FEED_SEAT_RADIAL_C", "0"))
 # 夹紧完成后径向支撑的渐变卸载步数。0 = 一步清零（旧行为）。
 # 上一轮实测：k=5000 时夹紧瞬态只有 z −0.42 mm（默认 +2.81），但一步
 # 撤销会把弹簧储能瞬间释放，把料弹飞到 10.27 mm / 13.3 deg。按 quintic
 # 把刚度和阻尼一起降到 0，让三爪逐步接手全部径向载荷。
-SEAT_FADE_STEPS = int(os.environ.get("FEED_SEAT_FADE", "0"))
+# 400 步 + 实体硬导套是定案组合；fade 段日志里的「卸载托力」指撤销
+# 这层【力等效托力】，不是撤掉常驻的实体导套几何（那个从不撤销）。
+SEAT_FADE_STEPS = int(os.environ.get("FEED_SEAT_FADE", "400"))
 
 # ---- 文献 C：低压预夹 -> 端面顶正 -> 高压终夹（默认关闭）----
 # 与已否掉的 CLAMP_TWOSTAGE 不同：那是把一段位移斜坡拆慢；这里中间真的
@@ -668,6 +777,34 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, i) or "")
         .startswith("shaft_")
     ]
+    bushing_ids = [
+        i for i in range(model.ngeom)
+        if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, i) or "")
+        .startswith("bushing_")
+    ]
+    # 定案交接（实体导套 + 先松爪 + 渐变卸载）只给「真实交接的全物理
+    # V 槽路径」。历史基线 / 官方 env 场景是独立对照，保持旧行为。
+    tuned = bool(bushing_ids) and v_jaw and lift and not carry_lock
+
+    def close_bushing():
+        """中心架在棒料送到位后闭合，之后一路不再打开。
+
+        与「夹紧后要撤销的力等效支撑」不同：合上就是实体接触，交接、
+        松爪、退出、解锁静置、拉拔全程都在，只是不参与搬运路径。
+        model.geom_pos 每步被 mj_kinematics 重算，所以移动几何有效；
+        掩码则不行（见 _install_bushing 的注释）。
+        """
+        if not bushing_ids or not BUSHING_CLOSED:
+            return
+        for i in bushing_ids:
+            name = (mujoco.mj_id2name(
+                model, mujoco.mjtObj.mjOBJ_GEOM, i) or "")
+            if name in BUSHING_CLOSED:
+                model.geom_pos[i][:] = BUSHING_CLOSED[name]
+        mujoco.mj_forward(model, data)
+        print("  导套闭合    %d 块 间隙 %.2f mm 同轴=%.2f mm 接触=%d"
+              % (len(bushing_ids), BUSHING_GAP * 1000, coax(),
+                 sleeve_state()[0]))
 
     # 穿透记录。接触点的 dist < 0 就是几何互相插进去多少 —— 这是判
     # 「有没有穿模」唯一可信的数字，肉眼在窗口里看到的深浅取决于机位。
@@ -744,6 +881,25 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             mujoco.mj_contactForce(model, data, i, f6)
             force += abs(f6[0])
         return contacts, force
+
+    def sleeve_state():
+        """实体导套与棒料的接触数/法向力：径向约束是否真的在受力。"""
+        n, f = 0, 0.0
+        for i in range(data.ncon):
+            c = data.contact[i]
+            if not any(g in (c.geom1, c.geom2) for g in shaft_geoms):
+                continue
+            n1 = mujoco.mj_id2name(
+                model, mujoco.mjtObj.mjOBJ_GEOM, c.geom1) or ""
+            n2 = mujoco.mj_id2name(
+                model, mujoco.mjtObj.mjOBJ_GEOM, c.geom2) or ""
+            if "bushing_" not in (n1 + "|" + n2):
+                continue
+            n += 1
+            f6 = np.zeros(6)
+            mujoco.mj_contactForce(model, data, i, f6)
+            f += abs(f6[0])
+        return n, f
 
     def grip_state():
         """V-blade contacts on the rod and their total normal force."""
@@ -1194,7 +1350,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         只约束轴向 (x)，径向 y/z 完全放开，让三爪能自由找正。
         qfrc_applied 是持久量，交接结束必须显式清零。
         """
-        if not HANDOVER_FIRST:
+        if not tuned or not HANDOVER_FIRST:
             return
         p = shaft()
         # 轴向：端面挡块 + 弹簧推料器。
@@ -1540,6 +1696,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         #   4) 夹完恢复刚性，再松爪退出
         # 已否掉、别再重试：预收托圈、换卡爪相位、抬夹紧力、两段闭合、
         # 夹爪半开。详见 CURRENT.md。
+        if tuned:
+            close_bushing()
         print("  夹紧前      轴=%s 同轴=%5.2f mm 轴向偏=%4.1f deg"
               % (np.round(shaft(), 4), coax(), axdev()))
         # qfrc_applied 是持久量，设一次持续到解锁前撤销。
@@ -1573,7 +1731,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         clamp_z_max = clamp_p0[2]
         jaw_from = SM.CHUCK_OPEN_CTRL
         clamp_grip = grip_close
-        if HANDOVER_FIRST:
+        if tuned and HANDOVER_FIRST:
             # 文献顺序：卡爪闭合【之前】先松开夹爪，手臂原地不动并保持
             # soft floating；料由竖直托力 + 轴向端面弹簧定位托住，不会掉。
             # 三爪闭合时不存在「两边都夹紧」的较劲期。
@@ -1706,8 +1864,10 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             track_pen("三爪稳定")
         clamp_p = shaft()
         nc, fN = jaw_state()
-        print("  三爪咬合     轴=%s 同轴=%5.2f mm 接触=%d 力=%.1f N"
-              % (np.round(shaft(), 4), coax(), nc, fN))
+        bn, bf = sleeve_state()
+        print("  三爪咬合     轴=%s 同轴=%5.2f mm 接触=%d 力=%.1f N "
+              "导套=%d/%.1fN"
+              % (np.round(shaft(), 4), coax(), nc, fN, bn, bf))
         if BORE_PROBE:
             _jq = [float(data.qpos[model.jnt_qposadr[
                 gid(mujoco.mjtObj.mjOBJ_JOINT, "jaw_slide_%d" % _k)]])
@@ -1739,7 +1899,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         data.qfrc_applied[sv + 2] = (
             float(model.body_mass[shaft_body]
                   * abs(model.opt.gravity[2])) if CLAMP_LIFT else 0.0)
-        if HANDOVER_FIRST and SEAT_RADIAL_K > 0 and SEAT_FADE_STEPS > 0:
+        if tuned and HANDOVER_FIRST and SEAT_RADIAL_K > 0 and SEAT_FADE_STEPS > 0:
             # 径向支撑不一步清零：按 quintic 把刚度+阻尼同步降到 0，让
             # 三爪在几百步里逐步接手全部径向载荷，弹簧储能不瞬间释放。
             mg2 = float(model.body_mass[shaft_body]
@@ -1766,9 +1926,9 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 clamp_z_max = max(clamp_z_max, _z)
                 state.setdefault("traj", []).append(
                     data.site_xpos[arm.site].copy())
-                state.setdefault("traj_label", []).append("撤销导套")
+                state.setdefault("traj_label", []).append("卸载托力")
                 state.setdefault("traj_t", []).append(float(data.time))
-            print("  撤销导套    %d 步渐变 同轴=%5.2f mm 接触=%d"
+            print("  卸载托力    %d 步渐变 同轴=%5.2f mm 接触=%d"
                   % (SEAT_FADE_STEPS, coax(), jaw_state()[0]))
         # 三爪夹住之后，机械臂先【原地】松开夹爪，等 V 槽刀片完全脱离，
         # 再移走。边松边退会让还没脱离的刀片横向刮着棒料，把工件从卡爪
@@ -1819,8 +1979,10 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     data.qfrc_applied[sv + 2] = 0.0
     state["lock_active"] = False
     settle(1600, SM.CHUCK_CLAMP_CTRL, GRIP_OPEN)
-    print("  解锁静置     轴=%s 同轴=%5.2f mm 轴向偏=%5.1f deg 接触=%d"
-          % (np.round(shaft(), 4), coax(), axdev(), jaw_state()[0]))
+    bn, bf = sleeve_state()
+    print("  解锁静置     轴=%s 同轴=%5.2f mm 轴向偏=%5.1f deg 接触=%d "
+          "导套=%d/%.1fN"
+          % (np.round(shaft(), 4), coax(), axdev(), jaw_state()[0], bn, bf))
     tick("⑪ 解锁｜交还真实物理")
 
     # The full-physics path has already released and retreated in one move.
