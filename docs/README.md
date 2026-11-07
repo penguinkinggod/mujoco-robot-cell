@@ -14,6 +14,8 @@
 | 想知道为什么“算对了还会错” | [06-why-numerically-exact-still-fails.md](learn/06-why-numerically-exact-still-fails.md) |
 | 想按顺序学基础 | [01](learn/01-what-is-simulator.md) → [02](learn/02-control-and-steady-state-error.md) → [03](learn/03-kinematics-and-jacobian.md) → [04](learn/04-embodied-data.md) → [05](learn/05-grasp-pipeline.md) |
 | 想看当前车床工位 | [项目定位](project-position.md) → [项目计划](project-plan.md) |
+| 想看现在正在改什么、下一步做什么 | [现场记录](../CURRENT.md) |
+| 想看项目已经跨过哪些阶段 | [项目里程碑](milestones.md) |
 | 想看代码和脚本放哪 | [代码地图](code-map.md) |
 | 想看 Git、GitHub、commit 怎么用 | [版本与提交](git-and-commits.md) |
 | 想查实验数据 | [工位资料索引](station/README.md) |
