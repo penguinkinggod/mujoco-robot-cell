@@ -161,11 +161,21 @@ def check_feed_physics(out, err, rc):
     contacts = int(m.group(3))
     slip, pull = float(m.group(4)), float(m.group(5))
     force, unlocked = float(m.group(6)), int(m.group(8))
+    # 交接全程可见位移（夹紧+松爪+退出）。slip_mm 只测解锁后静置，
+    # 覆盖不到人眼看到的「下沉—回升」，必须单独守住，否则又会退化到
+    # 「指标 0.02 mm、画面明显在动」。
+    sw = re.search(r"FEED_METRIC_HANDOVER clamp_swing_mm=([\d.]+) "
+                   r"limit=([\d.]+)", out)
+    swing = float(sw.group(1)) if sw else None
+    swing_limit = float(sw.group(2)) if sw else 6.0
     good = (rc == 0 and "FEED_METRIC PASS" in out and unlocked == 1
             and coax <= 2.0 and tilt <= 10.0 and contacts >= 6
-            and slip <= 2.0 and pull <= 2.0)
-    return good, "无锁同轴%.2fmm 倾斜%.1f° 接触%d 拉%.2fmm 力%.1fN" % (
-        coax, tilt, contacts, pull, force)
+            and slip <= 2.0 and pull <= 2.0
+            and swing is not None and swing <= swing_limit)
+    return good, ("无锁同轴%.2fmm 倾斜%.1f° 接触%d 拉%.2fmm 力%.1fN "
+                  "交接位移%s" % (
+                      coax, tilt, contacts, pull, force,
+                      "%.2fmm" % swing if swing is not None else "缺失"))
 
 
 def check_env_cell(out, err, rc):

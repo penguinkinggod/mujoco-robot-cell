@@ -97,6 +97,9 @@ TILT_LIMIT = 10.0      # deg
 CONTACT_MIN = 6
 SLIP_LIMIT = 2.0       # mm
 PULL_LIMIT = 2.0       # mm
+# 交接全程（夹紧+松爪+退出）棒料 z 的峰谷。slip_mm 只测解锁后静置，
+# 覆盖不到人眼看到的那一下位移。6 mm 是「明显恶化」的护栏，不是目标值。
+CLAMP_SWING_LIMIT = 6.0   # mm
 
 # 0.20 was picked by an old x-scan that only checked POSITION. With the rod
 # axis held horizontal, a 5-DoF SO-101 cannot reach that part of the table:
@@ -514,6 +517,23 @@ FEED_ITERS = int(os.environ.get("FEED_ITERS", 3))   # 进给闭环修正轮数
 FEED_GAIN = float(os.environ.get("FEED_GAIN", 0.8))  # 闭环修正增益
 FEED_STEPS = int(os.environ.get("FEED_STEPS", 600))  # 进给每轮步数（1.2 s，慢到不激起工件摆动）
 MIN_FIX_STEPS = 150      # 闭环修正轮的最短时长（0.30 s）：再短伺服落不了地
+
+# ---- 交接参数（2026-11-07 实测定案，见 CURRENT.md）----
+# 逐帧跟踪发现：进给到位时料在轴线上（同轴 0.08 mm），但夹紧前停等
+# 100 步期间机械臂位置伺服还在补 2.6 mm 的 IK 残差，会把料慢慢带到
+# 2.55 mm。停等取消，进给结束立即交接。
+CLAMP_SETTLE = int(os.environ.get("FEED_CLAMP_SETTLE", "0"))
+# 夹紧期手臂柔顺：把 5 个关节的位置目标逐步拉向实际角，手臂不再刚性
+# 顶着料，三爪能带着料找正。纯浮动（gain=1）会让料掉 42 mm；0.01 是
+# 实测「让得动、又撑得住」的点。夹紧完成后恢复刚性，否则松爪/退出段
+# 手臂继续软塌，会把刚定心好的料又拖歪（实测退出后劣化到 5 deg）。
+# 用可变容器存，让嵌套的 float_arm() 能读到运行时改动。
+CLAMP_FLOAT_GAIN = float(os.environ.get("FEED_CLAMP_FLOAT", "0.01"))
+_FLOAT = [CLAMP_FLOAT_GAIN]
+# 交接期托住棒料：抵消自重，等效真机长棒料送料的导套/托料架。料只有
+# 25 mm 插在爪里、55 mm 悬空，夹爪一让位就会自由落体（实测掉 6~12 mm，
+# 正是肉眼看到的「下沉又回来一点」）。解锁前必须撤销，否则下沉指标假通过。
+CLAMP_LIFT = os.environ.get("FEED_CLAMP_LIFT", "1") == "1"
 
 # SMOOTH=1 走「一条连续轨迹」：抬升 -> 横移 -> 下降 -> 进给 合并成一次
 # Ruckig 规划，中途不减速、不停车。0 = 老的分段 rest-to-rest 路径。
@@ -1056,6 +1076,26 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                      worst * 1000))
         return float(np.linalg.norm(arm.pad_center() - np.asarray(targets[-1])))
 
+    def support_rod():
+        """交接期托住棒料：抵消自重，等效真机的导套/托料架。"""
+        if CLAMP_LIFT:
+            data.qfrc_applied[sv + 2] = float(
+                model.body_mass[shaft_body] * abs(model.opt.gravity[2]))
+
+    def float_arm():
+        """夹紧期把 5 个手臂关节的位置目标拉向当前实际角，让手臂变软。
+
+        位置伺服原本死死盯着进给终点的关节角；三爪想找正料时，夹爪还夹着
+        尾段，这个硬目标会把料顶偏。把目标跟着实际位置走，伺服就不再跟
+        卡盘较劲，只剩阻尼。gain=1 纯浮动，小 gain 保留部分支撑刚度。
+        夹爪自身 (arm.grip_act) 不参与浮动。
+        """
+        g = _FLOAT[0]
+        if g <= 0:
+            return
+        for a in arm.qadr:
+            data.ctrl[a] += g * (data.qpos[a] - data.ctrl[a])
+
     def grip_direct(value):
         """Write an explicitly planned per-step gripper trajectory and sync its cache."""
         value = float(value)
@@ -1080,10 +1120,12 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         state["grip_now"] = v
         return v
 
-    def settle(n, jaw_ctrl, grip, locked=False):
+    def settle(n, jaw_ctrl, grip, locked=False, floating=False):
         for i in range(n):
             data.ctrl[jaw_act] = jaw_ctrl
             data.ctrl[arm.grip_act] = grip_cmd(grip)
+            if floating:
+                float_arm()
             mujoco.mj_step(model, data)
             state.setdefault("traj", []).append(
                 data.site_xpos[arm.site].copy())
@@ -1344,34 +1386,43 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         #      轴向不重叠，两者不会抢同一段料）
         #   3) 再松夹爪 —— 此时卡爪已经咬住，工件掉不了
         # 反面教材：先松夹爪再夹紧，工件在 44 mm 内径里悬空，直接掉。
-        # 丝杠是「连续拧紧」的。换成力控以后，控制量从张开那 30 N 一步
-        # 跳到 -400 N，卡爪在单步内就得到上万 m/s^2（实测 QACC 溢出、
-        # 工件被弹到 1 m 外）。真机也是转丝杠慢慢加力的，这里用 0.6 s
-        # 斜坡从张开推力平滑拧到夹紧力。
-        # 进给刚结束时棒料仍有约 5 mm/s 的竖直速度。若立刻闭合三爪，
-        # 卡爪先在空气中追随下沉，随后接触又把棒料弹回；夹紧前停 0.2 s
-        # 让位置伺服和棒料先稳定。测量：闭爪阶段向下峰值 1.28 -> 0.08 mm。
-        settle(100, SM.CHUCK_OPEN_CTRL, grip_close)
+        # 交接（2026-11-07 实测定案）：
+        #   1) 进给到位立即夹紧 —— 停等 100 步会让 IK 残差把料带偏 2.55 mm
+        #   2) support_rod() 托住悬空段，等效真机导套/托料架
+        #   3) 三爪闭合期手臂柔顺，让卡盘能把料找正
+        #   4) 夹完恢复刚性，再松爪退出
+        # 已否掉、别再重试：预收托圈、换卡爪相位、抬夹紧力、两段闭合、
+        # 夹爪半开。详见 CURRENT.md。
+        print("  夹紧前      轴=%s 同轴=%5.2f mm 轴向偏=%4.1f deg"
+              % (np.round(shaft(), 4), coax(), axdev()))
+        # qfrc_applied 是持久量，设一次持续到解锁前撤销。
+        support_rod()
+        settle(CLAMP_SETTLE, SM.CHUCK_OPEN_CTRL, grip_close, floating=True)
         # Record the transient at the actual clamp hand-over. The final
         # gravity-slip metric below starts much later, after release/retreat
         # and settling, so it cannot expose the visible motion while the jaws
         # are centring the rod.
+        clamp_grip = grip_close
+        jaw_from = SM.CHUCK_OPEN_CTRL
         clamp_p0 = shaft().copy()
         clamp_z_min = clamp_p0[2]
         clamp_z_max = clamp_p0[2]
-        jaw_from = SM.CHUCK_OPEN_CTRL
+        # 单段连续斜坡：丝杠从张开位拧到夹紧力上限，0.6 s。
+        state["label"] = "三爪拧紧"
         for i in range(500):
             t = (i + 1) / 500.0
             s = t * t * (3.0 - 2.0 * t)
-            data.ctrl[jaw_act] = jaw_from + s * (SM.CHUCK_CLAMP_CTRL - jaw_from)
-            data.ctrl[arm.grip_act] = grip_cmd(grip_close)
+            data.ctrl[jaw_act] = (jaw_from
+                                  + s * (SM.CHUCK_CLAMP_CTRL - jaw_from))
+            data.ctrl[arm.grip_act] = grip_cmd(clamp_grip)
+            float_arm()
             mujoco.mj_step(model, data)
             clamp_p = shaft()
             clamp_z_min = min(clamp_z_min, float(clamp_p[2]))
             clamp_z_max = max(clamp_z_max, float(clamp_p[2]))
             state.setdefault("traj", []).append(
                 data.site_xpos[arm.site].copy())
-            state.setdefault("traj_label", []).append(state.get("label", "?"))
+            state.setdefault("traj_label", []).append("三爪拧紧")
             state.setdefault("traj_t", []).append(float(data.time))
             track_pen("三爪拧紧")
             if frame_hook is not None and i % FRAME_EVERY == 0:
@@ -1381,7 +1432,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         # the later gravity-slip measurement.
         for _ in range(300):
             data.ctrl[jaw_act] = SM.CHUCK_CLAMP_CTRL
-            data.ctrl[arm.grip_act] = grip_cmd(grip_close)
+            data.ctrl[arm.grip_act] = grip_cmd(clamp_grip)
+            float_arm()
             mujoco.mj_step(model, data)
             clamp_p = shaft()
             clamp_z_min = min(clamp_z_min, float(clamp_p[2]))
@@ -1402,6 +1454,12 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                  (clamp_z_max - clamp_p0[2]) * 1000,
                  (clamp_p[1] - clamp_p0[1]) * 1000,
                  (clamp_p[2] - clamp_p0[2]) * 1000))
+        # 交接全程的 z 峰谷 = 人眼看到的「下沉—回升」。slip_mm 只在解锁
+        # 静置后测，完全覆盖不到这一段，必须单列并纳入判据，否则又会
+        # 出现「指标 0.02 mm 但画面明显在动」。采样延伸到松爪/退出段。
+        # 夹紧完成：手臂恢复刚性，目标就钉在当前实际角（柔顺期间
+        # ctrl 已跟随 qpos，不会跳变）。松爪/退出不能再让位。
+        _FLOAT[0] = 0.0
         # 三爪夹住之后，机械臂先【原地】松开夹爪，等 V 槽刀片完全脱离，
         # 再移走。边松边退会让还没脱离的刀片横向刮着棒料，把工件从卡爪
         # 里带出去（实测同轴 1.6 mm -> 283 mm，工件直接被带飞）。
@@ -1409,8 +1467,11 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             t = (i + 1) / 360
             s = t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
             data.ctrl[jaw_act] = SM.CHUCK_CLAMP_CTRL
-            grip_direct(grip_close + s * (GRIP_OPEN - grip_close))
+            grip_direct(clamp_grip + s * (GRIP_OPEN - clamp_grip))
             mujoco.mj_step(model, data)
+            _z = float(shaft()[2])
+            clamp_z_min = min(clamp_z_min, _z)
+            clamp_z_max = max(clamp_z_max, _z)
             state.setdefault("traj", []).append(
                 data.site_xpos[arm.site].copy())
             state.setdefault("traj_label", []).append("原地松爪")
@@ -1420,6 +1481,9 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 tick()
         settle(120, SM.CHUCK_CLAMP_CTRL, GRIP_OPEN)
         release_p = shaft()
+        _z = float(release_p[2])
+        clamp_z_min = min(clamp_z_min, _z)
+        clamp_z_max = max(clamp_z_max, _z)
         print("  原地松爪     同轴=%5.2f mm 轴向偏=%4.1f deg 接触=%d "
               "相对夹紧终点 dz=%+.2f mm"
               % (coax(), axdev(), jaw_state()[0],
@@ -1427,6 +1491,11 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         rerr = move(pad_target(retreat), 700, GRIP_OPEN, False,
                     SM.CHUCK_CLAMP_CTRL)
         retreat_p = shaft()
+        _z = float(retreat_p[2])
+        clamp_z_min = min(clamp_z_min, _z)
+        clamp_z_max = max(clamp_z_max, _z)
+        state["clamp_swing_mm"] = (clamp_z_max - clamp_z_min) * 1000
+        print("  交接位移     z峰谷=%.2f mm" % state["clamp_swing_mm"])
         print("  松手退出     IK残差=%5.1f mm 同轴=%5.2f mm "
               "轴向偏=%4.1f deg 接触=%d 相对原地松爪 dz=%+.2f mm"
               % (rerr * 1000, coax(), axdev(), jaw_state()[0],
@@ -1434,6 +1503,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     tick("⑩ 三爪夹紧｜单丝杠联动")
 
     # Hand the shaft back to PHYSICS before any load test.
+    # 撤掉交接期的托力，否则重力下沉指标会被托成假通过。
+    data.qfrc_applied[sv + 2] = 0.0
     state["lock_active"] = False
     settle(1600, SM.CHUCK_CLAMP_CTRL, GRIP_OPEN)
     print("  解锁静置     轴=%s 同轴=%5.2f mm 轴向偏=%5.1f deg 接触=%d"
@@ -1563,9 +1634,12 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 print(line)
         print()
 
+    # 全物理交接才有 clamp_swing_mm；运动学锁基线不测这一项。
+    swing = state.get("clamp_swing_mm")
     ok = (final_coax <= COAX_LIMIT and final_tilt <= TILT_LIMIT
           and contacts >= CONTACT_MIN and slip <= SLIP_LIMIT
-          and pull <= PULL_LIMIT)
+          and pull <= PULL_LIMIT
+          and (swing is None or swing <= CLAMP_SWING_LIMIT))
     print("=" * 74)
     print("FEED_METRIC coax_mm=%.2f tilt_deg=%.1f contacts=%d "
           "slip_mm=%.2f pull_mm=%.2f jaw_force_N=%.1f "
@@ -1573,12 +1647,15 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
           % (final_coax, final_tilt, contacts, slip, pull, force,
              grasp_tilt, "kinematic_lock" if carry_lock else "physics",
              0 if state["lock_active"] else 1))
+    if swing is not None:
+        print("FEED_METRIC_HANDOVER clamp_swing_mm=%.2f limit=%.1f"
+              % (swing, CLAMP_SWING_LIMIT))
     print("FEED_METRIC %s" % ("PASS" if ok else "FAIL"))
     if not ok:
         print("  未通过判据：同轴≤%.1fmm 倾斜≤%.1fdeg 接触≥%d "
-              "下沉≤%.1fmm 20N拉≤%.1fmm"
+              "下沉≤%.1fmm 20N拉≤%.1fmm 交接位移≤%.1fmm"
               % (COAX_LIMIT, TILT_LIMIT, CONTACT_MIN,
-                 SLIP_LIMIT, PULL_LIMIT))
+                 SLIP_LIMIT, PULL_LIMIT, CLAMP_SWING_LIMIT))
     print("=" * 74)
     print("OK")
     return 0 if ok else 1
