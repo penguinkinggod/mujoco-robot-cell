@@ -544,6 +544,24 @@ _FLOAT = [CLAMP_FLOAT_GAIN]
 # 正是肉眼看到的「下沉又回来一点」）。解锁前必须撤销，否则下沉指标假通过。
 CLAMP_LIFT = os.environ.get("FEED_CLAMP_LIFT", "1") == "1"
 
+# ---- 2026-11-07 文献/论坛对照：交接顺序（默认关闭，验证后再换默认值）----
+# 机械社区论坛原话：「机器人送入，然后卡盘夹紧，然后机器人再松开。造成
+# 两者交替时，有一个两者都夹紧的状态，较劲」。FANUC 软浮动专利
+# DE69837741T2 与 CNC 上下料手册都要求：卡爪闭合【之前】先让夹爪松开，
+# 但松开的料必须靠端面挡块/弹簧推料器顶住，否则会掉。
+# 1 = 先松夹爪（手臂原地、soft floating）-> 端面轴向定位 -> 卡爪闭合。
+HANDOVER_FIRST = os.environ.get("FEED_HANDOVER_FIRST", "0") == "1"
+# 轴向弹性定位（等效端面挡块 + 弹簧推料器），只在交接期生效，径向完全
+# 放开让三爪自由找正。棒料约 0.197 kg，k=300 N/m 时临界阻尼约 15 N·s/m。
+SEAT_K = float(os.environ.get("FEED_SEAT_K", "300"))
+SEAT_C = float(os.environ.get("FEED_SEAT_C", "12"))
+SEAT_DWELL = int(os.environ.get("FEED_SEAT_DWELL", "200"))
+# 径向约束：等效真机导套/中心架/托料架。必须软（留出三爪找正的自由
+# 度），只用来防止夹爪张开瞬间把料弹走。0 = 不约束（实测必 FAIL）。
+SEAT_RADIAL_K = float(os.environ.get("FEED_SEAT_RADIAL_K", "0"))
+# 0 = 按临界阻尼自动取 1.4*sqrt(k*m)，避免为每档刚度再调阻尼。
+SEAT_RADIAL_C = float(os.environ.get("FEED_SEAT_RADIAL_C", "0"))
+
 # SMOOTH=1 走「一条连续轨迹」：抬升 -> 横移 -> 下降 -> 进给 合并成一次
 # Ruckig 规划，中途不减速、不停车。0 = 老的分段 rest-to-rest 路径。
 SMOOTH_PATH = os.environ.get("SMOOTH", "1") == "1"
@@ -1106,6 +1124,32 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             data.qfrc_applied[sv + 2] = float(
                 model.body_mass[shaft_body] * abs(model.opt.gravity[2]))
 
+    def seat_rod(x0):
+        """交接期轴向弹性定位：等效真机端面挡块 + 弹簧推料器。
+
+        只约束轴向 (x)，径向 y/z 完全放开，让三爪能自由找正。
+        qfrc_applied 是持久量，交接结束必须显式清零。
+        """
+        if not HANDOVER_FIRST:
+            return
+        p = shaft()
+        # 轴向：端面挡块 + 弹簧推料器。
+        data.qfrc_applied[sv] = (SEAT_K * (x0 - float(p[0]))
+                                 - SEAT_C * float(data.qvel[sv]))
+        # 径向：等效导套/中心架。竖直项叠加自重补偿，和 support_rod()
+        # 保持一致；kr=0 时退化为原来的纯托力。
+        mg = float(model.body_mass[shaft_body]
+                   * abs(model.opt.gravity[2]))
+        cr = (SEAT_RADIAL_C if SEAT_RADIAL_C > 0 else
+              1.4 * np.sqrt(max(SEAT_RADIAL_K, 1.0)
+                            * model.body_mass[shaft_body]))
+        data.qfrc_applied[sv + 1] = (
+            SEAT_RADIAL_K * (axis[1] - float(p[1]))
+            - cr * float(data.qvel[sv + 1]))
+        data.qfrc_applied[sv + 2] = (
+            mg + SEAT_RADIAL_K * (axis[2] - float(p[2]))
+            - cr * float(data.qvel[sv + 2]))
+
     def float_arm():
         """夹紧期把 5 个手臂关节的位置目标拉向当前实际角，让手臂变软。
 
@@ -1422,15 +1466,59 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         # qfrc_applied 是持久量，设一次持续到解锁前撤销。
         support_rod()
         settle(CLAMP_SETTLE, SM.CHUCK_OPEN_CTRL, grip_close, floating=True)
-        # Record the transient at the actual clamp hand-over. The final
-        # gravity-slip metric below starts much later, after release/retreat
-        # and settling, so it cannot expose the visible motion while the jaws
-        # are centring the rod.
-        clamp_grip = grip_close
-        jaw_from = SM.CHUCK_OPEN_CTRL
+        # 交接起点在进给到位时取，两种顺序共用同一基准，夹紧瞬态才可比。
         clamp_p0 = shaft().copy()
+        seat_x0 = float(clamp_p0[0])
         clamp_z_min = clamp_p0[2]
         clamp_z_max = clamp_p0[2]
+        jaw_from = SM.CHUCK_OPEN_CTRL
+        clamp_grip = grip_close
+        if HANDOVER_FIRST:
+            # 文献顺序：卡爪闭合【之前】先松开夹爪，手臂原地不动并保持
+            # soft floating；料由竖直托力 + 轴向端面弹簧定位托住，不会掉。
+            # 三爪闭合时不存在「两边都夹紧」的较劲期。
+            print("  交接方式    先松夹爪 -> 端面定位 -> 三爪闭合"
+                  "（k=%.0f c=%.0f 停留%d步）"
+                  % (SEAT_K, SEAT_C, SEAT_DWELL))
+            for i in range(360):
+                t = (i + 1) / 360.0
+                s = t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
+                data.ctrl[jaw_act] = SM.CHUCK_OPEN_CTRL
+                grip_direct(grip_close + s * (GRIP_OPEN - grip_close))
+                seat_rod(seat_x0)
+                float_arm()
+                mujoco.mj_step(model, data)
+                _z = float(shaft()[2])
+                clamp_z_min = min(clamp_z_min, _z)
+                clamp_z_max = max(clamp_z_max, _z)
+                state.setdefault("traj", []).append(
+                    data.site_xpos[arm.site].copy())
+                state.setdefault("traj_label", []).append("先松夹爪")
+                state.setdefault("traj_t", []).append(float(data.time))
+                track_pen("先松夹爪")
+                if frame_hook is not None and i % FRAME_EVERY == 0:
+                    tick()
+            # 力控就位手册要求夹紧前留足 dwell 让料坐实：
+            # clamping before the part has slipped to full depth locks a
+            # proud part into the jaws。
+            for _ in range(SEAT_DWELL):
+                data.ctrl[jaw_act] = SM.CHUCK_OPEN_CTRL
+                data.ctrl[arm.grip_act] = grip_cmd(GRIP_OPEN)
+                seat_rod(seat_x0)
+                float_arm()
+                mujoco.mj_step(model, data)
+                _z = float(shaft()[2])
+                clamp_z_min = min(clamp_z_min, _z)
+                clamp_z_max = max(clamp_z_max, _z)
+                state.setdefault("traj", []).append(
+                    data.site_xpos[arm.site].copy())
+                state.setdefault("traj_label", []).append("端面就位")
+                state.setdefault("traj_t", []).append(float(data.time))
+            print("  夹爪先松    轴=%s 同轴=%5.2f mm 接触=%d"
+                  % (np.round(shaft(), 4), coax(), jaw_state()[0]))
+            clamp_grip = GRIP_OPEN
+        else:
+            print("  交接方式    夹爪保持，三爪闭合后原地松爪（当前默认）")
         # 单段连续斜坡：丝杠从张开位拧到夹紧力上限，0.6 s。
         state["label"] = "三爪拧紧"
         for i in range(500):
@@ -1439,6 +1527,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             data.ctrl[jaw_act] = (jaw_from
                                   + s * (SM.CHUCK_CLAMP_CTRL - jaw_from))
             data.ctrl[arm.grip_act] = grip_cmd(clamp_grip)
+            seat_rod(seat_x0)
             float_arm()
             mujoco.mj_step(model, data)
             clamp_p = shaft()
@@ -1457,6 +1546,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         for _ in range(300):
             data.ctrl[jaw_act] = SM.CHUCK_CLAMP_CTRL
             data.ctrl[arm.grip_act] = grip_cmd(clamp_grip)
+            seat_rod(seat_x0)
             float_arm()
             mujoco.mj_step(model, data)
             clamp_p = shaft()
@@ -1484,6 +1574,13 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         # 夹紧完成：手臂恢复刚性，目标就钉在当前实际角（柔顺期间
         # ctrl 已跟随 qpos，不会跳变）。松爪/退出不能再让位。
         _FLOAT[0] = 0.0
+        # 卡爪已提供轴向/径向约束，撤掉端面定位与导套弹簧。qfrc_applied
+        # 是持久量，不撤销会一路带到拉拔测试里；竖直恢复成纯托力。
+        data.qfrc_applied[sv] = 0.0
+        data.qfrc_applied[sv + 1] = 0.0
+        data.qfrc_applied[sv + 2] = (
+            float(model.body_mass[shaft_body]
+                  * abs(model.opt.gravity[2])) if CLAMP_LIFT else 0.0)
         # 三爪夹住之后，机械臂先【原地】松开夹爪，等 V 槽刀片完全脱离，
         # 再移走。边松边退会让还没脱离的刀片横向刮着棒料，把工件从卡爪
         # 里带出去（实测同轴 1.6 mm -> 283 mm，工件直接被带飞）。
@@ -1527,7 +1624,9 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     tick("⑩ 三爪夹紧｜单丝杠联动")
 
     # Hand the shaft back to PHYSICS before any load test.
-    # 撤掉交接期的托力，否则重力下沉指标会被托成假通过。
+    # 撤掉交接期的托力/轴向定位，否则重力下沉、拉拔指标会被托成假通过。
+    data.qfrc_applied[sv] = 0.0
+    data.qfrc_applied[sv + 1] = 0.0
     data.qfrc_applied[sv + 2] = 0.0
     state["lock_active"] = False
     settle(1600, SM.CHUCK_CLAMP_CTRL, GRIP_OPEN)
