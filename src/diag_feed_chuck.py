@@ -143,9 +143,15 @@ APPROACH_MM = 0.030        # 对轴时工件头端离卡爪前端面的间隙
 FEED_Z_COMP = float(os.environ.get("FEED_Z_COMP_MM", "0")) / 1000.0
 # 抓取点沿棒料轴线相对工件中心的位置：负 x = 靠机器人这一侧的尾段。
 # 让自由端（+x）伸出去插卡盘，夹爪始终留在卡盘口外。
-# 80 mm 料、24 mm V 槽：中心 -15 mm 时槽占 [-27,-3] mm（相对中心），
-# 与两端托架不重叠；进给 25 mm 后夹爪仍停在卡爪前端外侧。
-GRIP_STATION = -0.015
+# 2026-11-07 重定：原来是 -15 mm（贴尾端）。实测 -15 时料的重心离夹爪
+# 只有 15 mm，三爪闭合的推力全作用在「手臂-料」这个长杠杆上，夹爪被顶
+# 得抬高 3.36 mm，交接位移 3.75 mm。把槽挪到 -5 mm（更靠料重心）后，
+# 咬合同轴 3.06->0.37 mm、交接位移 3.75->1.43 mm、松爪 dz -1.42->0.02。
+# 扫描 0 / -5 差别 <0.02 mm，取 -5 留 20 mm 让夹爪本体不贴卡爪口。
+GRIP_STATION = -float(os.environ.get("FEED_GRIP_STATION_MM", "5")) / 1000.0
+# 松爪退出分两段：先沿轴线退到料尾之外，再侧向撤离。斜着一把撤时张开
+# 的刀片会横刮还没脱离的料尾，把刚定好心的料带歪。
+RETREAT_AXIAL = os.environ.get("FEED_RETREAT_AXIAL", "1") == "1"
 
 
 def tilt_deg(quat):
@@ -1807,6 +1813,31 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                   % (ARM_KP_SCALE, _KP0[0], _KP0[0] * ARM_KP_SCALE))
         print("  夹紧前      轴=%s 同轴=%5.2f mm 轴向偏=%4.1f deg"
               % (np.round(shaft(), 4), coax(), axdev()))
+        # 交接期下坠归因：把「料」和「爪」分开记。爪子下沉 = 手臂伺服在
+        # 负载下让位；料相对爪下沉 = 料在 V 槽里滑。两者必须分开量，
+        # 否则会把手臂软当成夹持打滑（上一轮就是这么误判的）。
+        state["clamp_arm_z0"] = float(arm.pad_center()[2])
+        state["clamp_rod_z0"] = float(shaft()[2])
+        state["clamp_rel_z0"] = (state["clamp_rod_z0"]
+                                 - state["clamp_arm_z0"])
+        state["arm_drop_min"] = 0.0
+        state["arm_drop_max"] = 0.0
+        state["rel_drop_min"] = 0.0
+        state["rel_drop_max"] = 0.0
+        state["rod_drop_min"] = 0.0
+
+        def clamp_stat():
+            _pc = arm.pad_center()
+            _p = shaft()
+            _a = (float(_pc[2]) - state["clamp_arm_z0"]) * 1000.0
+            _r = (float(_p[2]) - state["clamp_rod_z0"]) * 1000.0
+            _rel = (_r - _a)
+            state["arm_drop_min"] = min(state["arm_drop_min"], _a)
+            state["arm_drop_max"] = max(state["arm_drop_max"], _a)
+            state["rel_drop_min"] = min(state["rel_drop_min"], _rel)
+            state["rel_drop_max"] = max(state["rel_drop_max"], _rel)
+            state["rod_drop_min"] = min(state["rod_drop_min"], _r)
+            return _a, _r, _rel
         # qfrc_applied 是持久量，设一次持续到解锁前撤销。
         support_rod()
         settle(CLAMP_SETTLE, SM.CHUCK_OPEN_CTRL, grip_close, floating=True)
@@ -1954,14 +1985,17 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             state.setdefault("traj_label", []).append("三爪拧紧")
             state.setdefault("traj_t", []).append(float(data.time))
             track_pen("三爪拧紧")
+            _a, _r, _rel = clamp_stat()
             if CLAMP_TRACE and i % 25 == 0:
                 _p, _pc = shaft(), arm.pad_center()
                 print("    TRACE %3d 丝杠=%+.4f 料(y,z)=(%+.2f,%+.2f) "
-                      "爪(y,z)=(%+.2f,%+.2f) 卡爪接触=%d"
+                      "爪(y,z)=(%+.2f,%+.2f) 卡爪接触=%d "
+                      "| 爪沉%+.2f 料沉%+.2f 相对%+.2f"
                       % (i, float(data.ctrl[jaw_act]),
                          (_p[1] - axis[1]) * 1000, (_p[2] - axis[2]) * 1000,
                          (_pc[1] - axis[1]) * 1000,
-                         (_pc[2] - axis[2]) * 1000, jaw_state()[0]))
+                         (_pc[2] - axis[2]) * 1000, jaw_state()[0],
+                         _a, _r, _rel))
             if frame_hook is not None and i % FRAME_EVERY == 0:
                 tick()
         # Keep the same 300-step post-clamp hold as settle(), but sample the
@@ -1981,6 +2015,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             state.setdefault("traj_label", []).append("三爪稳定")
             state.setdefault("traj_t", []).append(float(data.time))
             track_pen("三爪稳定")
+            _a, _r, _rel = clamp_stat()
         clamp_p = shaft()
         nc, fN = jaw_state()
         bn, bf = sleeve_state()
@@ -2085,7 +2120,20 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
               "相对夹紧终点 dz=%+.2f mm"
               % (coax(), axdev(), jaw_state()[0],
                  (release_p[2] - clamp_p[2]) * 1000))
-        rerr = move(pad_target(retreat), 700, GRIP_OPEN, False,
+        # 退出必须分两段：先沿轴线退到料尾之外，再侧向撤离。一次斜着
+        # 撤退时，张开的刀片会横刮还没脱离的料尾，把卡盘里刚定好心的
+        # 料带歪（-5 mm 站点实测：同轴 0.44 -> 1.20 mm、倾斜 1.2 -> 2.0
+        # deg，余量偏心因此 2.45 mm 判 FAIL）。分两段后侧移段不再碰料。
+        # 退出段不能再套 part_offset()：料已经归卡盘，夹爪和料分开了，
+        # 实时量出来的「pad − 料」是个 40 mm 的大偏置，套上去等于让手臂
+        # 去追一个歪掉的目标（原实现实测残差 41.6 mm）。这里直接给世界点。
+        if RETREAT_AXIAL:
+            pull = np.array([axis[0] - 0.070, axis[1], axis[2] + 0.010])
+            move3(pull, 260, GRIP_OPEN, False, SM.CHUCK_CLAMP_CTRL)
+            print("  轴向退出     沿轴线退 %.0f mm，刀片已离开料尾"
+                  % (70.0))
+        # 侧向撤离从「已在料尾外侧」起步，行程比原来长 70 mm。
+        rerr = move(retreat, 1100, GRIP_OPEN, False,
                     SM.CHUCK_CLAMP_CTRL)
         retreat_p = shaft()
         _z = float(retreat_p[2])
@@ -2093,6 +2141,16 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         clamp_z_max = max(clamp_z_max, _z)
         state["clamp_swing_mm"] = (clamp_z_max - clamp_z_min) * 1000
         print("  交接位移     z峰谷=%.2f mm" % state["clamp_swing_mm"])
+        print("  位移归因     爪沉[%+.2f,%+.2f] 料相对爪[%+.2f,%+.2f] "
+              "= 手臂伺服 %.0f%% / 槽内滑移 %.0f%%"
+              % (state["arm_drop_min"], state["arm_drop_max"],
+                 state["rel_drop_min"], state["rel_drop_max"],
+                 100.0 * abs(state["arm_drop_min"]) / max(
+                     1e-9, abs(state["arm_drop_min"])
+                     + abs(state["rel_drop_min"])),
+                 100.0 * abs(state["rel_drop_min"]) / max(
+                     1e-9, abs(state["arm_drop_min"])
+                     + abs(state["rel_drop_min"]))))
         print("  松手退出     IK残差=%5.1f mm 同轴=%5.2f mm "
               "轴向偏=%4.1f deg 接触=%d 相对原地松爪 dz=%+.2f mm"
               % (rerr * 1000, coax(), axdev(), jaw_state()[0],
