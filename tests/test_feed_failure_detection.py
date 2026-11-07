@@ -20,6 +20,59 @@ for key in tuple(os.environ):
 import diag_feed_chuck as feed
 
 
+def assert_reproducibility_fields(test_case, result):
+    test_case.assertEqual(4, result["schema_version"])
+    test_case.assertEqual(1, result["metric_schema_version"])
+    test_case.assertEqual("feed-criteria-v1", result["criterion_set_id"])
+    test_case.assertTrue(result["case_id"])
+    test_case.assertIn(result["execution_status"],
+                       ("completed", "aborted", "error"))
+    test_case.assertIn("stages", result)
+    test_case.assertIn("hard_failures", result)
+    test_case.assertIn("quality_failures", result)
+    test_case.assertEqual(result["git_revision"],
+                          result["versions"]["git_revision"])
+    test_case.assertIsInstance(result["git_worktree_dirty"], bool)
+    test_case.assertIn("workpiece", result["inputs"])
+    test_case.assertEqual(20.0, result["inputs"]["workpiece"]["diameter_mm"])
+    test_case.assertEqual(80.0, result["inputs"]["workpiece"]["length_mm"])
+    test_case.assertIn("requested_initial_pose", result["inputs"])
+    test_case.assertIn("v_jaw", result["control_mode"])
+    test_case.assertIn("feed", result["effective_parameters"])
+    test_case.assertIn("bushing", result["effective_parameters"])
+    test_case.assertIn("timestep_s", result["model_options"]["initial"])
+    test_case.assertIn("timestep_s", result["model_options"]["at_result"])
+    test_case.assertIn("hard", result["criteria"])
+    test_case.assertIn("quality", result["criteria"])
+    if result["actual_initial_pose"] is not None:
+        test_case.assertEqual(
+            3, len(result["actual_initial_pose"]["position_m"]))
+        test_case.assertEqual(
+            4, len(result["actual_initial_pose"]["quaternion_wxyz"]))
+
+
+class ExperimentEnvironmentCaptureTests(unittest.TestCase):
+    def test_captures_physics_overrides_not_run_bookkeeping(self):
+        captured = feed._capture_environment_overrides({
+            "FEED_INSERT_MM": "25",
+            "FEED_BUSHING": "0",
+            "FEED_CASE_ID": "case-1",
+            "FEED_RANDOM_SEED": "19",
+            "FEED_RESULT_JSON": "_build/case-1.json",
+            "SO101_KP": "70",
+            "SMOOTH": "0",
+            "GRIP_RAMP": "400",
+            "UNRELATED_SETTING": "ignored",
+        })
+        self.assertEqual({
+            "FEED_INSERT_MM": "25",
+            "FEED_BUSHING": "0",
+            "SO101_KP": "70",
+            "SMOOTH": "0",
+            "GRIP_RAMP": "400",
+        }, captured)
+
+
 class RobotMachineContactTests(unittest.TestCase):
     def _build_model(self):
         model = feed.build_model(v_jaw=True, lift=True, machine_solid=True)
@@ -130,6 +183,7 @@ class RobotMachineContactTests(unittest.TestCase):
 
         self.assertTrue(injected[0])
         self.assertEqual(1, exit_code)
+        assert_reproducibility_fields(self, result)
         self.assertEqual("completed", result["execution_status"])
         self.assertGreater(
             result["metrics"]["robot_machine_contact_max"], 0)
@@ -169,6 +223,7 @@ class FeedFailureStatusTests(unittest.TestCase):
             initial_offset_mm=(0.0, 50.0, 0.0),
         )
         self.assertEqual(1, exit_code)
+        assert_reproducibility_fields(self, result)
         self.assertEqual("aborted", result["execution_status"])
         self.assertEqual("grasp", result["abort_stage"])
         self.assertEqual("no_v_jaw_contact", result["abort_reason"])
@@ -207,6 +262,7 @@ class FeedFailureStatusTests(unittest.TestCase):
                     os.environ["FEED_RESULT_JSON"] = previous_path
             result = json.loads(result_path.read_text(encoding="utf-8"))
 
+        assert_reproducibility_fields(self, result)
         self.assertEqual("error", result["execution_status"])
         self.assertEqual("non_finite_state", result["abort_reason"])
         self.assertEqual(["non_finite_state"], result["hard_failures"])

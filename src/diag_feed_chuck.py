@@ -89,6 +89,7 @@ import uuid
 
 import numpy as np
 import mujoco
+import scipy
 from scipy.interpolate import CubicSpline
 
 import scene_full as F
@@ -96,6 +97,135 @@ import scene_machining as SM
 from demo_08_pick_and_load import (
     Arm, WRIST_ROLL_GRASP, GRIP_OPEN, GRIP_CLOSE,
 )
+
+
+RESULT_SCHEMA_VERSION = 4
+METRIC_SCHEMA_VERSION = 1
+CRITERION_SET_ID = "feed-criteria-v1"
+_REPRODUCIBLE_ENV_KEYS = {
+    "FEED_INSERT_MM", "FEED_Z_COMP_MM", "FEED_GRIP_STATION_MM",
+    "FEED_RETREAT_AXIAL", "FEED_LEVEL_ROD", "FEED_AXIS_LEAD_DEG",
+    "FEED_SEAT_TAP_MM", "FEED_BUSHING", "FEED_BUSHING_GAP",
+    "FEED_BUSHING_FRONT", "FEED_BUSHING_LEN", "FEED_BUSHING_N",
+    "FEED_BUSHING_MODE", "FEED_BUSHING_MU", "FEED_BUSHING_OPEN",
+    "FEED_BUSHING_STIFF", "FEED_BUSHING_ALWAYS",
+    "FEED_BUSHING_RELEASE", "GRIP_RAMP", "FEED_ITERS", "FEED_GAIN",
+    "FEED_STEPS", "FEED_ARM_KV", "FEED_CLAMP_SETTLE",
+    "FEED_CLAMP_FLOAT", "FEED_ARM_GCOMP", "FEED_ARM_GCOMP_GAIN",
+    "FEED_ARM_PAYLOAD", "FEED_ARM_KP", "FEED_GRIP_FORCE_NM",
+    "FEED_GRIP_KP", "FEED_CLAMP_ANCHOR", "FEED_CLAMP_LIFT",
+    "FEED_HANDOVER_FIRST", "FEED_SEAT_K", "FEED_SEAT_C",
+    "FEED_SEAT_DWELL", "FEED_SEAT_RADIAL_K", "FEED_SEAT_RADIAL_C",
+    "FEED_SEAT_FADE", "FEED_PRECLAMP", "FEED_PRECLAMP_CTRL",
+    "FEED_PRECLAMP_STEPS", "FEED_PRECLAMP_DWELL",
+    "FEED_PRECLAMP_SEAT_K", "FEED_PRECLAMP_SEAT_C",
+    "FEED_ARM_LEAD", "FEED_ARM_DAMP", "FEED_FLOAT_DAMP",
+    "FEED_CONVERGE", "FEED_CONVERGE_TOL", "FEED_BORE_PROBE",
+    "FEED_GRIP_CLOSE", "FEED_DIAG_NO_RETREAT", "SMOOTH",
+    "SO101_KP", "SO101_KV", "SM_JAW_BORE_Q", "FEED_DEBUG",
+    "FEED_CLAMP_TRACE", "FEED_SEAT_TRACE",
+}
+_SOURCE_IDENTITY = None
+
+
+def _capture_environment_overrides(environ=None):
+    """Capture physics/debug overrides, excluding case/output bookkeeping."""
+    environ = os.environ if environ is None else environ
+    return {
+        key: str(environ[key])
+        for key in sorted(_REPRODUCIBLE_ENV_KEYS)
+        if key in environ
+    }
+
+
+def _source_identity():
+    global _SOURCE_IDENTITY
+    if _SOURCE_IDENTITY is None:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root,
+            capture_output=True, text=True, check=False).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=root, capture_output=True, text=True,
+            check=False).stdout.strip()
+        _SOURCE_IDENTITY = {
+            "git_revision": revision or "unknown",
+            "git_worktree_dirty": bool(dirty),
+        }
+    return _SOURCE_IDENTITY
+
+
+def _criteria_snapshot():
+    return {
+        "hard": {
+            "ik_result_required": True,
+            "v_jaw_grasp_contacts_min": 1,
+            "chuck_contacts_min": CONTACT_MIN,
+            "pull_out_mm_max": PULL_LIMIT,
+            "robot_machine_contacts_max": 0,
+            "rod_external_force_N_max_when_tuned": 1e-6,
+        },
+        "quality": {
+            "coax_mm_max": COAX_LIMIT,
+            "tilt_deg_max": TILT_LIMIT,
+            "gravity_slip_mm_max": SLIP_LIMIT,
+            "handover_swing_mm_max": CLAMP_SWING_LIMIT,
+            "stock_eccentricity_mm_max": STOCK_ALLOW_MM,
+        },
+    }
+
+
+def _model_options_snapshot(model):
+    opt = model.opt
+    return {
+        "timestep_s": float(opt.timestep),
+        "gravity_m_s2": [float(x) for x in opt.gravity],
+        "integrator": int(opt.integrator),
+        "solver": int(opt.solver),
+        "iterations": int(opt.iterations),
+        "tolerance": float(opt.tolerance),
+        "cone": int(opt.cone),
+        "impratio": float(opt.impratio),
+        "noslip_iterations": int(opt.noslip_iterations),
+        "noslip_tolerance": float(opt.noslip_tolerance),
+    }
+
+
+def _versions_snapshot():
+    identity = _source_identity()
+    return {
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "mujoco": getattr(mujoco, "__version__", "unknown"),
+        "numpy": np.__version__,
+        "scipy": scipy.__version__,
+        **identity,
+    }
+
+
+def _case_metadata(state, model):
+    versions = state["versions"]
+    versions = dict(versions)
+    versions.update(_source_identity())
+    return {
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "metric_schema_version": METRIC_SCHEMA_VERSION,
+        "criterion_set_id": CRITERION_SET_ID,
+        "criteria": _criteria_snapshot(),
+        "inputs": state["inputs"],
+        "actual_initial_pose": state["actual_initial_pose"],
+        "control_mode": state["control_mode"],
+        "effective_parameters": state["effective_parameters"],
+        "environment_overrides": state["environment_overrides"],
+        "model_options": {
+            "initial": state["model_options_initial"],
+            "at_result": _model_options_snapshot(model),
+        },
+        "versions": versions,
+        # Keep the original top-level version fields for existing readers.
+        **versions,
+    }
 
 
 def _finite_sim_state(qpos, qvel, ctrl, qacc, qfrc_applied,
@@ -1203,7 +1333,144 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
              "random_seed": random_seed,
              "rod_force_max": 0.0, "robot_machine_contact_max": 0,
              "shaft_contact_max": 0, "phase_stats": {}, "ik_solver": [],
-             "ik_residuals_mm": {}, "config": {
+             "ik_residuals_mm": {}, "versions": _versions_snapshot(),
+             "actual_initial_pose": None,
+             "model_options_initial": _model_options_snapshot(model),
+             "inputs": {
+                 "workpiece": {
+                     "shape": "cylinder",
+                     "material": "steel",
+                     "diameter_mm": float(SM.SHAFT_D * 1000),
+                     "length_mm": float(SM.SHAFT_L * 1000),
+                     "mass_kg": float(SM.SHAFT_MASS),
+                     "density_kg_m3": float(SM.STEEL_RHO),
+                     "nominal_start_position_m": [
+                         float(x) for x in SM.SHAFT_POS],
+                 },
+                 "requested_initial_pose": {
+                     "offset_mm": [float(x) for x in offset_mm],
+                     "roll_deg": float(initial_roll_deg),
+                 },
+                 "insert_mm": float(INSERT_MM * 1000),
+                 "random_seed": random_seed,
+             },
+             "control_mode": {
+                 "v_jaw": bool(v_jaw),
+                 "lift": bool(lift),
+                 "carry": ("kinematic_lock" if carry_lock
+                           else "unlocked_physics"),
+                 "machine_solid": bool(machine_solid),
+                 "evaluation_scope": evaluation_scope,
+                 "diagnostic_mode": diagnostic_mode,
+                 "wrist_command_rad": float(wrist),
+                 "grip_close_command": float(grip_close),
+             },
+             "effective_parameters": {
+                 "feed": {
+                     "insert_mm": float(INSERT_MM * 1000),
+                     "approach_mm": float(APPROACH_MM * 1000),
+                     "z_comp_mm": float(FEED_Z_COMP * 1000),
+                     "grip_station_mm": float(GRIP_STATION * 1000),
+                     "retreat_axial": bool(RETREAT_AXIAL),
+                     "diagnostic_no_retreat": bool(no_retreat_diagnostic),
+                     "level_rod": bool(LEVEL_ROD),
+                     "axis_lead_deg": float(AXIS_LEAD_DEG),
+                     "seat_tap_mm": float(SEAT_TAP * 1000),
+                     "smooth_path": bool(SMOOTH_PATH),
+                 },
+                 "gripper": {
+                     "v_angle_deg": 90.0,
+                     "v_depth_mm": float(V_DEPTH * 1000),
+                     "v_length_mm": float(V_LEN * 1000),
+                     "v_bar_mm": float(V_BAR * 1000),
+                     "v_reference_position": float(V_QREF),
+                     "cradle_depth_mm": float(CRADLE_DEPTH * 1000),
+                     "cradle_length_mm": float(CRADLE_LEN * 1000),
+                     "cradle_half_width_mm": float(
+                         CRADLE_HALF_X * 1000),
+                     "cradle_bar_mm": float(CRADLE_BAR * 1000),
+                     "cradle_drop_mm": float(CRADLE_DROP * 1000),
+                     "workpiece_lift_mm": float(LIFT_DZ * 1000),
+                     "v_wrist_rad": float(V_WRIST),
+                     "v_grip_close": float(V_GRIP_CLOSE),
+                     "effective_wrist_rad": float(wrist),
+                     "effective_grip_close": float(grip_close),
+                     "grip_ramp_steps": int(GRIP_RAMP),
+                     "grip_settle_steps": int(GRIP_SETTLE),
+                     "grip_force_limit_Nm": float(GRIP_FORCE_NM),
+                     "grip_kp_scale": float(GRIP_KP_SCALE),
+                 },
+                 "bushing": {
+                     "enabled": bool(bushing_ids),
+                     "gap_mm": float(BUSHING_GAP * 1000),
+                     "front_mm": float(BUSHING_FRONT * 1000),
+                     "length_mm": float(BUSHING_LEN * 1000),
+                     "segments": int(BUSHING_N),
+                     "mode": BUSHING_MODE,
+                     "friction": float(BUSHING_MU),
+                     "wall_mm": float(BUSHING_WALL * 1000),
+                     "open_mm": float(BUSHING_OPEN * 1000),
+                     "stiff": bool(BUSHING_STIFF),
+                     "always": bool(BUSHING_ALWAYS),
+                     "release": bool(BUSHING_RELEASE),
+                 },
+                 "controller": {
+                     "feed_iterations": int(FEED_ITERS),
+                     "feed_gain": float(FEED_GAIN),
+                     "feed_steps_per_iteration": int(FEED_STEPS),
+                     "minimum_fix_steps": int(MIN_FIX_STEPS),
+                     "feed_arm_kv": float(FEED_ARM_KV),
+                     "arm_gravity_compensation": bool(ARM_GCOMP),
+                     "arm_gravity_compensation_gain": float(
+                         ARM_GCOMP_GAIN),
+                     "arm_payload_compensation": float(ARM_PAYLOAD),
+                     "arm_kp_scale": float(ARM_KP_SCALE),
+                     "arm_move_lead": float(ARM_MOVE_LEAD),
+                     "arm_move_damping": float(ARM_MOVE_DAMP),
+                     "float_damping": float(FLOAT_DAMP),
+                     "converge_steps": int(CONVERGE_STEPS),
+                     "converge_tolerance": float(CONVERGE_TOL),
+                 },
+                 "handover": {
+                     "clamp_settle_steps": int(CLAMP_SETTLE),
+                     "clamp_float_gain": float(CLAMP_FLOAT_GAIN),
+                     "clamp_anchor": bool(CLAMP_ANCHOR),
+                     "clamp_lift": float(CLAMP_LIFT),
+                     "handover_first": bool(HANDOVER_FIRST),
+                     "seat_stiffness": float(SEAT_K),
+                     "seat_damping": float(SEAT_C),
+                     "seat_dwell_steps": int(SEAT_DWELL),
+                     "seat_radial_stiffness": float(SEAT_RADIAL_K),
+                     "seat_radial_damping": float(SEAT_RADIAL_C),
+                     "seat_fade_steps": int(SEAT_FADE_STEPS),
+                     "preclamp": bool(PRECLAMP),
+                     "preclamp_ctrl": float(PRECLAMP_CTRL),
+                     "preclamp_steps": int(PRECLAMP_STEPS),
+                     "preclamp_dwell_steps": int(PRECLAMP_DWELL),
+                     "preclamp_seat_stiffness": float(PRECLAMP_SEAT_K),
+                     "preclamp_seat_damping": float(PRECLAMP_SEAT_C),
+                 },
+                 "chuck": {
+                     "radius_mm": float(SM.CHUCK_R * 1000),
+                     "length_mm": float(SM.CHUCK_L * 1000),
+                     "bore_radius_mm": float(SM.BORE_R * 1000),
+                     "bore_segments": int(SM.BORE_SEGS),
+                     "jaw_length_mm": float(SM.JAW_LEN * 1000),
+                     "open_ctrl": float(SM.CHUCK_OPEN_CTRL),
+                     "clamp_ctrl": float(SM.CHUCK_CLAMP_CTRL),
+                     "force_limit_N": float(SM.CHUCK_FORCE_LIMIT),
+                     "lathe_origin_m": [float(x) for x in LATHE_ORIGIN],
+                 },
+                 "arm_servo": {
+                     "base_kp_Nm_rad": float(F.ARM_SERVO_KP),
+                     "effective_kv_Nms_rad": float(
+                         os.environ.get("SO101_KV", FEED_ARM_KV)),
+                     "effective_kp_Nm_rad": float(
+                         os.environ.get("SO101_KP", F.ARM_SERVO_KP)),
+                 },
+             },
+             "environment_overrides": _capture_environment_overrides(),
+             "config": {
                  "insert_mm": float(INSERT_MM * 1000),
                  "grip_station_mm": float(GRIP_STATION * 1000),
                  "v_depth_mm": float(V_DEPTH * 1000),
@@ -1226,6 +1493,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         json_path = os.environ.get("FEED_RESULT_JSON")
         if not json_path:
             return
+        result.update(_case_metadata(state, model))
         path = os.path.abspath(json_path)
         directory = os.path.dirname(path)
         if directory:
@@ -1242,7 +1510,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             return
         print("FEED_ABORT stage=%s reason=non_finite_state" % label)
         result = {
-            "schema_version": 3,
+            "schema_version": RESULT_SCHEMA_VERSION,
             "case_id": state["case_id"],
             "random_seed": state["random_seed"],
             "created_at_unix": time.time(),
@@ -1918,6 +2186,11 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
 
     tick("① 起始｜卡盘张开，工件在台面")
     home = shaft()
+    state["actual_initial_pose"] = {
+        "position_m": [float(x) for x in home],
+        "quaternion_wxyz": [
+            float(x) for x in data.qpos[sq + 3:sq + 7]],
+    }
     R = F.SHAFT_D / 2
     # Use the settled workpiece pose: --lift changes the nominal table pose.
     pick_at = home.copy()
@@ -1992,7 +2265,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         print("FEED_ABORT stage=grasp reason=no_v_jaw_contact; "
               "搬运和卡盘闭合已取消")
         result = {
-            "schema_version": 3,
+            "schema_version": RESULT_SCHEMA_VERSION,
             "case_id": state["case_id"],
             "random_seed": state["random_seed"],
             "created_at_unix": time.time(),
@@ -2853,7 +3126,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     print("OK")
 
     result = {
-        "schema_version": 3,
+        "schema_version": RESULT_SCHEMA_VERSION,
         "case_id": state["case_id"],
         "random_seed": state["random_seed"],
         "created_at_unix": time.time(),
