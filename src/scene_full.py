@@ -226,6 +226,18 @@ WRIST_CAM_FOVY = 61.0
 
 
 ARM_SERVO_KV = 2.6      # Nm·s/rad，位置伺服缺失的微分项（见 _damp_arm_servos）
+# 2026-11-07：用户反馈「找轴心吨吨吨几下」= 接触段欠阻尼 hunting
+# （IEEE IE Magazine / Loughborough 综述：先加阻尼，别加比例增益）。
+# 全送料扫描 2.6/3.5/4/5/6/8：
+#   末端抖动 RMS  0.046 -> 0.036/0.033/0.031/0.029/0.027 mm
+#   最大抖动      0.878 -> 0.390/0.378/0.377/0.400/0.501 mm
+#   进给段起步次数 2/2/1 -> 1/1/1（吨吨吨从 5 次降到 3 次）
+#   最终同轴      1.26 -> 1.00/0.92/0.87/0.84/0.70 mm
+# 6 以上 grasp_tilt 涨到 1.7 deg、8 直接 27.2 deg；5.0 是最佳点。
+# 但【不能全局改】：demo_09「搬运到槽上方」要求 xy<5 mm，阻尼一加大
+# 稳态跟踪误差就涨（2.6 -> 4.0 mm，3.5 -> 5.4，4 -> 6.1，5 -> 5.9，
+# 6 -> 6.6），回归会掉到 8/9。所以高阻尼只由送料场景经
+# build_scene(arm_kv=...) 单独注入，其它场景保持 2.6。
 ARM_SERVO_KP = 70.0     # Nm/rad；XML 里是 17.8（下垂 17 mm），官方新版是 998
 ARM_ACT_NAMES = ("shoulder_pan", "shoulder_lift", "elbow_flex",
                  "wrist_flex", "wrist_roll")
@@ -260,7 +272,7 @@ def _damp_arm_servos(spec, kv=ARM_SERVO_KV):
 
 def build_scene(shaft_mass=None, with_lathe=False, lathe_origin=None,
                 with_vise=True, with_fixture=True, with_shaft_flat=True,
-                machine_solid=True, official_world=False):
+                machine_solid=True, official_world=False, arm_kv=None):
     """Build the merged scene.
 
     The three with_* switches default to True so demo_08 / demo_09 and every
@@ -272,7 +284,8 @@ def build_scene(shaft_mass=None, with_lathe=False, lathe_origin=None,
         shaft_mass = SHAFT_MASS
 
     spec = mujoco.MjSpec.from_file(SO101_XML)
-    _damp_arm_servos(spec)
+    _damp_arm_servos(spec,
+                     kv=ARM_SERVO_KV if arm_kv is None else arm_kv)
     mesh_out = SO101_MESH_DIR
     spec.meshdir = SO101_MESH_DIR
     spec.visual.global_.offwidth = 1600

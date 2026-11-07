@@ -149,6 +149,15 @@ JAW_ARC_BORE_R = None
 # 软爪的「设计闭合位」：镗孔时卡爪停的位置，与实际控制量解耦。
 # 夹紧力来自丝杠继续拧紧（ctrl 比这个位置更深），不是来自几何过盈。
 JAW_ARC_Q0 = -0.015
+# 受载自镗标定位（文献 C: boring jaws under load, "Never bore jaws unloaded"）。
+# None = 按理想设计位 JAW_ARC_Q0 镗爪，相当于空载镗。设成实测夹紧时滑座
+# qpos 后，整套爪面按该受载位置重镗：受载闭合时弧片内表面正好落在
+# r_hole，几何过盈只剩 JAW_ARC_CLEAR，夹紧力全部由力控执行器给出，
+# 不再靠过盈量 —— 过盈会被三爪同步差放大成「某一爪先接触、把料推偏」。
+# 默认不变；SM_JAW_BORE_Q 只做对照，实测有效才写死。
+JAW_ARC_BORE_Q = os.environ.get("SM_JAW_BORE_Q")
+JAW_ARC_BORE_Q = (None if JAW_ARC_BORE_Q is None
+                  else float(JAW_ARC_BORE_Q))
 # 三爪相位固定 90/210/330 deg。2026-11-07 曾怀疑「正下方 270 deg 是缝、
 # 没有托爪」导致下沉，扫了 30/90/150/210 四个相位：换相位只把偏移方向
 # 从「向上顶 +3.5 mm」翻成「向下沉 −2.5 mm」，偏心照样跳到 6.7 mm，
@@ -158,11 +167,14 @@ JAW_ARC_Q0 = -0.015
 def add_soft_jaws(jb, k, ang, jaw_open, apply_mask):
     """把第 k 个卡爪的方盒换成拼出来的圆弧软爪。
 
-    闭合时（q = CHUCK_CLAMP_CTRL）弧片内表面正好落在 r_hole 上；张开时
-    整组随滑座沿自身径向平移 20 mm，轴向通道最小内半径约 27 mm，Φ20
-    棒料仍可沿 +x 插入。基板、作动器、三条联动约束一行都不用改。
+    按 JAW_ARC_BORE_Q（默认 JAW_ARC_Q0）这个「镗爪时的滑座位」标定：
+    滑座停在该位时弧片内表面正好落在 r_hole 上。张开时整组随滑座沿自身
+    径向平移 20 mm，轴向通道最小内半径约 27 mm，Φ20 棒料仍可沿 +x 插入。
+    基板、作动器、三条联动约束一行都不用改。
     """
-    r_clamp = jaw_open + JAW_ARC_Q0
+    q_bore = (JAW_ARC_Q0 if JAW_ARC_BORE_Q is None
+              else JAW_ARC_BORE_Q)
+    r_clamp = jaw_open + q_bore
     bore = SHAFT_D / 2 if JAW_ARC_BORE_R is None else JAW_ARC_BORE_R
     r_hole = bore + JAW_ARC_CLEAR
     r_c = r_hole + JAW_ARC_THICK / 2

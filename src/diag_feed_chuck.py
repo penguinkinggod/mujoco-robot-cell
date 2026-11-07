@@ -503,7 +503,8 @@ def build_model(grip_fix=None, v_jaw=False, lift=False, arc_jaw=False,
                          with_vise=False, with_fixture=False,
                          with_shaft_flat=False,
                          machine_solid=machine_solid,
-                         official_world=official_world)
+                         official_world=official_world,
+                         arm_kv=FEED_ARM_KV)
     if lift:
         _lift_workpiece(spec)
     if arc_jaw:
@@ -526,6 +527,13 @@ FEED_ITERS = int(os.environ.get("FEED_ITERS", 3))   # 进给闭环修正轮数
 FEED_GAIN = float(os.environ.get("FEED_GAIN", 0.8))  # 闭环修正增益
 FEED_STEPS = int(os.environ.get("FEED_STEPS", 600))  # 进给每轮步数（1.2 s，慢到不激起工件摆动）
 MIN_FIX_STEPS = 150      # 闭环修正轮的最短时长（0.30 s）：再短伺服落不了地
+
+# ---- 送料场景专用伺服阻尼（文献 B：hunting 是欠阻尼，先加阻尼）----
+# 全局 ARM_SERVO_KV 必须保持 2.6，否则 demo_09 搬运到槽上方 xy 误差会从
+# 4.0 涨到 5.4~6.6 mm（要求 <5），回归掉到 8/9。高阻尼只在本场景注入。
+# 实测 5.0：末端抖动 RMS 0.046->0.031 mm、最大 0.878->0.377 mm，
+# 进给段重新起步 5->3 次，最终同轴 1.26->0.87 mm、余量 1.55->1.05 mm。
+FEED_ARM_KV = float(os.environ.get("FEED_ARM_KV", "5.0"))
 
 # ---- 交接参数（2026-11-07 实测定案，见 CURRENT.md）----
 # 逐帧跟踪发现：进给到位时料在轴线上（同轴 0.08 mm），但夹紧前停等
@@ -561,12 +569,50 @@ SEAT_DWELL = int(os.environ.get("FEED_SEAT_DWELL", "200"))
 SEAT_RADIAL_K = float(os.environ.get("FEED_SEAT_RADIAL_K", "0"))
 # 0 = 按临界阻尼自动取 1.4*sqrt(k*m)，避免为每档刚度再调阻尼。
 SEAT_RADIAL_C = float(os.environ.get("FEED_SEAT_RADIAL_C", "0"))
+# 夹紧完成后径向支撑的渐变卸载步数。0 = 一步清零（旧行为）。
+# 上一轮实测：k=5000 时夹紧瞬态只有 z −0.42 mm（默认 +2.81），但一步
+# 撤销会把弹簧储能瞬间释放，把料弹飞到 10.27 mm / 13.3 deg。按 quintic
+# 把刚度和阻尼一起降到 0，让三爪逐步接手全部径向载荷。
+SEAT_FADE_STEPS = int(os.environ.get("FEED_SEAT_FADE", "0"))
+
+# ---- 文献 C：低压预夹 -> 端面顶正 -> 高压终夹（默认关闭）----
+# 与已否掉的 CLAMP_TWOSTAGE 不同：那是把一段位移斜坡拆慢；这里中间真的
+# 插入一次「料还能微动时的端面顶正」，且预夹段用较浅的丝杠目标给出低压。
+# 对应 Practical Machinist 的「刀塔弹簧推料器在循环中把料重新顶正 + M
+# 代码重新夹紧」。0 = 单段夹紧（当前默认）。
+PRECLAMP = os.environ.get("FEED_PRECLAMP", "0") == "1"
+PRECLAMP_CTRL = float(os.environ.get("FEED_PRECLAMP_CTRL", "-0.017"))
+PRECLAMP_STEPS = int(os.environ.get("FEED_PRECLAMP_STEPS", "300"))
+PRECLAMP_DWELL = int(os.environ.get("FEED_PRECLAMP_DWELL", "200"))
+PRECLAMP_SEAT_K = float(os.environ.get("FEED_PRECLAMP_SEAT_K", "300"))
+PRECLAMP_SEAT_C = float(os.environ.get("FEED_PRECLAMP_SEAT_C", "12"))
+
+# ---- 文献 B：「吨吨吨」= 接触段欠阻尼 hunting（默认关闭）----
+# move()/move3() 原来只写纯位置指令，没有 move_path() 已有的速度前馈。
+# 速度前馈 = kv/kp 抵消匀速段跟踪滞后；速度误差阻尼抑制接触时反复回弹。
+# 文献明确：振荡是欠阻尼，先加阻尼，别加比例增益。
+ARM_MOVE_LEAD = float(os.environ.get("FEED_ARM_LEAD", "0"))
+ARM_MOVE_DAMP = float(os.environ.get("FEED_ARM_DAMP", "0"))
+# 夹紧期柔顺跟随原是纯比例（g*(qpos-ctrl)），只有跟随没有阻尼，接触时
+# 容易 hunting。给跟随目标叠一个与关节速度反向的阻尼项。0 = 保持原样。
+FLOAT_DAMP = float(os.environ.get("FEED_FLOAT_DAMP", "0"))
+# 夹紧前让伺服在【不拖拽工件】的前提下收敛：目标跟随实际角，只等关节
+# 速度降下来，不空等固定步数（固定停等 100 步会把料从 0.08 带到 2.55 mm）。
+CONVERGE_STEPS = int(os.environ.get("FEED_CONVERGE", "0"))
+CONVERGE_TOL = float(os.environ.get("FEED_CONVERGE_TOL", "0.02"))
+
+# 打印夹紧稳定时三个滑座的实际 qpos，用于标定受载自镗位置。
+BORE_PROBE = os.environ.get("FEED_BORE_PROBE", "0") == "1"
 
 # SMOOTH=1 走「一条连续轨迹」：抬升 -> 横移 -> 下降 -> 进给 合并成一次
 # Ruckig 规划，中途不减速、不停车。0 = 老的分段 rest-to-rest 路径。
 SMOOTH_PATH = os.environ.get("SMOOTH", "1") == "1"
 # 位置伺服的速度前馈系数 = kv/kp（秒）。纯 PD 在匀速段的跟踪误差是
 # (kv/kp)*qdot，把参考速度按这个比例提前量加进指令即可补偿。
+# 注意：这里刻意用【全局】ARM_SERVO_KV(2.6)，不是本场景注入的 5.0。
+# 2026-11-07 的 5.0 阻尼扫描正是在「伺服 kv=5 + 前馈 2.6/70」这个
+# 组合下测出 RMS 0.031 mm 的；把前馈也改成 5/70 是未验证的变化，
+# 不要为了公式好看顺手统一。
 ARM_LEAD = F.ARM_SERVO_KV / F.ARM_SERVO_KP
 
 
@@ -845,8 +891,26 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 # 三次样条让 v 和 a 都连续，时间律本来就是 quintic，
                 # 两者乘起来才是一条真正光滑的轨迹。
                 q = np.array([_spl[j](s) for j in range(len(arm.qadr))])
-            for a, v in zip(arm.qadr, q):
-                data.ctrl[a] = v
+            if ARM_MOVE_LEAD or ARM_MOVE_DAMP:
+                # 参考速度由下一时刻的同一条样条求出，和 move_path() 的
+                # 前馈一致。速度前馈抵掉纯 PD 匀速段 (kv/kp)*qdot 的滞后；
+                # 速度误差阻尼把「实际跟不上参考」时的超调拉回来。
+                _dt = float(model.opt.timestep)
+                t2 = min(s1, s0 + (s1 - s0) * (i + 2) / ns)
+                s2 = min(1.0, max(0.0, (_smooth(t2) - S0) / span))
+                if q_path is None:
+                    q2 = q_start + s2 * (q_goal - q_start)
+                else:
+                    q2 = np.array([_spl[j](s2)
+                                   for j in range(len(arm.qadr))])
+                qd = (q2 - q) / _dt
+                for a, v, w in zip(arm.qadr, q, qd):
+                    data.ctrl[a] = (v + ARM_MOVE_LEAD * w
+                                    - ARM_MOVE_DAMP
+                                    * (float(data.qvel[a]) - w))
+            else:
+                for a, v in zip(arm.qadr, q):
+                    data.ctrl[a] = v
             gcmd = grip if grip_end is None else grip + s * (grip_end - grip)
             data.ctrl[arm.grip_act] = grip_cmd(gcmd)
             data.ctrl[jaw_act] = jaw_ctrl
@@ -1150,6 +1214,19 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             mg + SEAT_RADIAL_K * (axis[2] - float(p[2]))
             - cr * float(data.qvel[sv + 2]))
 
+    def pusher_rod(x0):
+        """端面弹簧推料器：只在低压预夹期生效，轴向顶正，径向完全放开。
+
+        Practical Machinist：磨损卡盘会向外让、把料推离挡块，车间做法是
+        刀塔上装弹簧推料器在夹紧循环中把料重新顶正。qfrc_applied 是持久
+        量，夹紧完成必须显式清零，否则会一路带到拉拔测试里。
+        """
+        if not PRECLAMP:
+            return
+        data.qfrc_applied[sv] = (
+            PRECLAMP_SEAT_K * (x0 - float(shaft()[0]))
+            - PRECLAMP_SEAT_C * float(data.qvel[sv]))
+
     def float_arm():
         """夹紧期把 5 个手臂关节的位置目标拉向当前实际角，让手臂变软。
 
@@ -1161,8 +1238,10 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         g = _FLOAT[0]
         if g <= 0:
             return
+        _dt = float(model.opt.timestep)
         for a in arm.qadr:
-            data.ctrl[a] += g * (data.qpos[a] - data.ctrl[a])
+            data.ctrl[a] += (g * (data.qpos[a] - data.ctrl[a])
+                             - FLOAT_DAMP * float(data.qvel[a]) * _dt)
 
     def grip_direct(value):
         """Write an explicitly planned per-step gripper trajectory and sync its cache."""
@@ -1466,6 +1545,27 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         # qfrc_applied 是持久量，设一次持续到解锁前撤销。
         support_rod()
         settle(CLAMP_SETTLE, SM.CHUCK_OPEN_CTRL, grip_close, floating=True)
+        if CONVERGE_STEPS > 0:
+            # 文献 B：夹紧前让伺服收敛。不能用固定停等 —— 实测停 100 步
+            # 会把料从同轴 0.08 带到 2.55 mm。这里目标跟随实际角（不拖拽
+            # 工件），只等关节速度降到阈值就立刻交接。
+            _qvel, _used = 9.9, 0
+            for _j in range(CONVERGE_STEPS):
+                data.ctrl[jaw_act] = SM.CHUCK_OPEN_CTRL
+                data.ctrl[arm.grip_act] = grip_cmd(grip_close)
+                float_arm()
+                mujoco.mj_step(model, data)
+                _used = _j + 1
+                _qvel = float(np.linalg.norm(
+                    [data.qvel[a] for a in arm.qadr]))
+                state.setdefault("traj", []).append(
+                    data.site_xpos[arm.site].copy())
+                state.setdefault("traj_t", []).append(float(data.time))
+                state.setdefault("traj_label", []).append("伺服收敛")
+                if _qvel < CONVERGE_TOL and _j >= 20:
+                    break
+            print("  伺服收敛    等待%3d 步 关节速度=%.4f rad/s 同轴=%5.2f mm"
+                  % (_used, _qvel, coax()))
         # 交接起点在进给到位时取，两种顺序共用同一基准，夹紧瞬态才可比。
         clamp_p0 = shaft().copy()
         seat_x0 = float(clamp_p0[0])
@@ -1519,7 +1619,54 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             clamp_grip = GRIP_OPEN
         else:
             print("  交接方式    夹爪保持，三爪闭合后原地松爪（当前默认）")
-        # 单段连续斜坡：丝杠从张开位拧到夹紧力上限，0.6 s。
+        if PRECLAMP:
+            # 文献 C：低压贴料 -> 端面推料器把料顶正 -> 高压终夹。
+            # 关键不是「把位移斜坡拆慢」（CLAMP_TWOSTAGE 已否掉），而是
+            # 中间留一段「三爪轻贴、料还能微动」的窗口给推料器。
+            print("  低压预夹    丝杠目标=%+.4f m -> 端面顶正 %d 步 -> 高压终夹"
+                  % (PRECLAMP_CTRL, PRECLAMP_DWELL))
+            for i in range(PRECLAMP_STEPS):
+                t = (i + 1) / PRECLAMP_STEPS
+                s = t * t * (3.0 - 2.0 * t)
+                data.ctrl[jaw_act] = (jaw_from
+                                      + s * (PRECLAMP_CTRL - jaw_from))
+                data.ctrl[arm.grip_act] = grip_cmd(clamp_grip)
+                pusher_rod(seat_x0)
+                seat_rod(seat_x0)
+                float_arm()
+                mujoco.mj_step(model, data)
+                clamp_p = shaft()
+                clamp_z_min = min(clamp_z_min, float(clamp_p[2]))
+                clamp_z_max = max(clamp_z_max, float(clamp_p[2]))
+                state.setdefault("traj", []).append(
+                    data.site_xpos[arm.site].copy())
+                state.setdefault("traj_label", []).append("低压预夹")
+                state.setdefault("traj_t", []).append(float(data.time))
+                track_pen("低压预夹")
+            print("  预夹贴料    同轴=%5.2f mm 接触=%d"
+                  % (coax(), jaw_state()[0]))
+            for _ in range(PRECLAMP_DWELL):
+                data.ctrl[jaw_act] = PRECLAMP_CTRL
+                data.ctrl[arm.grip_act] = grip_cmd(clamp_grip)
+                pusher_rod(seat_x0)
+                seat_rod(seat_x0)
+                float_arm()
+                mujoco.mj_step(model, data)
+                clamp_p = shaft()
+                clamp_z_min = min(clamp_z_min, float(clamp_p[2]))
+                clamp_z_max = max(clamp_z_max, float(clamp_p[2]))
+                state.setdefault("traj", []).append(
+                    data.site_xpos[arm.site].copy())
+                state.setdefault("traj_label", []).append("端面顶正")
+                state.setdefault("traj_t", []).append(float(data.time))
+                track_pen("端面顶正")
+            print("  端面顶正    同轴=%5.2f mm 接触=%d"
+                  % (coax(), jaw_state()[0]))
+            # 高压终夹前撤掉推料器：卡爪接手后不再顶，避免残余轴向力
+            # 一路带到拉拔测试。qfrc_applied 是持久量，必须显式清零。
+            data.qfrc_applied[sv] = 0.0
+            jaw_from = PRECLAMP_CTRL
+        # 单段连续斜坡：丝杠从张开位（或预夹位）拧到夹紧力上限。
         state["label"] = "三爪拧紧"
         for i in range(500):
             t = (i + 1) / 500.0
@@ -1561,6 +1708,17 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         nc, fN = jaw_state()
         print("  三爪咬合     轴=%s 同轴=%5.2f mm 接触=%d 力=%.1f N"
               % (np.round(shaft(), 4), coax(), nc, fN))
+        if BORE_PROBE:
+            _jq = [float(data.qpos[model.jnt_qposadr[
+                gid(mujoco.mjtObj.mjOBJ_JOINT, "jaw_slide_%d" % _k)]])
+                for _k in range(3)]
+            _qb = (SM.JAW_ARC_Q0 if SM.JAW_ARC_BORE_Q is None
+                   else SM.JAW_ARC_BORE_Q)
+            print("  受载爪位    q=[%+.5f %+.5f %+.5f] m 镗爪位=%+.5f "
+                  "几何过盈=%+.2f mm 同步差=%.3f mm"
+                  % (_jq[0], _jq[1], _jq[2], _qb,
+                     (_qb - _jq[0]) * 1000,
+                     (max(_jq) - min(_jq)) * 1000))
         print("  夹紧瞬态     z变化=%+.2f mm  峰值范围=[%+.2f, %+.2f] mm  "
               "y/z终点偏移=(%+.2f,%+.2f) mm"
               % ((clamp_p[2] - clamp_p0[2]) * 1000,
@@ -1581,6 +1739,37 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         data.qfrc_applied[sv + 2] = (
             float(model.body_mass[shaft_body]
                   * abs(model.opt.gravity[2])) if CLAMP_LIFT else 0.0)
+        if HANDOVER_FIRST and SEAT_RADIAL_K > 0 and SEAT_FADE_STEPS > 0:
+            # 径向支撑不一步清零：按 quintic 把刚度+阻尼同步降到 0，让
+            # 三爪在几百步里逐步接手全部径向载荷，弹簧储能不瞬间释放。
+            mg2 = float(model.body_mass[shaft_body]
+                        * abs(model.opt.gravity[2]))
+            cr2 = (SEAT_RADIAL_C if SEAT_RADIAL_C > 0 else
+                   1.4 * np.sqrt(SEAT_RADIAL_K
+                                 * model.body_mass[shaft_body]))
+            for j in range(SEAT_FADE_STEPS):
+                t = (j + 1) / SEAT_FADE_STEPS
+                s = 1.0 - t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
+                p = shaft()
+                data.qfrc_applied[sv + 1] = s * (
+                    SEAT_RADIAL_K * (axis[1] - float(p[1]))
+                    - cr2 * float(data.qvel[sv + 1]))
+                data.qfrc_applied[sv + 2] = (
+                    (mg2 if CLAMP_LIFT else 0.0)
+                    + s * (SEAT_RADIAL_K * (axis[2] - float(p[2]))
+                           - cr2 * float(data.qvel[sv + 2])))
+                data.ctrl[jaw_act] = SM.CHUCK_CLAMP_CTRL
+                data.ctrl[arm.grip_act] = grip_cmd(clamp_grip)
+                mujoco.mj_step(model, data)
+                _z = float(shaft()[2])
+                clamp_z_min = min(clamp_z_min, _z)
+                clamp_z_max = max(clamp_z_max, _z)
+                state.setdefault("traj", []).append(
+                    data.site_xpos[arm.site].copy())
+                state.setdefault("traj_label", []).append("撤销导套")
+                state.setdefault("traj_t", []).append(float(data.time))
+            print("  撤销导套    %d 步渐变 同轴=%5.2f mm 接触=%d"
+                  % (SEAT_FADE_STEPS, coax(), jaw_state()[0]))
         # 三爪夹住之后，机械臂先【原地】松开夹爪，等 V 槽刀片完全脱离，
         # 再移走。边松边退会让还没脱离的刀片横向刮着棒料，把工件从卡爪
         # 里带出去（实测同轴 1.6 mm -> 283 mm，工件直接被带飞）。
