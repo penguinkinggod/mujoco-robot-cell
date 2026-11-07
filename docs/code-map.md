@@ -20,7 +20,8 @@ _build/               运行时生成物，不提交
 - 想看场景怎么拼：`src/scene_full.py`、`src/scene_machining.py`
 - 想看完整送料流程：`src/diag_feed_chuck.py`
 - 想看卡盘几何和接触：`src/scene_machining.py`、`src/diag_chuck_health.py`
-- 想看扫描：`src/diag_diameter_sweep.py`、`src/diag_jaw_face_sweep.py`
+- 想看完整送料的插入深度扫描：`src/diag_feed_insert_sweep.py`（输出 `_build/feed_insert_sweep.csv`）
+- 想看卡盘单站变径与卡爪接触面扫描：`src/diag_diameter_sweep.py`、`src/diag_jaw_face_sweep.py`
 - 想看一键验收：`verify_all.py` 和 [检查说明](station/07-checks.md)
 - 想看最小入门程序：`src/demo_00_check.py` 到 `src/demo_07_turned_parts.py`
 

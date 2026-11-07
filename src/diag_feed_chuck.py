@@ -80,7 +80,12 @@ Pass/fail thresholds (written down BEFORE any of the scans)
 Run:
     D:\\robot-env\\Scripts\\python.exe diag_feed_chuck.py
 """
+import json
 import os
+import platform
+import subprocess
+import time
+import uuid
 
 import numpy as np
 import mujoco
@@ -802,7 +807,9 @@ ARM_LEAD = F.ARM_SERVO_KV / F.ARM_SERVO_KP
 
 
 def main(frame_hook=None, model=None, data=None, carry_lock=True,
-         v_jaw=False, lift=False, wrist=None, machine_solid=True):
+         v_jaw=False, lift=False, wrist=None, machine_solid=True,
+         initial_offset_mm=(0.0, 0.0, 0.0), initial_roll_deg=0.0,
+         random_seed=None):
     """Run the feed sequence.
 
     frame_hook(tag, model, data) is an OPTIONAL visualisation tap.
@@ -833,6 +840,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     data = data if data is not None else mujoco.MjData(model)
 
     def tick(tag=None):
+        if tag is not None and "stage_records" in state:
+            record_stage(tag)
         if frame_hook is not None:
             frame_hook(tag, model, data)
 
@@ -916,8 +925,22 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
 
     def track_pen(label):
         _fmax = 0.0
+        machine_contacts = []
+        shaft_contacts = 0
         for i in range(data.ncon):
             c = data.contact[i]
+            n1 = mujoco.mj_id2name(
+                model, mujoco.mjtObj.mjOBJ_GEOM, c.geom1) or "?"
+            n2 = mujoco.mj_id2name(
+                model, mujoco.mjtObj.mjOBJ_GEOM, c.geom2) or "?"
+            t1 = int(model.geom_contype[c.geom1])
+            t2 = int(model.geom_contype[c.geom2])
+            if (t1, t2) in ((1, 8), (8, 1)):
+                mujoco.mj_contactForce(model, data, i, _cf6)
+                machine_contacts.append({
+                    "geoms": [n1, n2], "normal_force_N": abs(float(_cf6[0]))})
+            if any(g_ in (c.geom1, c.geom2) for g_ in shaft_geoms):
+                shaft_contacts += 1
             if not any(g_ in (c.geom1, c.geom2) for g_ in shaft_geoms):
                 continue
             mujoco.mj_contactForce(model, data, i, _cf6)
@@ -930,6 +953,29 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 PEN["min"] = float(c.dist)
                 PEN["label"] = label
                 PEN["pair"] = "%s|%s" % (n1, n2)
+        state["robot_machine_contact_max"] = max(
+            state["robot_machine_contact_max"], len(machine_contacts))
+        state["shaft_contact_max"] = max(state["shaft_contact_max"],
+                                           shaft_contacts)
+        phase = state.setdefault("phase_stats", {}).setdefault(label, {
+            "samples": 0, "robot_machine_contact_max": 0,
+            "shaft_contact_max": 0, "rod_external_force_max_N": 0.0,
+            "robot_machine_pairs": {},
+        })
+        phase["samples"] += 1
+        phase["robot_machine_contact_max"] = max(
+            phase["robot_machine_contact_max"], len(machine_contacts))
+        phase["shaft_contact_max"] = max(phase["shaft_contact_max"],
+                                           shaft_contacts)
+        _external_force = float(np.max(np.abs(data.qfrc_applied[sv:sv + 3])))
+        phase["rod_external_force_max_N"] = max(
+            phase["rod_external_force_max_N"], _external_force)
+        state["rod_force_max"] = max(state["rod_force_max"], _external_force)
+        for pair in machine_contacts:
+            key = "|".join(pair["geoms"])
+            phase["robot_machine_pairs"][key] = max(
+                phase["robot_machine_pairs"].get(key, 0.0),
+                pair["normal_force_N"])
         state.setdefault("rod_p", []).append(data.qpos[sq:sq + 3].copy())
         state.setdefault("rod_f", []).append(_fmax)
         state.setdefault("rod_lab", []).append(label)
@@ -1034,6 +1080,14 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         return count, force
 
     arm = Arm(model, data)
+    started_at = time.perf_counter()
+    case_id = (os.environ.get("FEED_CASE_ID") or uuid.uuid4().hex[:12])
+    if random_seed is None:
+        seed_env = os.environ.get("FEED_RANDOM_SEED")
+        random_seed = None if seed_env in (None, "") else int(seed_env)
+    offset_mm = np.asarray(initial_offset_mm, dtype=float)
+    if offset_mm.shape != (3,):
+        raise ValueError("initial_offset_mm must have three values: dx, dy, dz")
     _KP0 = [float(model.actuator_gainprm[a, 0]) for a in arm.qadr]
     # 夹爪执行器力矩上限（N·m）。SO-101 出厂 ±3.35，挂 80 mm 料时料重经
     # V 槽楔形放大，实测把两指撑开 3.8 mm、料跟着下沉 1.4 mm。这里只是
@@ -1057,7 +1111,85 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             model.actuator_biasprm[a, 1] = -_KP0[k] * scale
 
     state = {"offset": None, "off_site": None, "abs_pos": None,
-             "lock_active": True, "axis_hold": False}
+             "lock_active": True, "axis_hold": False,
+             "stage_records": [], "case_id": case_id,
+             "random_seed": random_seed,
+             "rod_force_max": 0.0, "robot_machine_contact_max": 0,
+             "shaft_contact_max": 0, "phase_stats": {}, "ik_solver": [],
+             "ik_residuals_mm": {}, "config": {
+                 "insert_mm": float(INSERT_MM * 1000),
+                 "grip_station_mm": float(GRIP_STATION * 1000),
+                 "v_depth_mm": float(V_DEPTH * 1000),
+                 "v_length_mm": float(V_LEN * 1000),
+                 "v_angle_deg": 90.0,
+                 "initial_offset_mm": [float(x) for x in offset_mm],
+                 "initial_roll_deg": float(initial_roll_deg),
+                 "v_jaw": bool(v_jaw), "lift": bool(lift),
+                 "carry_lock": bool(carry_lock),
+                 "machine_solid": bool(machine_solid),
+                 "retreat_axial": bool(RETREAT_AXIAL),
+             }}
+
+    robot_machine_peaks = {}
+
+    def record_stage(name):
+        mujoco.mj_forward(model, data)
+        contacts, jaw_force = jaw_state()
+        axis_now = rod_axis()
+        p = shaft()
+        machine_pairs = {}
+        shaft_contacts = 0
+        for i in range(data.ncon):
+            c = data.contact[i]
+            n1 = mujoco.mj_id2name(
+                model, mujoco.mjtObj.mjOBJ_GEOM, c.geom1) or "?"
+            n2 = mujoco.mj_id2name(
+                model, mujoco.mjtObj.mjOBJ_GEOM, c.geom2) or "?"
+            t1 = int(model.geom_contype[c.geom1])
+            t2 = int(model.geom_contype[c.geom2])
+            if (t1, t2) in ((1, 8), (8, 1)):
+                mujoco.mj_contactForce(model, data, i, _cf6)
+                key = "%s|%s" % (n1, n2)
+                machine_pairs[key] = max(
+                    machine_pairs.get(key, 0.0), abs(float(_cf6[0])))
+            if any(g in (c.geom1, c.geom2) for g in shaft_geoms):
+                shaft_contacts += 1
+        for key, value in machine_pairs.items():
+            robot_machine_peaks[key] = max(
+                robot_machine_peaks.get(key, 0.0), value)
+        row = {
+            "stage": name,
+            "sim_time_s": float(data.time),
+            "shaft_position_m": [float(x) for x in p],
+            "shaft_axis": [float(x) for x in axis_now],
+            "shaft_axis_error_deg": axdev(),
+            "coax_mm": coax(),
+            "stock_ecc_mm": stock_ecc(),
+            "gripper_site_position_m": [
+                float(x) for x in data.site_xpos[arm.site]],
+            "jaw_contact_count": contacts,
+            "jaw_normal_force_N": jaw_force,
+            "shaft_contact_count": shaft_contacts,
+            "robot_machine_contact_count": len(machine_pairs),
+            "robot_machine_pairs_force_N": machine_pairs,
+            "shaft_qfrc_applied_N": [
+                float(x) for x in data.qfrc_applied[sv:sv + 3]],
+            "shaft_external_force_max_N": float(
+                np.max(np.abs(data.qfrc_applied[sv:sv + 3]))),
+            "penetration_min_m": float(PEN["min"]),
+            "penetration_pair": PEN["pair"],
+            "penetration_phase": PEN["label"],
+        }
+        state["stage_records"].append(row)
+        return row
+
+    def stage_phase_snapshot(name):
+        phases = state.get("phase_stats", {})
+        if name == "robot_machine_pairs_peak":
+            return dict(robot_machine_peaks)
+        if name == "phase_stats":
+            return phases
+        return None
 
     def part_offset():
         """Pad centre relative to the PART centre, measured right now.
@@ -1148,6 +1280,11 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                     p, _AXIS_TGT, a_local,
                     q_init=q_prev, iters=240)
                 last_ik = (pe, ae)
+                state.setdefault("ik_solver", []).append({
+                    "stage": state.get("label", "?"),
+                    "position_residual_mm": float(pe * 1000),
+                    "axis_residual_deg": float(np.degrees(ae)),
+                })
                 pts.append(q_prev.copy())
             q_path = np.asarray(pts)
             # 关节空间样条：C1/C2 连续，配合 quintic 时间律才不折角。
@@ -1159,7 +1296,13 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                       % (state.get("label", ""), last_ik[0] * 1000,
                          np.degrees(last_ik[1])))
         else:
-            q_goal, _ = arm.ik(site_target, lock_wrist_roll=wrist)
+            q_goal, solver_residual = arm.ik(
+                site_target, lock_wrist_roll=wrist)
+            state.setdefault("ik_solver", []).append({
+                "stage": state.get("label", "?"),
+                "position_residual_mm": float(solver_residual * 1000),
+                "axis_residual_deg": None,
+            })
 
         # Quintic (minimum-jerk) time law on a GLOBAL time axis [s0, s1].
         # move3 splits one stage into several closed-loop passes; giving each
@@ -1342,6 +1485,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             trace.append(err)
             # 0.8 damping: full step overshoots once the load unloads
             tgt = tgt + FEED_GAIN * (gmeas - meas())
+        state.setdefault("ik_residuals_mm", {})[label] = float(err * 1000)
         if DEBUG_MOVE:
             # 正负号变化 = 闭环在目标两侧来回；单调下降 = 只是慢。
             sign_flips = sum(
@@ -1420,6 +1564,10 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             worst = max(worst, float(pe))
             qs.append(np.asarray(q_sol, float).copy())
         Q = np.asarray(qs)
+        state.setdefault("ik_solver", []).append({
+            "stage": label, "position_residual_mm": float(worst * 1000),
+            "axis_residual_deg": None,
+        })
 
         # 归一化弧长上做 jerk 受限的时间参数化。
         dt = float(model.opt.timestep)
@@ -1528,7 +1676,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         """
         # 逐帧记录作用在【棒料】上的外力峰值：0 说明交接期没有隐藏对中
         # 力场，棒料只受重力 / 接触力 / 夹爪力。
-        _f = float(np.max(np.abs(data.qfrc_applied[sv:sv + 6])))
+        _f = float(np.max(np.abs(data.qfrc_applied[sv:sv + 3])))
         if _f > state.get("rod_force_max", 0.0):
             state["rod_force_max"] = _f
         g = _FLOAT[0]
@@ -1588,6 +1736,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             state.setdefault("traj_label", []).append(state.get("label", "?"))
             if locked:
                 lock()
+            track_pen(state.get("label", "settle"))
             if frame_hook is not None and i % (FRAME_EVERY * 2) == 0:
                 tick()
 
@@ -1598,6 +1747,15 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
 
     # ---------------- reset / home ----------------
     mujoco.mj_resetData(model, data)
+    data.qpos[sq:sq + 3] += offset_mm / 1000.0
+    if initial_roll_deg:
+        _roll = np.array([np.cos(np.radians(initial_roll_deg) / 2),
+                          0.0, 0.0,
+                          np.sin(np.radians(initial_roll_deg) / 2)])
+        _q = np.zeros(4)
+        mujoco.mju_mulQuat(_q, _roll, data.qpos[sq + 3:sq + 7].copy())
+        data.qpos[sq + 3:sq + 7] = _q
+    mujoco.mj_forward(model, data)
     data.qpos[arm.qadr[4]] = wrist
     data.ctrl[4] = wrist
     grip_direct(GRIP_OPEN)
@@ -1613,11 +1771,12 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     tick("① 起始｜卡盘张开，工件在台面")
     home = shaft()
     R = F.SHAFT_D / 2
+    # Use the settled workpiece pose: --lift changes the nominal table pose.
+    pick_at = home.copy()
     g = home
     # The ARM still approaches the calibrated rod centre. The V groove is
     # physically shifted to GRIP_STATION inside the gripper, so the contact
     # patch is on the tail while the approach pose stays unchanged.
-    pick_at = home.copy()
     print("=" * 74)
     print("机械臂送料到卡盘（合并场景；搬运段为运动学锁，见文件头）")
     print("=" * 74)
@@ -1679,6 +1838,12 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     # 133 deg、接触 0，就是这里漏了一段保持。先让爪子合完再搬。
     if GRIP_RAMP > 320:
         settle(GRIP_RAMP - 320 + 80, SM.CHUCK_OPEN_CTRL, grip_close)
+    state["grasp_contact_count"] = grip_state()[0]
+    if v_jaw and not carry_lock and state["grasp_contact_count"] == 0:
+        print("FEED_ABORT stage=grasp reason=no_v_jaw_contact; "
+              "搬运和卡盘闭合已取消")
+        return 1
+    record_stage("grasp_complete")
     print("  shaft_in_grip = %s mm（搬运锁的相对偏移）"
           % np.round(state["offset"] * 1000, 2))
     # 落座：抓起后先把料抬离台面几毫米再静置，让它在 V 槽里坐到底。
@@ -1801,6 +1966,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
           % (err * 1000, np.round(shaft(), 4), coax(), axdev()))
     print("  夹爪站位  x=%.3f，距卡爪前端 %.0f mm，机器人-机床接触=%d"
           % (station_x, (jaw_front - station_x) * 1000, machine_hits))
+    state["ik_residuals_mm"]["feed"] = float(err * 1000)
+    record_stage("feed_complete")
     tick("⑨ 直线进给｜沿 +x 插入")
 
     # ---------------- clamp: align friction solver with the chuck scene ----
@@ -2158,6 +2325,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                  (clamp_z_max - clamp_p0[2]) * 1000,
                  (clamp_p[1] - clamp_p0[1]) * 1000,
                  (clamp_p[2] - clamp_p0[2]) * 1000))
+        record_stage("three_jaw_clamped")
         # 交接全程的 z 峰谷 = 人眼看到的「下沉—回升」。slip_mm 只在解锁
         # 静置后测，完全覆盖不到这一段，必须单列并纳入判据，否则又会
         # 出现「指标 0.02 mm 但画面明显在动」。采样延伸到松爪/退出段。
@@ -2235,6 +2403,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
               "相对夹紧终点 dz=%+.2f mm 翘向=%+.2f deg"
               % (coax(), axdev(), jaw_state()[0],
                  (release_p[2] - clamp_p[2]) * 1000, rod_pitch()))
+        record_stage("gripper_released_in_place")
         # 退出必须分两段：先沿轴线退到料尾之外，再侧向撤离。一次斜着
         # 撤退时，张开的刀片会横刮还没脱离的料尾，把卡盘里刚定好心的
         # 料带歪（-5 mm 站点实测：同轴 0.44 -> 1.20 mm、倾斜 1.2 -> 2.0
@@ -2242,14 +2411,21 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         # 退出段不能再套 part_offset()：料已经归卡盘，夹爪和料分开了，
         # 实时量出来的「pad − 料」是个 40 mm 的大偏置，套上去等于让手臂
         # 去追一个歪掉的目标（原实现实测残差 41.6 mm）。这里直接给世界点。
-        if RETREAT_AXIAL:
+        if RETREAT_AXIAL and os.environ.get("FEED_DIAG_NO_RETREAT") != "1":
             pull = np.array([axis[0] - 0.070, axis[1], axis[2] + 0.010])
             move3(pull, 260, GRIP_OPEN, False, SM.CHUCK_CLAMP_CTRL)
             print("  轴向退出     沿轴线退 %.0f mm，刀片已离开料尾"
                   % (70.0))
+        elif os.environ.get("FEED_DIAG_NO_RETREAT") == "1":
+            print("  诊断对照     松爪后不移动机械臂（仅定位用）")
+        record_stage("after_axial_retreat")
         # 侧向撤离从「已在料尾外侧」起步，行程比原来长 70 mm。
-        rerr = move(retreat, 1100, GRIP_OPEN, False,
-                    SM.CHUCK_CLAMP_CTRL)
+        if os.environ.get("FEED_DIAG_NO_RETREAT") == "1":
+            rerr = 0.0
+        else:
+            rerr = move(retreat, 1100, GRIP_OPEN, False,
+                        SM.CHUCK_CLAMP_CTRL)
+        record_stage("after_lateral_retreat")
         retreat_p = shaft()
         _z = float(retreat_p[2])
         clamp_z_min = min(clamp_z_min, _z)
@@ -2280,12 +2456,14 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     data.qfrc_applied[sv + 1] = 0.0
     data.qfrc_applied[sv + 2] = 0.0
     state["lock_active"] = False
+    record_stage("before_unlock_settle")
     settle(1600, SM.CHUCK_CLAMP_CTRL, GRIP_OPEN)
     bn, bf = sleeve_state()
     print("  解锁静置     轴=%s 同轴=%5.2f mm 轴向偏=%5.1f deg 接触=%d "
           "导套=%d/%.1fN"
           % (np.round(shaft(), 4), coax(), axdev(), jaw_state()[0], bn, bf))
     tick("⑪ 解锁｜交还真实物理")
+    record_stage("after_unlock_settle")
 
     # The full-physics path has already released and retreated in one move.
     # Only the legacy kinematic-lock path still needs its separate retreat.
@@ -2306,6 +2484,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
           "接触=%d 三爪法向力=%.1f N 翘向=%+.2f deg"
           % (np.round(shaft(), 4), final_coax, final_tilt,
              contacts, force, rod_pitch()))
+    record_stage("robot_clear")
     tick("⑫ 机器人退出｜装夹完成")
 
     z0 = shaft()[2]
@@ -2319,6 +2498,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         if frame_hook is not None and i % (FRAME_EVERY * 2) == 0:
             tick()
     pull = abs(shaft()[0] - x0) * 1000
+    record_stage("after_20N_pull_test")
     tick("⑬ 20 N 拉拔｜夹得住")
     print("  重力下沉  %.2f mm      20 N 拉  %.2f mm" % (slip, pull))
     print()
@@ -2418,9 +2598,38 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     handover_ok = (swing is None or
                    (swing <= CLAMP_SWING_LIMIT
                     and (stock is None or stock <= STOCK_ALLOW_MM)))
-    ok = (final_coax <= COAX_LIMIT and final_tilt <= TILT_LIMIT
-          and contacts >= CONTACT_MIN and slip <= SLIP_LIMIT
-          and pull <= PULL_LIMIT and handover_ok)
+    hard_failures = []
+    quality_failures = []
+    if not state.get("ik_residuals_mm"):
+        hard_failures.append("no_ik_result")
+    if state.get("grasp_contact_count", 0) <= 0:
+        if v_jaw and not carry_lock:
+            hard_failures.append("grasp_empty")
+    if contacts < CONTACT_MIN:
+        hard_failures.append("chuck_contact_insufficient")
+    if pull > PULL_LIMIT:
+        hard_failures.append("pull_out")
+    if state.get("robot_machine_contact_max", 0) > 0:
+        hard_failures.append("robot_machine_collision")
+    # The tuned V-jaw handoff is the no-hidden-force experiment. The
+    # official compatibility scene still uses its historical gravity support
+    # because it has no physical bushing geometry; keep that scene separate
+    # instead of calling its legacy support a tuned-path pass.
+    if tuned and state.get("rod_force_max", 0.0) > 1e-6:
+        hard_failures.append("rod_external_force")
+    if final_coax > COAX_LIMIT:
+        quality_failures.append("coaxiality")
+    if final_tilt > TILT_LIMIT:
+        quality_failures.append("axis_tilt")
+    if slip > SLIP_LIMIT:
+        quality_failures.append("gravity_slip")
+    if swing is not None and swing > CLAMP_SWING_LIMIT:
+        quality_failures.append("handover_swing")
+    if stock is not None and stock > STOCK_ALLOW_MM:
+        quality_failures.append("stock_eccentricity")
+    hard_pass = not hard_failures
+    quality_pass = not quality_failures
+    ok = hard_pass and quality_pass
     print("=" * 74)
     print("FEED_METRIC coax_mm=%.2f tilt_deg=%.1f contacts=%d "
           "slip_mm=%.2f pull_mm=%.2f jaw_force_N=%.1f "
@@ -2442,6 +2651,51 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                  SLIP_LIMIT, PULL_LIMIT, CLAMP_SWING_LIMIT, STOCK_ALLOW_MM))
     print("=" * 74)
     print("OK")
+
+    result = {
+        "schema_version": 1,
+        "case_id": state["case_id"],
+        "random_seed": state["random_seed"],
+        "created_at_unix": time.time(),
+        "duration_s": time.perf_counter() - started_at,
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "mujoco": getattr(mujoco, "__version__", "unknown"),
+        "git_revision": subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__))),
+            capture_output=True, text=True, check=False).stdout.strip(),
+        "config": state["config"],
+        "metrics": {
+            "coax_mm": final_coax, "tilt_deg": final_tilt,
+            "contacts": contacts, "slip_mm": slip, "pull_mm": pull,
+            "jaw_force_N": force, "grasp_tilt_deg": grasp_tilt,
+            "clamp_swing_mm": swing, "stock_ecc_mm": stock,
+            "rod_external_force_max_N": state.get("rod_force_max", 0.0),
+            "robot_machine_contact_max": state.get(
+                "robot_machine_contact_max", 0),
+            "shaft_contact_max": state.get("shaft_contact_max", 0),
+            "penetration_min_m": float(PEN["min"]),
+            "penetration_pair": PEN["pair"],
+            "penetration_phase": PEN["label"],
+        },
+        "hard_pass": hard_pass,
+        "quality_pass": quality_pass,
+        "overall_pass": ok,
+        "hard_failures": hard_failures,
+        "quality_failures": quality_failures,
+        "phase_stats": state.get("phase_stats", {}),
+        "ik_solver": state.get("ik_solver", []),
+        "ik_residuals_mm": state.get("ik_residuals_mm", {}),
+        "stages": state.get("stage_records", []),
+    }
+    json_path = os.environ.get("FEED_RESULT_JSON")
+    if json_path:
+        path = os.path.abspath(json_path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(result, stream, ensure_ascii=False, indent=2)
+        print("FEED_RESULT_JSON %s" % path)
     return 0 if ok else 1
 
 
@@ -2459,9 +2713,26 @@ if __name__ == "__main__":
     ap.add_argument("--passthrough", action="store_true",
                     help="历史基线专用：卡盘外壳不参与碰撞（机器人可穿模）。"
                          "只用于和旧数字对比，新流程一律不要加")
+    ap.add_argument("--json-out", metavar="PATH",
+                    help="write structured case results to this JSON file")
+    ap.add_argument("--initial-dy-mm", type=float, default=0.0)
+    ap.add_argument("--initial-dz-mm", type=float, default=0.0)
+    ap.add_argument("--initial-roll-deg", type=float, default=0.0)
+    ap.add_argument("--random-seed", type=int)
+    ap.add_argument("--case-id")
     args = ap.parse_args()
+    if args.json_out:
+        os.environ["FEED_RESULT_JSON"] = args.json_out
+    if args.case_id:
+        os.environ["FEED_CASE_ID"] = args.case_id
+    if args.random_seed is not None:
+        os.environ["FEED_RANDOM_SEED"] = str(args.random_seed)
     if args.passthrough:
         print("  ⚠ 穿模模式：卡盘外壳不参与碰撞，仅用于复现历史基线数字")
     raise SystemExit(main(v_jaw=args.v_jaw, lift=args.lift,
                           carry_lock=not args.no_lock,
-                          machine_solid=not args.passthrough))
+                          machine_solid=not args.passthrough,
+                          initial_offset_mm=(0.0, args.initial_dy_mm,
+                                             args.initial_dz_mm),
+                          initial_roll_deg=args.initial_roll_deg,
+                          random_seed=args.random_seed))

@@ -17,6 +17,7 @@
 | 想看现在正在改什么、下一步做什么 | [现场记录](../CURRENT.md) |
 | 想看项目已经跨过哪些阶段 | [项目里程碑](milestones.md) |
 | 想看代码和脚本放哪 | [代码地图](code-map.md) |
+| 想查每个送料指标怎么测、阈值能不能改 | [机械臂送料指标字典](metric-dictionary.md) |
 | 想看 Git、GitHub、commit 怎么用 | [版本与提交](git-and-commits.md) |
 | 想查实验数据 | [工位资料索引](station/README.md) |
 | 想看相关研究 | [相关工作](research/related-work.md) |

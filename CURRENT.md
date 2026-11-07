@@ -1,15 +1,26 @@
 # 现在在做什么
 
 给下一个接手的人或 agent 看的现场记录。只写"此刻"的状态，不写历史；换手前改这里，不要另开日志。
-最后更新：2026-11-07（深插边界 + 托架贡献量化）
+最后更新：2026-11-07（P3 退出段诊断完成）
+
+## 先读：抓取回归已修复，P0 已完成
+
+本轮给 `src/diag_feed_chuck.py` 和 `src/diag_feed_insert_sweep.py` 增加日志/扰动相关草稿后，完整送料测试出现回归：抓取目标过低、棒料被挤走，之后流程仍继续闭合卡盘。P0.2 已恢复抓取目标并加入抓取失败终止；P0.3 已重跑回归并完成画面核验。T1-T4 **仍没有完成验收**。
+
+已修复的首要差异：抓取目标恢复为仿真静置后的实际 `home`，包含 `--lift` 后的抬升高度；全物理 V 槽路径若抓取接触数为 0，则在 `grasp` 阶段 `FEED_ABORT`，不会继续搬运或闭合卡盘。官方兼容场景仍保留历史托力，并作为独立对照。P0.2、P0.3、P0.4 现已完成。
+
+**统一任务入口：[项目任务总账](docs/project-taskbook.md)**。它记录最终成果、分工、P0-P10 小任务、验收和决定。P1.1 指标字典已写入 [docs/metric-dictionary.md](docs/metric-dictionary.md)。P0.4 基准身份记录见 [docs/baseline-identity-2026-11-07.md](docs/baseline-identity-2026-11-07.md)，P3 退出段诊断见 [docs/exit-diagnostics-2026-11-07.md](docs/exit-diagnostics-2026-11-07.md)。下一步做 P1.2 状态转换验收。旧 T 清单是实现参考，不是允许一次做完所有步骤的授权。
+
+P0.1 审计结论见 [docs/audit-current-diff-2026-11-07.md](docs/audit-current-diff-2026-11-07.md)。P0.2 与 P0.3 基础回归证据：`verify_all.py` 为 **9/9**；`diag_feed_chuck.py --v-jaw --lift --no-lock` 为 `FEED_METRIC PASS`，同轴约 `0.64 mm`、倾角约 `0.2°`、交接位移约 `1.58 mm`、余量偏心约 `0.70/2.0 mm`、20 N 拉拔约 `0.00 mm`。负向 `dy=+50 mm` 在抓取阶段终止，未进入三爪闭合。P0.3 四档复验、8 mm 画面核验和 P0.4 基准身份记录已完成；P1.1 文档已完成。P3 退出段三模式诊断见 [docs/exit-diagnostics-2026-11-07.md](docs/exit-diagnostics-2026-11-07.md)。
+
+**尚未验收的实现：** 姿态扰动入口、全过程接触/阶段日志及扫描器错误处理还不能作为正式批量扰动实验工具。它们目前用于本轮受限的四档扫描与退出段诊断，后续按 P1/P2 分卡验收。证据与配置见 [docs/insert-sweep-2026-11-07.md](docs/insert-sweep-2026-11-07.md)、[docs/baseline-identity-2026-11-07.md](docs/baseline-identity-2026-11-07.md) 和 [docs/exit-diagnostics-2026-11-07.md](docs/exit-diagnostics-2026-11-07.md)。当前计划本地 checkpoint；不 push，直到完成可公开展示的项目成果。
 
 **要拿去问别人/别的 AI**：直接用 [docs/handoff-brief.md](docs/handoff-brief.md)，
 那份是自包含的，不需要读代码，末尾有 6 个待判断的问题。
 
 ## 当前目标
 
-固定一根棒料，**机械臂自己**完成一次可靠送料：抓取 → 提起 → 对轴 → 插入卡盘 → 夹紧 → 松爪退出。
-随机来料、流水线、训练明确暂不碰。
+当前先固定 Ø20 × 80 mm 棒料和现有 V 槽，完成成功判据与流程状态转换的可信记录，再开始受控扰动实验。大方向和后续阶段见 [docs/project-plan.md](docs/project-plan.md)；目前没有实体机械臂，视觉、流水线、多工件和策略训练都属于后续工作。
 
 用户要的是**交接过程的姿态**：松爪 ↔ 卡爪接手那一瞬不能"往左上怼一下 / 放掉料自己偏 /
 再夹紧又动一下 / 找轴心吨吨吨几下"。不能只看最终余量 PASS 就收尾。
@@ -17,6 +28,14 @@
 **验收必须分层**：卡盘基准（`diag_chuck_seat.py`，只证明卡盘）≠ 机械臂送料
 （`diag_feed_chuck.py --v-jaw --lift --no-lock`，必须机械臂实际抓料送入）。
 用隐藏力场替机械臂对中不算数。
+
+## 本轮新增：完整送料插入深度扫描
+
+- 当前默认深度 25 mm 的完整送料基准重跑通过：同轴 0.59 mm、倾角 0.2°、交接位移 1.56 mm、余量偏心 0.64/2.0 mm、20 N 拉拔位移 0.00 mm。
+- 新增 `src/diag_feed_insert_sweep.py`，运行 `python src/diag_feed_insert_sweep.py` 可扫描完整机械臂送料流程并写入 `_build/feed_insert_sweep.csv`。它只改变插入深度，其他 `FEED_*` 环境覆盖会清除。
+- 当前恢复后的四档复验：7.75 mm FAIL（余量偏心 2.19 mm），8 mm FAIL（2.28 mm），10 mm PASS（0.92 mm），25 mm PASS（0.70 mm）。
+- 本次固定初态四档中，最浅 PASS 是 **10 mm**；它不是生产标准或任意尺寸通用值。旧记录中的“8 mm PASS”属于另一轮代码/结果，已被本次复验覆盖。
+- 7.75/8 mm 首次超过 2.0 mm 余量偏心发生在轴向退出之后；进给完成、三爪夹紧、原地松爪仍未超线。8 mm 画面未见明显挤飞或穿模，但数值仍 FAIL。P3 对照显示：正常两段退出是 8 mm 三种模式中最不坏的路径，但唯一根因仍未证明。下一步做 P1.2 状态转换验收。
 
 ## 状态：阶段 B 第三轮已落地为新默认
 
