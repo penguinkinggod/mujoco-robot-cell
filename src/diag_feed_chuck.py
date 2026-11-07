@@ -498,8 +498,12 @@ def _lift_workpiece(spec):
 # 只有配合「先松夹爪 + 径向托力渐变卸载」才成立：导套在夹爪松开到
 # 三爪咬合之间顶住料，咬合后自己卸载（解锁静置导套=0/0.0N，拉拔
 # 不是假通过）。实测交接位移 4.77->1.05 mm、首次接触推挤 4.20->0.53。
-# 这一组已设为默认，见 CURRENT.md；关掉用 FEED_BUSHING=0。
-BUSHING = os.environ.get("FEED_BUSHING", "1") == "1"
+# 2026-11-07 用户否掉这组定案：拆开对照证实「把料摆回主轴轴线」的主要是
+# SEAT_RADIAL_K 那根以【理论轴线坐标】为目标的数学弹簧，等于替机械臂完成
+# 最后对中，不能算机械臂送料成功。故全部默认回退为关，主路径输出的是
+# 【无作弊机械臂基线】（交接位移 4.77 mm，过程姿态未达标，待重做）。
+# 开关全部保留，只用于对照；复现旧定案须同时开下面六个，见 CURRENT.md。
+BUSHING = os.environ.get("FEED_BUSHING", "0") == "1"
 BUSHING_GAP = float(os.environ.get("FEED_BUSHING_GAP", "0.2")) / 1000.0
 BUSHING_FRONT = float(os.environ.get("FEED_BUSHING_FRONT", "6")) / 1000.0
 BUSHING_LEN = float(os.environ.get("FEED_BUSHING_LEN", "14")) / 1000.0
@@ -510,10 +514,10 @@ BUSHING_WALL = 0.004
 # 中心架初始张开量（径向）。搬运路径横穿卡爪口外，闭合的常驻环会被
 # 棒料撞上；真机中心架送料时本来就是张开的，到位才合上。
 BUSHING_OPEN = float(os.environ.get("FEED_BUSHING_OPEN", "40")) / 1000.0
-# 1 = 硬接触（短 solref + 陡 solimp）。默认开：软接触只顶回 9~17 N、
-# 被三爪挤穿；硬接触才顶得住交接瞬间的悬空段。单独用（不先松爪）会
-# 与三爪抢料变 7.24 mm / 8.6 deg，所以必须与 HANDOVER_FIRST 同开。
-BUSHING_STIFF = os.environ.get("FEED_BUSHING_STIFF", "1") == "1"
+# 1 = 硬接触（短 solref + 陡 solimp）。软接触只顶回 9~17 N、被三爪挤穿；
+# 硬接触才顶得住交接瞬间的悬空段，但单独用会与三爪抢料（7.24 mm / 8.6 deg）。
+# 随整组定案一起回退为默认关。
+BUSHING_STIFF = os.environ.get("FEED_BUSHING_STIFF", "0") == "1"
 BUSHING_CLOSED = {}   # geom name -> 闭合位 pos，供 close_bushing() 用
 
 
@@ -660,29 +664,29 @@ CLAMP_LIFT = os.environ.get("FEED_CLAMP_LIFT", "1") == "1"
 # DE69837741T2 与 CNC 上下料手册都要求：卡爪闭合【之前】先让夹爪松开，
 # 但松开的料必须靠端面挡块/弹簧推料器顶住，否则会掉。
 # 1 = 先松夹爪（手臂原地、soft floating）-> 端面轴向定位 -> 卡爪闭合。
-# 上一轮单独用会 FAIL（撤支撑后跷 2.2 deg）；配上实体硬导套后 PASS，
-# 且「夹爪先松」时同轴 0.00 mm、不下沉，三爪首次接触不再把料怼偏。
-# 关掉用 FEED_HANDOVER_FIRST=0（但那样也要一并关导套，否则会抢料）。
-HANDOVER_FIRST = os.environ.get("FEED_HANDOVER_FIRST", "1") == "1"
+# 单独用会 FAIL（撤支撑后跷 2.2 deg）；配实体硬导套 + 径向弹簧后 PASS，
+# 但那组结果已被用户否掉（作弊弹簧替机械臂对中），故默认回退为关。
+# 注意 tuned 依赖「有导套几何」：FEED_BUSHING=0 会把整组一起短路。
+HANDOVER_FIRST = os.environ.get("FEED_HANDOVER_FIRST", "0") == "1"
 # 轴向弹性定位（等效端面挡块 + 弹簧推料器），只在交接期生效，径向完全
 # 放开让三爪自由找正。棒料约 0.197 kg，k=300 N/m 时临界阻尼约 15 N·s/m。
 SEAT_K = float(os.environ.get("FEED_SEAT_K", "300"))
 SEAT_C = float(os.environ.get("FEED_SEAT_C", "12"))
 SEAT_DWELL = int(os.environ.get("FEED_SEAT_DWELL", "200"))
-# 径向约束：等效真机导套/中心架/托料架。必须软（留出三爪找正的自由
-# 度），只用来防止夹爪张开瞬间把料弹走。0 = 不约束（实测必 FAIL）。
-# 与实体硬导套叠加后定案 5000：它在交接期托住悬空段，实体导套负责
-# 松爪瞬间的几何限位，两者缺一都会把料带偏。
-SEAT_RADIAL_K = float(os.environ.get("FEED_SEAT_RADIAL_K", "5000"))
+# 【已否掉】径向约束：qfrc_applied 数学弹簧，目标直接取理论主轴轴线
+# axis[1]/axis[2]。拆开对照：关掉它、保留导套，导套反以 483 N 把料别到
+# 14.2 deg FAIL，证明是这根弹簧在替机械臂对中，而不是实体几何。真机没有
+# 「知道轴线在哪」的力场，故默认 0。保留开关仅供对照，勿重新设为默认。
+SEAT_RADIAL_K = float(os.environ.get("FEED_SEAT_RADIAL_K", "0"))
 # 0 = 按临界阻尼自动取 1.4*sqrt(k*m)，避免为每档刚度再调阻尼。
 SEAT_RADIAL_C = float(os.environ.get("FEED_SEAT_RADIAL_C", "0"))
 # 夹紧完成后径向支撑的渐变卸载步数。0 = 一步清零（旧行为）。
 # 上一轮实测：k=5000 时夹紧瞬态只有 z −0.42 mm（默认 +2.81），但一步
 # 撤销会把弹簧储能瞬间释放，把料弹飞到 10.27 mm / 13.3 deg。按 quintic
 # 把刚度和阻尼一起降到 0，让三爪逐步接手全部径向载荷。
-# 400 步 + 实体硬导套是定案组合；fade 段日志里的「卸载托力」指撤销
-# 这层【力等效托力】，不是撤掉常驻的实体导套几何（那个从不撤销）。
-SEAT_FADE_STEPS = int(os.environ.get("FEED_SEAT_FADE", "400"))
+# 旧定案用 400 步；随径向弹簧一起回退为 0。fade 段日志里的「卸载托力」
+# 指撤销这层【力等效托力】，不是撤掉常驻的实体导套几何（那个从不撤销）。
+SEAT_FADE_STEPS = int(os.environ.get("FEED_SEAT_FADE", "0"))
 
 # ---- 文献 C：低压预夹 -> 端面顶正 -> 高压终夹（默认关闭）----
 # 与已否掉的 CLAMP_TWOSTAGE 不同：那是把一段位移斜坡拆慢；这里中间真的
