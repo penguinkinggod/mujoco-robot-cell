@@ -3,134 +3,128 @@
 给下一个接手的人或 agent 看的现场记录。只写"此刻"的状态，不写历史；换手前改这里，不要另开日志。
 最后更新：2026-11-07
 
-## 当前目标：交接瞬间的姿态，不是成品余量
+## 当前目标：交接瞬间的姿态
 
-用户 2026-11-07 推翻了上一轮"偏移可以切掉、可以无视"的收尾判断。
-他看到的四个现象都发生在**机械臂松爪 ↔ 卡盘卡爪接手**这一瞬间：
+用户看到的五个现象，都发生在**机械臂松爪 ↔ 卡盘卡爪接手**这一瞬间：
+往左上怼一下 / 放掉料自己往下偏 / 再夹紧又动一下 / 找轴心吨吨吨几下 / 最终偏心太大。
+上一轮曾把验收收窄成"余量偏心 ≤ 2 mm、偏移第一刀能切掉"，用户明确推翻：
+**要的是过程本身不出这几下，不是成品精度。别再只看最终值判 PASS。**
 
-1. 机械臂放开、卡爪接手时，料被**往左上怼一下**；
-2. 放掉料会**自己往下偏移**；
-3. 再夹紧**又动一下**；
-4. 机械臂找轴心时**吨吨吨几下**；
-5. 最终**偏心太大**。
+## 本轮结论（用户要求"两条都做"：受载自镗+分段压力、伺服阻尼）
 
-上一轮把验收标准收窄成"整根料最坏偏心 ≤ 单边余量"（`stock_ecc_mm=1.55 ≤ 2.0`），
-那管的是第一刀能否见光，**管不到过程姿态**。用户要的是过程本身不出这几下。
+### ✅ 已定案并设为默认：「吨吨吨」= 位置伺服欠阻尼 hunting
 
-## 文献 / 论坛调研结论（2026-11-07 检索）
+文献 B（IEEE IE Magazine 2020 / Loughborough 综述）：接触时环境阻尼不足 →
+力控在接触点振荡、被弹回、再接触，即 hunting；解法是**加阻尼，别加比例增益**。
+Industrial Monitor Direct 补：Rx/Ry 柔顺、TCP 不在受力点时零件会在孔里来回摇摆，
+要锁倾转柔顺 + 夹紧前留足 dwell 让料坐实。
 
-### A. 交接期"两边都夹紧 = 较劲"（最直接对口）
+- 改法：`src/scene_full.py` 的 `build_scene()` 新增 `arm_kv` 参数；
+  `src/diag_feed_chuck.py` 用 `FEED_ARM_KV=5.0` 单独给送料场景注入。
+  **全局 `ARM_SERVO_KV` 必须保持 2.6** —— demo_09「搬运到槽上方 xy<5 mm」
+  在阻尼加大后会从 4.0 涨到 5.4~6.6 mm，回归掉到 8/9。
+- 实测（默认路径，不带任何环境变量）：
 
-- **机械社区《关于机床上下料的问题》**（社友讨论）：原帖就写「机器人送入，然后
-  卡盘夹紧，然后机器人再松开。造成两者交替时，**有一个两者都夹紧的状态，较劲**。
-  也是定位精度不高的原因」。解法：①「放进零件后，**松开夹爪但不移动手臂**，
-  等卡盘夹紧后再移走」；②「气爪端面有**弹簧定位**，松开后端面不要移动，靠弹簧
-  把工件顶在主轴卡爪定位面上，**三爪锁紧过程会自动找正**」；③ 短轴用弹簧推料机构，
-  长轴加尾座顶紧；④「FANUC **软浮动**功能可以解决机器人同机床夹具别劲儿」；
-  ⑤ 夹爪内孔精磨、示教用直角坐标系保证 6 轴中轴线与卡盘中轴线平行；
-  ⑥ 每次装夹后程序校验是否装正。
-  http://mp.weixin.qq.com/s?__biz=MzA5ODYyNjQxMQ==&mid=2668557070&idx=1&sn=f3038a239ac8e6dec9a446925814f347
-- **FANUC 软浮动专利 DE69837741T2**：检测到接触后开启 soft-floating，机器人被动
-  沿外力方向移动，让工件贴合卡盘定位面；**卡爪此时仍在退回位、尚未闭合**。
-  https://patents.google.com/patent/DE69837741T2/en
-- **Fanuc LR Mate 虎钳交接案例**：机器人释放后夹具夹在未就位料上 →「爪可能把
-  毛坯夹得**倾斜或旋转**」；夹爪仍夹持时夹具闭合 →「不对中对腕部造成负载…
-  仅当必须保持方向时才用，且必须配合**柔顺性**」。解法是推料器在夹紧闭合前一直压住、
-  并就位信号互锁夹紧指令。
-  https://industrialmonitordirect.com/tr/blogs/knowledgebase/should-a-fanuc-lr-mate-release-the-part-before-vise-clamp
-- **EVST《Robot Lathe Tending: Chuck Handoff and Interlocks》**：「blank can appear
-  centered in the jaws while remaining off the locating face because of …
-  **spring in the handoff**」；要求 prove seating at the locating face，并明确
-  **不要用主轴/卡盘把不确定的料拉正**。
-  https://www.evsint.com/robot-lathe-tending-chuck-handoff-interlocks/
+  | 指标 | 改前 | 改后 |
+  |---|---|---|
+  | 末端抖动 RMS / 最大 | 0.046 / 0.878 mm | **0.031 / 0.377 mm** |
+  | 进给 3 轮重新起步次数 | 2/2/1（共 5 次） | **1/1/1（共 3 次）** |
+  | 最终同轴 / 倾斜 | 1.26 mm / 0.7° | **0.87 mm / 0.3°** |
+  | 余量偏心 | 1.55 mm | **1.05 mm** |
+  | 20 N 拉拔 / 重力下沉 | 0.00 / 0.26 mm | **0.00 / 0.00 mm** |
 
-### B. "吨吨吨" = 力控 hunting / 欠阻尼，不是没对准
+- KV 扫描 2.6/3.5/4/5/6/8：5.0 是最佳点。6 起 grasp_tilt 涨到 1.7°，
+  8 直接 27.2°（抓取时料被拽歪），且三爪拧紧起步回升到 8 次。
+- **坑**：`ARM_LEAD` 刻意仍用全局 2.6/70，**不要**"顺手统一"成 5/70 —
+  上面这组有效数据就是在「伺服 kv=5 + 前馈 2.6/70」下测的，改前馈是未验证变量。
 
-- **IEEE Industrial Electronics Magazine 2020 / Loughborough 综述**：接触时环境阻尼
-  不足 → 力控在接触点振荡、被弹回、再接触，反复即 **hunting**；标准解法是插入
-  **速度反馈环**，并用阻抗控制按任务阶段调度刚度（自由空间高刚度、接触段低刚度）。
-  https://repository.lboro.ac.uk/articles/journal_contribution/Motion-control_techniques_of_today_and_tomorrow_A_review_and_discussion_of_the_challenges_of_controlled_motion/14047004/1/files/26506868.pdf
-- **Industrial Monitor Direct《Robot Force Mode Seating in CNC Chuck: Fixing Wobble》**：
-  Rx/Ry 柔顺且 TCP 在法兰（不在受力点）时，推力线横向偏移产生力矩，机器人倾斜去
-  归零力矩 → 零件边缘在孔内**来回摇摆**而非轴向推进；Z 推力太低推不动摩擦，
-  倾斜轴继续 hunting。解法：**TCP 移到接触点** + **锁住 Rx/Ry 倾转柔顺** +
-  提高 Z 推力 + **夹紧前留足 dwell 让料坐实**（clamping before the part has
-  slipped to full depth locks a proud part into the jaws）+ 夹爪要有让料微滑的 slack。
-  https://industrialmonitordirect.com/blogs/knowledgebase/why-does-the-robot-wobble-when-force-seating-a-part-in-a-chuck
-- **Stiffness Scheduling**：振荡是**欠阻尼**，先加微分/阻尼，不要加比例增益；
-  接触段关掉或钳制积分项防 windup；控制器须在一个控制周期内收敛。
-  https://lillytechsystems.com/ai-physical-ai/control-basics-for-ai/stiffness-scheduling.html
-- 学术侧主动柔顺 RCC：Mobedi et al., RO-MAN 2020,
-  DOI 10.1109/RO-MAN47096.2020.9223515，peg-in-hole 有间隙/角度偏差时在线调节
-  约束方向柔顺度。https://zenodo.org/record/4020930
+### ❌ 两条阴性（开关保留、默认关闭，别再重试）
 
-### C. 夹紧时料被推动 / 偏心放大（卡盘侧）
+1. **软爪受载自镗**（文献 C "Never bore jaws unloaded"）：
+   `SM_JAW_BORE_Q` 扫 -0.016/-0.0155/-0.015/-0.0145/-0.014/-0.0135 六档，
+   三爪咬合同轴始终 4.33~4.44 mm、夹紧瞬态 z 始终 +2.77~3.02 mm。
+   原因：力控执行器会自适应几何平移，镗爪位平移被补偿掉；现有圆弧软爪
+   三爪同步差只有 0.087 mm，没有可修的几何误差。
+2. **低压预夹 → 端面顶正 → 高压终夹**（`FEED_PRECLAMP=1`）：
+   `PRECLAMP_CTRL` 扫 -0.012/-0.015/-0.017/-0.020/-0.024，夹紧瞬态仍 +2.74~3.11 mm。
+   **决定性证据：`预夹贴料` 打印时同轴就已经 4.34 mm** —— 推挤发生在三爪
+   **第一次碰到料**那一刻，与压力/位移分段无关，所以所有分段方案都打不中。
+   -0.020/-0.024 只把最终同轴改善到 0.67/0.70 mm，代价是把"怼一下"提前；
+   -0.015 直接 FAIL（余量 3.29 mm），边界很敏感。
 
-- **Practical Machinist《3 jaw question for lathe》**：磨损卡盘会向外让、
-  **把料推离挡块**；爪尖碰到台阶圆角也会顶出。车间解法：橡胶锤轻敲、
-  **装在刀塔上的弹簧推料器在循环中把料重新顶正**（推着料 + M 代码触发卡盘动作）、
-  尾座顶紧两下、爪口做微锥度。
-  https://www.practicalmachinist.com/forum/threads/3-jaw-question-for-lathe.265817/
-- **MentorCNC 车床装夹教程**：软爪必须**在夹紧压力下自镗**（boring jaws under
-  load，用镗爪环/spider 预加载），"Never bore jaws unloaded"；未镗软爪是线接触，
-  卡盘 0.02–0.03 mm 跳动会放大到工件 0.1–0.2 mm。
-  https://www.mentorcnc.com/en/cnc-lathe-training-lesson-5/
-- **浮动动力卡盘专利 CN121535233A**：浮动桥自适应均衡各爪夹紧力，明确针对
-  「受力不均导致工件**变形或位移**」。https://eureka.patsnap.com/patent/CN121535233A
-- 长轴/悬伸必须支撑：中心架、跟刀架、尾座活顶尖、扇形爪/弹簧夹头（360° 接触）。
-  EVS 曲轴上下料案例也是「三爪夹一端 + 远端支撑」，且"让上料台决定位置，
-  机器人只重复抓取"。https://www.evsrobot.com/?p=7639
+### 诊断数据（用 `FEED_BORE_PROBE=1` 复现）
 
-## 本轮实测（代码里已留对照开关，默认关闭）
+夹紧稳定时三个滑座 `q=[-0.01448, -0.01441, -0.01439] m`，比设计镗爪位
+`-0.015` 还**外 0.52 mm**、同步差 0.087 mm。即爪还没收到位就靠偏心料先
+接触了某一爪 —— 这是"夹紧又动一下"的几何来源，但改镗爪位修不掉（见上）。
 
-按 A 实现 `FEED_HANDOVER_FIRST=1`：进给到位 → **夹爪先完全松开**（手臂原地、
-soft floating）→ 端面轴向弹簧定位（等效挡块+推料器）+ 径向弹性支撑（等效导套）
-→ 停留 dwell → 三爪闭合 → 撤支撑 → 退出。
+### 补充实验：渐变撤销径向支撑（有进展，但仍 FAIL）
 
-| 对照 | 夹爪先松时同轴 | 夹紧瞬态 | 结果 |
-|---|---|---|---|
-| 旧顺序（当前默认） | — | z +2.81 mm，y/z (+3.37,+2.81) | PASS，交接位移 4.99 mm |
-| 先松爪，无径向支撑 | 4.7~8.0 mm（料被弹走，**正是"往左上怼"**） | z −6.09 / +5.50 | FAIL |
-| 先松爪 + 径向支撑 k=200 | **0.00 mm** | z −4.07 | FAIL（余量 2.22） |
-| 先松爪 + 径向支撑 k=1000 | **0.00 mm** | z −4.66 | FAIL |
-| 先松爪 + 径向支撑 k=5000 | **0.00 mm** | z −0.42，交接位移 **3.30 mm** | 撤支撑后料飞了：10.27 mm / 13.3° |
+上一轮 `HANDOVER_FIRST + SEAT_RADIAL_K=5000` 的夹紧瞬态只有 z −0.42 mm
+（默认 +2.81），但一步撤销支撑会弹飞到 10.27 mm / 13.3°。新增
+`FEED_SEAT_FADE` 按 quintic 渐变卸载 400/800 步：
 
-**结论（重要）**：
-- "往左上怼"的根因已定位 = **夹爪张开瞬间料失去径向约束被弹开**。
-  加径向支撑后该瞬间同轴从 7.5 mm 变 **0.00 mm**，是文献 A/C 的直接验证。
-- 但**三爪闭合仍把料往下推约 4 mm**，撤销硬支撑还会弹飞 → 还缺真机的
-  **软爪受载自镗**和/或**低压预夹→高压终夹**（文献 C）。纯力控参数已到头，
-  别再扫 `FEED_CLAMP_FLOAT` / `SEAT_*` 增益。
+- FADE=400：弹飞消失（最终 2.38 mm）、交接位移 **3.00 mm**（默认 4.77）；
+  配合 KV=5 时三爪咬合 **0.63 mm**、夹紧瞬态 **z −0.19 mm** —— 过程姿态最好的一组。
+- 仍 FAIL：撤掉力等效支撑后，**25 mm 插入 / 55 mm 悬空**那一段自己跷起来
+  （原地松爪轴向偏 7.2°、最终倾斜 2.2°、余量 3.87 mm）。
+- **结论：缺的是实体导套/中心架几何（不可撤销的径向约束），不是可撤销的力。**
 
-## 已否掉，别再试
+### "吨吨吨"其它尝试（也否掉）
 
-夹紧力 150→300 N、卡爪相位 30/90/150/210、预收托圈、两段位移闭合、夹爪半开、
-纯柔顺增益扫描（本轮 6 组全 FAIL）、关重力对照（顶偏与重力无关）。
+`FEED_ARM_LEAD` 速度前馈、`FEED_ARM_DAMP` 速度误差阻尼 → 抖动反而略增、
+grasp_tilt 涨到 2.2~3.3°；`FEED_FLOAT_DAMP` 柔顺期阻尼 → 几乎无变化；
+`FEED_CONVERGE` 夹紧前收敛等待 → 等 32 步料就从 0.08 漂到 1.27 mm、
+交接位移 4.77→5.55。**有效的是全局阻尼档位，不是这些局部补偿。**
 
-## 下一步（按文献优先级，别自己扩）
+## 根因收敛（写死，别再发散）
 
-1. **软爪在受载状态下自镗**：`SM.JAW_ARC_Q0` / 圆弧半径按实际夹紧力下的爪面
-   位置标定，而不是理想 `SHAFT_D/2`。对应"夹紧又动一下"。
-2. **低压预夹 → 停留/顶正 → 高压终夹**两段**压力**（不是两段位移，之前试的
-   `CLAMP_TWOSTAGE` 是位移斜坡，已否掉），对应 Practical Machinist 的
-   "弹簧推料器 + M 代码重新顶正"。
-3. **实体径向导套几何**（不是力等效），撤掉时不会储能弹飞。
-4. "吨吨吨"单列处理：给位置伺服加阻尼/速度前馈、夹紧前保证伺服已收敛，
-   别再加比例增益。
+1. "往左上怼 / 夹紧又动" = 三爪**首次接触**就把料从同轴 0.08 mm 推到
+   4.3~4.5 mm。已排除：夹紧力 150→300 N、卡爪相位、丝杆联动、软爪几何、
+   预收托圈、两段位移闭合、夹爪半开、受载自镗、分段压力、关重力（顶偏照旧）。
+2. "放掉料自己偏 / 下沉又回来" = 悬空段没有实体径向支撑，力等效支撑一撤就跷。
+3. "吨吨吨" = 伺服欠阻尼 hunting → **本轮已解决**。
+
+## 下一步（只剩这一条，别自己扩）
+
+**实体托料导套几何**：在卡爪口外加一个不撤销的下半圆/整圆导套，给 55 mm
+悬空段真实径向约束；配合 `FEED_HANDOVER_FIRST=1 + FEED_SEAT_RADIAL_K=5000
++ FEED_SEAT_FADE=400` 那组过程姿态最好的交接顺序。
+或者加大插入深度（之前 35/45/55 mm 因机械臂够不到 FAIL，需先改工位/夹爪站位）。
 
 ## 怎么复现
 
 ```bash
-python verify_all.py                                  # 默认路径 9/9
-python src/diag_feed_chuck.py --v-jaw --lift --no-lock
-FEED_HANDOVER_FIRST=1 FEED_SEAT_RADIAL_K=200 python src/diag_feed_chuck.py --v-jaw --lift --no-lock
+python verify_all.py                                  # 9/9
+python src/diag_feed_chuck.py --v-jaw --lift --no-lock   # 默认路径，看抖动/同轴
+FEED_BORE_PROBE=1 python src/diag_feed_chuck.py --v-jaw --lift --no-lock
+SM_JAW_BORE_Q=-0.0145 python src/diag_feed_chuck.py --v-jaw --lift --no-lock
+FEED_PRECLAMP=1 FEED_PRECLAMP_CTRL=-0.020 python src/diag_feed_chuck.py --v-jaw --lift --no-lock
+FEED_HANDOVER_FIRST=1 FEED_SEAT_RADIAL_K=5000 FEED_SEAT_FADE=400 \
+  python src/diag_feed_chuck.py --v-jaw --lift --no-lock
 ```
 
-看 `夹紧前`、`夹爪先松`、`三爪咬合`、`夹紧瞬态`、`交接位移`、
-`FEED_METRIC`、`FEED_METRIC_HANDOVER`、`FEED_METRIC_MACHINING`。
+看 `夹紧前`、`夹爪先松`、`预夹贴料`、`三爪咬合`、`夹紧瞬态`、`受载爪位`、
+`撤销导套`、`交接位移`、`末端抖动幅度`、`分段起步/静止`、`FEED_METRIC*`。
+
+## 文献 / 论坛出处
+
+- A 交接期较劲：机械社区《关于机床上下料的问题》
+  http://mp.weixin.qq.com/s?__biz=MzA5ODYyNjQxMQ==&mid=2668557070&idx=1&sn=f3038a239ac8e6dec9a446925814f347
+  FANUC 软浮动专利 DE69837741T2 https://patents.google.com/patent/DE69837741T2/en
+  EVST《Robot Lathe Tending: Chuck Handoff and Interlocks》
+  https://www.evsint.com/robot-lathe-tending-chuck-handoff-interlocks/
+- B hunting / 欠阻尼：Loughborough 综述
+  https://repository.lboro.ac.uk/articles/journal_contribution/Motion-control_techniques_of_today_and_tomorrow_A_review_and_discussion_of_the_challenges_of_controlled_motion/14047004/1/files/26506868.pdf
+  Industrial Monitor Direct《Robot Force Mode Seating in CNC Chuck: Fixing Wobble》
+  https://industrialmonitordirect.com/blogs/knowledgebase/why-does-the-robot-wobble-when-force-seating-a-part-in-a-chuck
+- C 卡盘侧：Practical Machinist《3 jaw question for lathe》
+  https://www.practicalmachinist.com/forum/threads/3-jaw-question-for-lathe.265817/
+  MentorCNC 软爪受载自镗 https://www.mentorcnc.com/en/cnc-lathe-training-lesson-5/
+  浮动动力卡盘专利 CN121535233A https://eureka.patsnap.com/patent/CN121535233A
 
 ## 同步状态
 
-默认行为未变，`verify_all.py` 9/9。推送需用会话代理端口：
+`verify_all.py` **9/9 通过**。默认行为已改（送料场景阻尼 5.0），其它实验
+开关默认全关闭。推送需用会话代理端口，全局配置里的 7897 是坏的：
 `git -c http.proxy=$HTTP_PROXY -c https.proxy=$HTTPS_PROXY push origin main`
-（全局配置里写死的 7897 是坏的）。
