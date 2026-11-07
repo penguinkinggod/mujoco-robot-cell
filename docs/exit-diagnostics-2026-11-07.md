@@ -67,4 +67,4 @@ $env:FEED_INSERT_MM = "8"   # 或 10
 
 当前默认退出路径不改。8 mm 不能写成通过，也不能仅凭这三组对照宣布“轴向退出就是根因”。10 mm 仍是本轮固定初态和当前判据下的最浅通过档位。
 
-P1.2 状态转换验收已完成，结果见 [p1.2-state-transitions-2026-11-07.md](p1.2-state-transitions-2026-11-07.md)。下一张卡为 **P1.3：失败标签与有效性分层**；暂不做扰动批量扫描、夹具搜索或 AI 训练。
+P1.2 状态转换和 P1.3 结果分类均已完成，记录见 [p1.2-state-transitions-2026-11-07.md](p1.2-state-transitions-2026-11-07.md) 与 [p1.3-validity-and-outcomes-2026-11-07.md](p1.3-validity-and-outcomes-2026-11-07.md)。下一张卡为 **P1.4：故障检测验证**；暂不做扰动批量扫描、夹具搜索或 AI 训练。

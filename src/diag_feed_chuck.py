@@ -104,6 +104,40 @@ def _finite_sim_state(qpos, qvel, ctrl, qacc, qfrc_applied,
         qpos, qvel, ctrl, qacc, qfrc_applied, xfrc_applied))
 
 
+def _case_classification(execution_status, evaluation_scope, hard_pass,
+                         quality_pass, overall_pass):
+    """Separate trial usability and evaluation scope from measured outcome."""
+    trial_data_valid = execution_status in ("completed", "aborted")
+    primary_trial = evaluation_scope == "primary_physics_feed"
+    if execution_status == "error":
+        outcome_class = "runtime_error"
+    elif execution_status == "aborted":
+        outcome_class = "aborted"
+    elif not primary_trial:
+        prefix = ("reference" if evaluation_scope
+                  == "kinematic_lock_reference" else "diagnostic")
+        outcome_class = "%s_%s" % (
+            prefix, "pass" if overall_pass else "fail")
+    elif not hard_pass:
+        outcome_class = "hard_fail"
+    elif not quality_pass:
+        outcome_class = "quality_fail"
+    elif overall_pass:
+        outcome_class = "physical_success"
+    else:
+        outcome_class = "criteria_fail"
+    return {
+        "evaluation_scope": evaluation_scope,
+        "trial_data_valid": trial_data_valid,
+        "include_in_primary_trial_stats": (
+            primary_trial and trial_data_valid),
+        "physical_task_success": (
+            primary_trial and execution_status == "completed"
+            and bool(overall_pass)),
+        "outcome_class": outcome_class,
+    }
+
+
 COAX_LIMIT = 2.0       # mm
 TILT_LIMIT = 10.0      # deg
 CONTACT_MIN = 6
@@ -885,6 +919,17 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     # 新交接行为（去托力、锚定、托架）只给真实交接路径；历史基线与官方
     # env 场景保持旧行为，作为独立对照。
     _lift = CLAMP_LIFT if tuned else 1.0
+    no_retreat_diagnostic = (
+        os.environ.get("FEED_DIAG_NO_RETREAT") == "1")
+    diagnostic_mode = (
+        "stationary_after_release" if no_retreat_diagnostic
+        else "no_axial_retreat" if not RETREAT_AXIAL else "standard")
+    primary_protocol = (
+        tuned and machine_solid and diagnostic_mode == "standard")
+    evaluation_scope = (
+        "primary_physics_feed" if primary_protocol
+        else "kinematic_lock_reference" if carry_lock
+        else "diagnostic_configuration")
 
     def close_bushing():
         """中心架在棒料送到位后闭合，之后一路不再打开。
@@ -1120,8 +1165,6 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             model.actuator_gainprm[a, 0] = _KP0[k] * scale
             model.actuator_biasprm[a, 1] = -_KP0[k] * scale
 
-    no_retreat_diagnostic = (
-        os.environ.get("FEED_DIAG_NO_RETREAT") == "1")
     state = {"offset": None, "off_site": None, "abs_pos": None,
              "lock_active": True, "axis_hold": False,
              "stage_records": [], "case_id": case_id,
@@ -1139,13 +1182,10 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                  "v_jaw": bool(v_jaw), "lift": bool(lift),
                  "carry_lock": bool(carry_lock),
                  "machine_solid": bool(machine_solid),
+                 "evaluation_scope": evaluation_scope,
                  "retreat_axial": bool(
                      RETREAT_AXIAL and not no_retreat_diagnostic),
-                 "diagnostic_mode": (
-                     "stationary_after_release"
-                     if no_retreat_diagnostic
-                     else "no_axial_retreat"
-                     if not RETREAT_AXIAL else "standard"),
+                 "diagnostic_mode": diagnostic_mode,
              }}
 
     robot_machine_peaks = {}
@@ -1169,8 +1209,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                     data.qfrc_applied, data.xfrc_applied)):
             return
         print("FEED_ABORT stage=%s reason=non_finite_state" % label)
-        write_result_json({
-            "schema_version": 2,
+        result = {
+            "schema_version": 3,
             "case_id": state["case_id"],
             "random_seed": state["random_seed"],
             "created_at_unix": time.time(),
@@ -1192,7 +1232,12 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             "ik_solver": state.get("ik_solver", []),
             "ik_residuals_mm": state.get("ik_residuals_mm", {}),
             "stages": state.get("stage_records", []),
-        })
+        }
+        result.update(_case_classification(
+            result["execution_status"], evaluation_scope,
+            result["hard_pass"], result["quality_pass"],
+            result["overall_pass"]))
+        write_result_json(result)
         raise FloatingPointError(
             "non-finite simulation state at stage %s" % label)
 
@@ -1916,7 +1961,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         print("FEED_ABORT stage=grasp reason=no_v_jaw_contact; "
               "搬运和卡盘闭合已取消")
         result = {
-            "schema_version": 2,
+            "schema_version": 3,
             "case_id": state["case_id"],
             "random_seed": state["random_seed"],
             "created_at_unix": time.time(),
@@ -1962,6 +2007,10 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             "ik_residuals_mm": state.get("ik_residuals_mm", {}),
             "stages": state.get("stage_records", []),
         }
+        result.update(_case_classification(
+            result["execution_status"], evaluation_scope,
+            result["hard_pass"], result["quality_pass"],
+            result["overall_pass"]))
         write_result_json(result)
         return 1
     record_stage("grasp_complete")
@@ -2774,7 +2823,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     print("OK")
 
     result = {
-        "schema_version": 2,
+        "schema_version": 3,
         "case_id": state["case_id"],
         "random_seed": state["random_seed"],
         "created_at_unix": time.time(),
@@ -2812,6 +2861,10 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         "ik_residuals_mm": state.get("ik_residuals_mm", {}),
         "stages": state.get("stage_records", []),
     }
+    result.update(_case_classification(
+        result["execution_status"], evaluation_scope,
+        result["hard_pass"], result["quality_pass"],
+        result["overall_pass"]))
     write_result_json(result)
     return 0 if ok else 1
 

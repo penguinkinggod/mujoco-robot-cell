@@ -59,11 +59,25 @@
 
 ## 汇总判定规则
 
-1. 先判断 case 是否有效：输入和仿真状态完整、抓取成立、未发生任务禁止的异常。
-2. 再对有效 case 评估姿态和质量指标。
-3. 报告至少包含各指标原始值、`metric_schema_version`、`criterion_set_id`、控制模式、工件与夹具参数、代码版本。
-4. 总体 PASS 不得隐藏失败阶段；至少报告硬失败标签和未通过的质量指标。
-5. 批量实验报告成功分子/分母、失败类别、分布和最差 case；不要只给平均值。
+先分清三个问题，不要用一个“有效/无效”全包：
+
+1. `trial_data_valid`：这次仿真是否留下可解释的尝试记录。正常完成或按预期抓空后中止，都算可用试验记录；NaN 等运行错误不算有效尝试结果。抓空没有后续卡盘质量指标，相关指标应为空，不能补零。
+2. `evaluation_scope`：这条记录属于主全物理送料、带运动学锁的历史参考，还是其他诊断配置。只有声明的主实验配置进入主实验统计；其他配置可以报告，但不混入同一个成功率。
+3. `outcome_class` 与原判据：可用的主实验尝试再分成功、硬失败、质量失败或中止。`hard_pass`、`quality_pass`、`overall_pass` 仍保留原含义，不能因新增标签而重算或覆盖。
+
+P1.3 的机读字段写在 case JSON 顶层，`schema_version=3`：
+
+| 字段 | 解释 |
+|---|---|
+| `evaluation_scope` | `primary_physics_feed`、`kinematic_lock_reference` 或 `diagnostic_configuration` |
+| `trial_data_valid` | 完成或受控中止的仿真记录为 true；数值运行错误为 false |
+| `include_in_primary_trial_stats` | 是否进入主物理送料统计；可用的 ABORT 也计入尝试次数和失败数 |
+| `physical_task_success` | 只有主实验配置完整完成且原 `overall_pass` 为 true 才为 true |
+| `outcome_class` | `physical_success`、`hard_fail`、`quality_fail`、`aborted`、`runtime_error`、`reference_pass/fail`、`diagnostic_pass/fail` 或 `missing_result` |
+
+运行错误与子进程无 JSON 结果均单独报告，不算物理成功，也不静默当成物理失败。带锁对照即使 `overall_pass=true`，也只能标为 `reference_pass`，不得计入主实验成功率。
+
+正式报告至少包含各指标原始值、`metric_schema_version`、`criterion_set_id`、控制模式、工件与夹具参数、代码版本、评价范围、数据有效性和结果类别。总体 PASS 不得隐藏失败阶段；批量统计报告成功分子/分母、失败类别、运行错误数量、分布和最差 case，不要只给平均值。
 
 ## 修改判据的记录模板
 

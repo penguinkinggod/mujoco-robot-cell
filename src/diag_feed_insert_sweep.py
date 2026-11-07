@@ -57,6 +57,11 @@ def run_case(insert_mm, json_path, case_id=None, dy_mm=0.0, dz_mm=0.0,
         "roll_deg": roll_deg,
         "status": "ERROR",
         "execution_status": "",
+        "evaluation_scope": "",
+        "trial_data_valid": "",
+        "include_in_primary_trial_stats": "",
+        "physical_task_success": "",
+        "outcome_class": "missing_result",
         "diagnostic_mode": "",
         "abort_stage": "",
         "hard_pass": "",
@@ -92,6 +97,13 @@ def run_case(insert_mm, json_path, case_id=None, dy_mm=0.0, dz_mm=0.0,
         if execution_status == "error":
             row.update({
                 "execution_status": execution_status,
+                "evaluation_scope": result.get("evaluation_scope", ""),
+                "trial_data_valid": result.get("trial_data_valid", False),
+                "include_in_primary_trial_stats": result.get(
+                    "include_in_primary_trial_stats", False),
+                "physical_task_success": result.get(
+                    "physical_task_success", False),
+                "outcome_class": result.get("outcome_class", "runtime_error"),
                 "diagnostic_mode": result.get("config", {}).get(
                     "diagnostic_mode", ""),
                 "abort_stage": result.get("abort_stage", ""),
@@ -104,6 +116,13 @@ def run_case(insert_mm, json_path, case_id=None, dy_mm=0.0, dz_mm=0.0,
                 "ABORT" if execution_status == "aborted"
                 else "PASS" if result["overall_pass"] else "FAIL"),
             "execution_status": execution_status,
+            "evaluation_scope": result.get("evaluation_scope", ""),
+            "trial_data_valid": result.get("trial_data_valid", ""),
+            "include_in_primary_trial_stats": result.get(
+                "include_in_primary_trial_stats", ""),
+            "physical_task_success": result.get(
+                "physical_task_success", ""),
+            "outcome_class": result.get("outcome_class", ""),
             "diagnostic_mode": result.get("config", {}).get(
                 "diagnostic_mode", ""),
             "abort_stage": result.get("abort_stage", ""),
@@ -131,6 +150,12 @@ def run_case(insert_mm, json_path, case_id=None, dy_mm=0.0, dz_mm=0.0,
         })
     else:
         row["error"] = output[-1200:].strip()
+        row.update({
+            "execution_status": "missing",
+            "trial_data_valid": False,
+            "include_in_primary_trial_stats": False,
+            "physical_task_success": False,
+        })
     return row
 
 
