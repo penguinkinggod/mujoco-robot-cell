@@ -84,6 +84,16 @@ CT_STATIC = (4, 3)
 #   vs 工件   (2,3):  ca=1 & ct=2 = 0, ca=3 & ct=8 = 0  -> 不碰
 # 工件仍然不碰盘面，才能沿轴线进给到卡爪里；机器人碰，才不能穿模。
 CT_MACHINE = (8, 1)
+# Feed-scene robot shell mask: it receives machine/static contacts via bits
+# 8/4, but does not receive the workpiece bit 2. The feed scene has no
+# separate fixture, and only fingertip pads / added V blades use CT_ROBOT to
+# touch the rod. Applied only when with_lathe=True so other demos keep their
+# original collision behavior.
+CT_ROBOT_SHELL = (8, 12)
+ROBOT_BODY_NAMES = {
+    "base", "shoulder", "upper_arm", "lower_arm", "wrist", "gripper",
+    "moving_jaw_so101_v1",
+}
 
 # ---- workpiece: D-shaft 20 x 80 mm with a milled flat so it will not roll
 SHAFT_D = 0.020
@@ -469,16 +479,27 @@ def build_scene(shaft_mass=None, with_lathe=False, lathe_origin=None,
         print("    shaft_flat: omitted -> PLAIN CYLINDER D%.0f"
               % (SHAFT_D * 1000))
 
-    # ---- gripper pad collision mask ----
+    # ---- robot collision masks ----
+    # The stock collision meshes default to (1, 1), which also makes the
+    # wrist/motor shells collide with the free workpiece (2, 3). Keep those
+    # shells solid against the machine, but reserve workpiece contact for the
+    # pads and explicitly added grasp geometry.
     npad = 0
+    nshell = 0
     for body in spec.bodies:
         for gg in body.geoms:
             if gg.name and "pad" in gg.name:
                 gg.contype = CT_ROBOT[0]
                 gg.conaffinity = CT_ROBOT[1]
                 npad += 1
-    print("    normalized %d gripper pads to (%d, %d)"
-          % (npad, CT_ROBOT[0], CT_ROBOT[1]))
+                continue
+            if (with_lathe and body.name in ROBOT_BODY_NAMES
+                    and gg.group == 3):
+                gg.contype = CT_ROBOT_SHELL[0]
+                gg.conaffinity = CT_ROBOT_SHELL[1]
+                nshell += 1
+    print("    normalized %d pads to %s and %d robot shell geoms to %s"
+          % (npad, CT_ROBOT, nshell, CT_ROBOT_SHELL))
 
     if with_lathe:
         # Bolt the lathe on as a workstation. Default OFF: demo_08 /

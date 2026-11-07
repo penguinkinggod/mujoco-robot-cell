@@ -786,7 +786,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             for a, v in zip(arm.qadr, q):
                 data.ctrl[a] = v
             gcmd = grip if grip_end is None else grip + s * (grip_end - grip)
-            data.ctrl[arm.grip_act] = gcmd
+            data.ctrl[arm.grip_act] = grip_cmd(gcmd)
             data.ctrl[jaw_act] = jaw_ctrl
             mujoco.mj_step(model, data)
             state.setdefault("traj", []).append(
@@ -819,7 +819,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         for j in range(settle_steps):
             for a, v in zip(arm.qadr, q_goal):
                 data.ctrl[a] = v
-            data.ctrl[arm.grip_act] = final_grip
+            data.ctrl[arm.grip_act] = grip_cmd(final_grip)
             data.ctrl[jaw_act] = jaw_ctrl
             mujoco.mj_step(model, data)
             state.setdefault("traj", []).append(
@@ -928,8 +928,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         if DEBUG_MOVE:
             # 正负号变化 = 闭环在目标两侧来回；单调下降 = 只是慢。
             sign_flips = sum(
-                1 for a, b in zip(trace, trace[1:])
-                if (a - err) * (b - err) < 0)
+                1 for a, b, c in zip(trace, trace[1:], trace[2:])
+                if (b - a) * (c - b) < 0)
             print("    err[%-4s] %s mm  轮数=%d 过冲=%d"
                   % (label, " ".join("%.1f" % (e * 1000) for e in trace),
                      len(trace) - 1, sign_flips))
@@ -1056,18 +1056,20 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                      worst * 1000))
         return float(np.linalg.norm(arm.pad_center() - np.asarray(targets[-1])))
 
+    def grip_direct(value):
+        """Write an explicitly planned per-step gripper trajectory and sync its cache."""
+        value = float(value)
+        data.ctrl[arm.grip_act] = value
+        state["grip_now"] = value
+        state["grip_tgt"] = value
+        state["grip_from"] = value
+        state["grip_k"] = 0
+        return value
+
     def grip_cmd(target):
-        """夹爪指令走线性斜坡，不一步跳过去。
-
-        张开 0.50、闭合 -0.10（V 槽爪），一步写完等于 0.6 m 的阶跃：
-        手指以最大速度撞上工件，实测工件被撞跳 2.31 mm —— 就是「夹住
-        那一下抖一下」。按步插值后，接触时手指速度已经降下来。
-
-        内部自己数步：目标一变就重置斜坡起点，所以调用处不用管循环
-        索引，也不会因为换一段就重新慢慢爬。
-        """
+        """Move the gripper command toward a fixed target without a step jump."""
         tgt = float(target)
-        cur = float(state.get("grip_now", data.ctrl[arm.grip_act]))
+        cur = float(data.ctrl[arm.grip_act])
         if abs(tgt - state.get("grip_tgt", 1e9)) > 1e-9:
             state["grip_tgt"] = tgt
             state["grip_from"] = cur
@@ -1101,7 +1103,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     mujoco.mj_resetData(model, data)
     data.qpos[arm.qadr[4]] = wrist
     data.ctrl[4] = wrist
-    data.ctrl[arm.grip_act] = GRIP_OPEN
+    grip_direct(GRIP_OPEN)
     data.ctrl[jaw_act] = SM.CHUCK_OPEN_CTRL
     for _ in range(600):
         for k in range(5):
@@ -1129,16 +1131,41 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     print()
 
     # ---------------- real-physics grasp ----------------
+    # A vertical drop makes the first V-blade edge hit the rod before the
+    # groove is underneath it.  That contact pushed the free rod 6.97 mm.
+    # Enter through the actual mouth direction instead: the direction is
+    # measured from the two V-jaw mouth centres at the approach pose, with
+    # the rod-axis component removed.  This keeps the change local to pickup
+    # and avoids hard-coding a world Y/Z direction for a calibrated wrist.
     pick = [
         ("接近", [pick_at[0], pick_at[1], pick_at[2] + R + 0.075],
          GRIP_OPEN, 550),
+    ]
+    if v_jaw:
+        pick.append(("侧向进入", None, GRIP_OPEN, 400))
+    pick.extend([
         ("下降", [pick_at[0], pick_at[1], pick_at[2] + 0.002],
          GRIP_OPEN, 400),
         ("夹紧", [pick_at[0], pick_at[1], pick_at[2] + 0.002],
          grip_close, 320),
-    ]
+    ])
     grasp_tilt = None
     for name, tgt, grip, ns in pick:
+        if name == "侧向进入":
+            fixed = [mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_GEOM,
+                "fixed_jaw_pad_v%d" % k) for k in (1, 2)]
+            moving = [mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_GEOM,
+                "moving_jaw_pad_v%d" % k) for k in (1, 2)]
+            entry_axis = (np.mean(data.geom_xpos[moving], axis=0)
+                          - np.mean(data.geom_xpos[fixed], axis=0))
+            rod = rod_axis()
+            entry_axis -= np.dot(entry_axis, rod) * rod
+            entry_axis /= max(float(np.linalg.norm(entry_axis)), 1e-12)
+            tgt = pick_at - 0.020 * entry_axis
+            print("  抓取接近轴  fixed->moving=%s  进入目标=%s"
+                  % (np.round(entry_axis, 4), np.round(tgt, 4)))
         move3(np.array(tgt), ns, grip, False, label=name)
         grasp_tilt = tilt_deg(data.qpos[sq + 3:sq + 7])
         print("  %-6s 轴=%s 轴向偏=%5.1f deg  pad-轴=%5.1f mm"
@@ -1146,9 +1173,10 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                  np.linalg.norm(arm.pad_center() - shaft()) * 1000))
         if name == "夹紧":
             state["offset"] = arm.pad_center() - shaft()
-        tick("② 接近｜下降中" if name == "接近" else
-             "③ 下降｜pad 到轴心" if name == "下降" else
-             "④ 夹紧｜真实抓取（轴会歪）")
+        tick({"接近": "② 接近｜到槽口外侧",
+              "侧向进入": "③ 侧向进入｜沿 V 槽开口",
+              "下降": "④ 下降｜pad 到轴心",
+              "夹紧": "⑤ 夹紧｜真实抓取（轴会歪）"}[name])
     # 夹爪是斜坡闭合（GRIP_RAMP 步），"夹紧"那段 320 步走完时它还没合到
     # 位。一抬臂，工件就从 V 槽里滑出去：实测全物理路径同轴 250 mm、倾斜
     # 133 deg、接触 0，就是这里漏了一段保持。先让爪子合完再搬。
@@ -1297,7 +1325,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             data.ctrl[jaw_act] = (SM.CHUCK_OPEN_CTRL
                                   + s * (SM.CHUCK_CLAMP_CTRL
                                          - SM.CHUCK_OPEN_CTRL))
-            data.ctrl[arm.grip_act] = GRIP_OPEN
+            data.ctrl[arm.grip_act] = grip_cmd(GRIP_OPEN)
             mujoco.mj_step(model, data)
             state.setdefault("traj", []).append(
                 data.site_xpos[arm.site].copy())
@@ -1320,13 +1348,27 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         # 跳到 -400 N，卡爪在单步内就得到上万 m/s^2（实测 QACC 溢出、
         # 工件被弹到 1 m 外）。真机也是转丝杠慢慢加力的，这里用 0.6 s
         # 斜坡从张开推力平滑拧到夹紧力。
+        # 进给刚结束时棒料仍有约 5 mm/s 的竖直速度。若立刻闭合三爪，
+        # 卡爪先在空气中追随下沉，随后接触又把棒料弹回；夹紧前停 0.2 s
+        # 让位置伺服和棒料先稳定。测量：闭爪阶段向下峰值 1.28 -> 0.08 mm。
+        settle(100, SM.CHUCK_OPEN_CTRL, grip_close)
+        # Record the transient at the actual clamp hand-over. The final
+        # gravity-slip metric below starts much later, after release/retreat
+        # and settling, so it cannot expose the visible motion while the jaws
+        # are centring the rod.
+        clamp_p0 = shaft().copy()
+        clamp_z_min = clamp_p0[2]
+        clamp_z_max = clamp_p0[2]
         jaw_from = SM.CHUCK_OPEN_CTRL
         for i in range(500):
             t = (i + 1) / 500.0
             s = t * t * (3.0 - 2.0 * t)
             data.ctrl[jaw_act] = jaw_from + s * (SM.CHUCK_CLAMP_CTRL - jaw_from)
-            data.ctrl[arm.grip_act] = grip_close
+            data.ctrl[arm.grip_act] = grip_cmd(grip_close)
             mujoco.mj_step(model, data)
+            clamp_p = shaft()
+            clamp_z_min = min(clamp_z_min, float(clamp_p[2]))
+            clamp_z_max = max(clamp_z_max, float(clamp_p[2]))
             state.setdefault("traj", []).append(
                 data.site_xpos[arm.site].copy())
             state.setdefault("traj_label", []).append(state.get("label", "?"))
@@ -1334,10 +1376,32 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             track_pen("三爪拧紧")
             if frame_hook is not None and i % FRAME_EVERY == 0:
                 tick()
-        settle(300, SM.CHUCK_CLAMP_CTRL, grip_close, locked=False)
+        # Keep the same 300-step post-clamp hold as settle(), but sample the
+        # workpiece each step so a brief drop-and-rebound cannot be hidden by
+        # the later gravity-slip measurement.
+        for _ in range(300):
+            data.ctrl[jaw_act] = SM.CHUCK_CLAMP_CTRL
+            data.ctrl[arm.grip_act] = grip_cmd(grip_close)
+            mujoco.mj_step(model, data)
+            clamp_p = shaft()
+            clamp_z_min = min(clamp_z_min, float(clamp_p[2]))
+            clamp_z_max = max(clamp_z_max, float(clamp_p[2]))
+            state.setdefault("traj", []).append(
+                data.site_xpos[arm.site].copy())
+            state.setdefault("traj_label", []).append("三爪稳定")
+            state.setdefault("traj_t", []).append(float(data.time))
+            track_pen("三爪稳定")
+        clamp_p = shaft()
         nc, fN = jaw_state()
         print("  三爪咬合     轴=%s 同轴=%5.2f mm 接触=%d 力=%.1f N"
               % (np.round(shaft(), 4), coax(), nc, fN))
+        print("  夹紧瞬态     z变化=%+.2f mm  峰值范围=[%+.2f, %+.2f] mm  "
+              "y/z终点偏移=(%+.2f,%+.2f) mm"
+              % ((clamp_p[2] - clamp_p0[2]) * 1000,
+                 (clamp_z_min - clamp_p0[2]) * 1000,
+                 (clamp_z_max - clamp_p0[2]) * 1000,
+                 (clamp_p[1] - clamp_p0[1]) * 1000,
+                 (clamp_p[2] - clamp_p0[2]) * 1000))
         # 三爪夹住之后，机械臂先【原地】松开夹爪，等 V 槽刀片完全脱离，
         # 再移走。边松边退会让还没脱离的刀片横向刮着棒料，把工件从卡爪
         # 里带出去（实测同轴 1.6 mm -> 283 mm，工件直接被带飞）。
@@ -1345,7 +1409,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             t = (i + 1) / 360
             s = t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
             data.ctrl[jaw_act] = SM.CHUCK_CLAMP_CTRL
-            data.ctrl[arm.grip_act] = grip_close + s * (GRIP_OPEN - grip_close)
+            grip_direct(grip_close + s * (GRIP_OPEN - grip_close))
             mujoco.mj_step(model, data)
             state.setdefault("traj", []).append(
                 data.site_xpos[arm.site].copy())
@@ -1355,13 +1419,18 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             if frame_hook is not None and i % FRAME_EVERY == 0:
                 tick()
         settle(120, SM.CHUCK_CLAMP_CTRL, GRIP_OPEN)
-        print("  原地松爪     同轴=%5.2f mm 轴向偏=%4.1f deg 接触=%d"
-              % (coax(), axdev(), jaw_state()[0]))
+        release_p = shaft()
+        print("  原地松爪     同轴=%5.2f mm 轴向偏=%4.1f deg 接触=%d "
+              "相对夹紧终点 dz=%+.2f mm"
+              % (coax(), axdev(), jaw_state()[0],
+                 (release_p[2] - clamp_p[2]) * 1000))
         rerr = move(pad_target(retreat), 700, GRIP_OPEN, False,
                     SM.CHUCK_CLAMP_CTRL)
+        retreat_p = shaft()
         print("  松手退出     IK残差=%5.1f mm 同轴=%5.2f mm "
-              "轴向偏=%4.1f deg 接触=%d"
-              % (rerr * 1000, coax(), axdev(), jaw_state()[0]))
+              "轴向偏=%4.1f deg 接触=%d 相对原地松爪 dz=%+.2f mm"
+              % (rerr * 1000, coax(), axdev(), jaw_state()[0],
+                 (retreat_p[2] - release_p[2]) * 1000))
     tick("⑩ 三爪夹紧｜单丝杠联动")
 
     # Hand the shaft back to PHYSICS before any load test.
