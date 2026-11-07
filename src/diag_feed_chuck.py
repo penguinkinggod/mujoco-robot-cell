@@ -152,6 +152,15 @@ GRIP_STATION = -float(os.environ.get("FEED_GRIP_STATION_MM", "5")) / 1000.0
 # 松爪退出分两段：先沿轴线退到料尾之外，再侧向撤离。斜着一把撤时张开
 # 的刀片会横刮还没脱离的料尾，把刚定好心的料带歪。
 RETREAT_AXIAL = os.environ.get("FEED_RETREAT_AXIAL", "1") == "1"
+# 进给到位后把料轴调平（见 level_rod()）。默认开：不调平时料"尾端翘起"
+# 约 1.2°，80 mm 料两端高差 1.7 mm，肉眼一眼看得出来。
+LEVEL_ROD = os.environ.get("FEED_LEVEL_ROD", "0") == "1"
+# 进给轴目标的前倾补偿（度）。舵机软，目标是水平时实际会低约 1°，80 mm
+# 料两端差 1.7 mm，肉眼就是"尾端翘着"。把 IK 目标轴预先抬高同样的角度，
+# 末端实际才落平。只改机器人目标姿态，不给料加外力。
+AXIS_LEAD_DEG = float(os.environ.get("FEED_AXIS_LEAD_DEG", "1.0"))
+_AXIS_TGT = np.array([np.cos(np.radians(AXIS_LEAD_DEG)), 0.0,
+                      np.sin(np.radians(AXIS_LEAD_DEG))])
 
 
 def tilt_deg(quat):
@@ -948,6 +957,17 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         ax = data.xmat[shaft_body].reshape(3, 3)[:, 2]
         return float(np.degrees(np.arccos(min(1.0, abs(float(ax[0]))))))
 
+    def rod_pitch():
+        """带符号的轴线仰角：正 = 头端（+x，插卡盘那头）比尾端高。
+
+        axdev() 只给绝对值，看不出"翘向哪头"。验收看姿态时必须带符号，
+        否则料是头端上翘还是尾端上翘分不清。
+        """
+        a = data.xmat[shaft_body].reshape(3, 3)[:, 2].astype(float)
+        if a[0] < 0:
+            a = -a
+        return float(np.degrees(np.arctan2(a[2], max(1e-9, abs(a[0])))))
+
     def jaw_state():
         contacts, force = 0, 0.0
         for i in range(data.ncon):
@@ -1102,7 +1122,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             for frac in grid[1:]:
                 p = site_start + frac * (site_target - site_start)
                 q_prev, pe, ae = arm.ik_axis(
-                    p, np.array([1.0, 0.0, 0.0]), a_local,
+                    p, _AXIS_TGT, a_local,
                     q_init=q_prev, iters=240)
                 last_ik = (pe, ae)
                 pts.append(q_prev.copy())
@@ -1370,7 +1390,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             # 机械臂自己折起来（同轴 32 mm、接触 0）。
             if state["axis_hold"]:
                 q_sol, pe, _ae = arm.ik_axis(
-                    p, np.array([1.0, 0.0, 0.0]), a_local,
+                    p, _AXIS_TGT, a_local,
                     q_init=q_start, iters=300)
             else:
                 q_sol, pe = arm.ik(p, lock_wrist_roll=wrist)
@@ -1806,13 +1826,53 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         # 已否掉、别再重试：预收托圈、换卡爪相位、抬夹紧力、两段闭合、
         # 夹爪半开。详见 CURRENT.md。
         if tuned:
+            # 料"尾端翘起"不是 geometry 问题，是舵机太软：同样的目标姿态，
+            # 挂上 80 mm 料后实际会低约 1°（两端高差 1.7 mm）。这里按实测
+            # 仰角做积分补偿——把 IK 目标过冲同样的角度，让实际落到水平。
+            # 只改机器人关节目标，不给料加任何外力（棒料 qfrc 仍为 0）。
+            def level_rod(iters=4, ns=160):
+                trail, comp = [], 0.0
+                for _ in range(iters):
+                    pitch = rod_pitch()
+                    trail.append(pitch)
+                    if abs(pitch) < 0.12:
+                        break
+                    comp += -pitch
+                    th = np.radians(comp)
+                    tgt = np.array([np.cos(th), 0.0, np.sin(th)])
+                    R_site = data.site_xmat[arm.site].reshape(3, 3)
+                    a_local = R_site.T @ rod_axis()
+                    q_now = np.array([data.qpos[a] for a in arm.qadr])
+                    q_goal, _pe, _ae = arm.ik_axis(
+                        data.site_xpos[arm.site].copy(), tgt, a_local,
+                        q_init=q_now, iters=400)
+                    for i in range(ns):
+                        f = (i + 1) / float(ns)
+                        s = f * f * (3.0 - 2.0 * f)
+                        for k, a in enumerate(arm.qadr):
+                            data.ctrl[a] = (q_now[k]
+                                            + s * (q_goal[k] - q_now[k]))
+                        data.ctrl[arm.grip_act] = grip_cmd(grip_close)
+                        data.ctrl[jaw_act] = SM.CHUCK_OPEN_CTRL
+                        mujoco.mj_step(model, data)
+                        state.setdefault("traj", []).append(
+                            data.site_xpos[arm.site].copy())
+                        state.setdefault("traj_label", []).append("料轴调平")
+                        state.setdefault("traj_t", []).append(float(data.time))
+                return trail
+
+            if LEVEL_ROD:
+                _trail = level_rod()
+                print("  料轴调平     %s -> %+.2f deg（%d 轮）"
+                      % (" ".join("%+.2f" % v for v in _trail),
+                         rod_pitch(), len(_trail)))
             close_bushing()
         if ARM_KP_SCALE != 1.0:
             set_arm_stiff(ARM_KP_SCALE)
             print("  伺服刚度    kp x%.1f（%.1f -> %.1f N·m/rad）"
                   % (ARM_KP_SCALE, _KP0[0], _KP0[0] * ARM_KP_SCALE))
-        print("  夹紧前      轴=%s 同轴=%5.2f mm 轴向偏=%4.1f deg"
-              % (np.round(shaft(), 4), coax(), axdev()))
+        print("  夹紧前      轴=%s 同轴=%5.2f mm 轴向偏=%4.1f deg 翘向=%+.2f deg"
+              % (np.round(shaft(), 4), coax(), axdev(), rod_pitch()))
         # 交接期下坠归因：把「料」和「爪」分开记。爪子下沉 = 手臂伺服在
         # 负载下让位；料相对爪下沉 = 料在 V 槽里滑。两者必须分开量，
         # 否则会把手臂软当成夹持打滑（上一轮就是这么误判的）。
@@ -2023,8 +2083,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
               % (state.get("rod_force_max", 0.0),
                  "开" if ARM_GCOMP else "关"))
         print("  三爪咬合     轴=%s 同轴=%5.2f mm 接触=%d 力=%.1f N "
-              "导套=%d/%.1fN"
-              % (np.round(shaft(), 4), coax(), nc, fN, bn, bf))
+              "导套=%d/%.1fN 翘向=%+.2f deg"
+              % (np.round(shaft(), 4), coax(), nc, fN, bn, bf, rod_pitch()))
         if BORE_PROBE:
             _jq = [float(data.qpos[model.jnt_qposadr[
                 gid(mujoco.mjtObj.mjOBJ_JOINT, "jaw_slide_%d" % _k)]])
@@ -2117,9 +2177,9 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         clamp_z_min = min(clamp_z_min, _z)
         clamp_z_max = max(clamp_z_max, _z)
         print("  原地松爪     同轴=%5.2f mm 轴向偏=%4.1f deg 接触=%d "
-              "相对夹紧终点 dz=%+.2f mm"
+              "相对夹紧终点 dz=%+.2f mm 翘向=%+.2f deg"
               % (coax(), axdev(), jaw_state()[0],
-                 (release_p[2] - clamp_p[2]) * 1000))
+                 (release_p[2] - clamp_p[2]) * 1000, rod_pitch()))
         # 退出必须分两段：先沿轴线退到料尾之外，再侧向撤离。一次斜着
         # 撤退时，张开的刀片会横刮还没脱离的料尾，把卡盘里刚定好心的
         # 料带歪（-5 mm 站点实测：同轴 0.44 -> 1.20 mm、倾斜 1.2 -> 2.0
@@ -2188,9 +2248,9 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     final_tilt = axdev()
     contacts, force = jaw_state()
     print("  松开退出     轴=%s 同轴=%5.2f mm 轴向偏=%5.1f deg "
-          "接触=%d 三爪法向力=%.1f N"
+          "接触=%d 三爪法向力=%.1f N 翘向=%+.2f deg"
           % (np.round(shaft(), 4), final_coax, final_tilt,
-             contacts, force))
+             contacts, force, rod_pitch()))
     tick("⑫ 机器人退出｜装夹完成")
 
     z0 = shaft()[2]
