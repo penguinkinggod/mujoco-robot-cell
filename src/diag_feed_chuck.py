@@ -161,6 +161,11 @@ LEVEL_ROD = os.environ.get("FEED_LEVEL_ROD", "0") == "1"
 AXIS_LEAD_DEG = float(os.environ.get("FEED_AXIS_LEAD_DEG", "1.0"))
 _AXIS_TGT = np.array([np.cos(np.radians(AXIS_LEAD_DEG)), 0.0,
                       np.sin(np.radians(AXIS_LEAD_DEG))])
+# 落座：抓起后先抬离台面 SEAT_TAP，静置让料在 V 槽里坐到底。
+# 【已否掉，默认 0，留作对照】实测只吃掉 0.33 mm（相对爪 -0.22 -> -0.55），
+# 交接位移 1.56 -> 1.54。原因见下：料不是"滑落"，是夹爪被料重撑开，
+# 抓多久都一样要回到同一个重力平衡位。
+SEAT_TAP = float(os.environ.get("FEED_SEAT_TAP_MM", "0")) / 1000.0
 
 
 def tilt_deg(quat):
@@ -706,6 +711,10 @@ ARM_PAYLOAD = float(os.environ.get("FEED_ARM_PAYLOAD", "0"))
 ARM_KP_SCALE = float(os.environ.get("FEED_ARM_KP", "1"))
 # 夹紧期逐帧跟踪，用来分清「手臂硬顶」还是「夹爪带着料跑」。默认关。
 CLAMP_TRACE = os.environ.get("FEED_CLAMP_TRACE", "0") == "1"
+# 落座诊断：打印 V 槽两指间距，看「料在槽里滑」还是「夹爪被撑开」。
+SEAT_TRACE = os.environ.get("FEED_SEAT_TRACE", "0") == "1"
+GRIP_FORCE_NM = float(os.environ.get("FEED_GRIP_FORCE_NM", "0"))
+GRIP_KP_SCALE = float(os.environ.get("FEED_GRIP_KP", "1"))
 # 进给到位后把位置伺服目标一次性同步到实际角。逐帧跟踪发现：夹紧斜坡
 # 前 300 步卡爪还没碰到料，夹爪却带着料漂了 3.3 mm —— 根源是伺服还在
 # 追进给终点 2.5 mm 的 IK 残差。锚定让手臂停在【实际到位姿态】，
@@ -1026,6 +1035,20 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
 
     arm = Arm(model, data)
     _KP0 = [float(model.actuator_gainprm[a, 0]) for a in arm.qadr]
+    # 夹爪执行器力矩上限（N·m）。SO-101 出厂 ±3.35，挂 80 mm 料时料重经
+    # V 槽楔形放大，实测把两指撑开 3.8 mm、料跟着下沉 1.4 mm。这里只是
+    # 把伺服力限调大做「如果夹爪更硬」的对照，不改任何几何或外力。
+    if GRIP_FORCE_NM > 0:
+        model.actuator_forcerange[arm.grip_act] = [-GRIP_FORCE_NM,
+                                                  GRIP_FORCE_NM]
+        print("  夹爪力限      %.2f -> %.2f N·m（诊断用）"
+              % (3.35, GRIP_FORCE_NM))
+    if GRIP_KP_SCALE != 1.0:
+        _gk = float(model.actuator_gainprm[arm.grip_act, 0])
+        model.actuator_gainprm[arm.grip_act, 0] = _gk * GRIP_KP_SCALE
+        model.actuator_biasprm[arm.grip_act, 1] = -_gk * GRIP_KP_SCALE
+        print("  夹爪刚度      kp %.1f -> %.1f（诊断用）"
+              % (_gk, _gk * GRIP_KP_SCALE))
 
     def set_arm_stiff(scale):
         """交接期改手臂位置伺服刚度。只动 servo 参数，不加任何外力。"""
@@ -1658,6 +1681,22 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         settle(GRIP_RAMP - 320 + 80, SM.CHUCK_OPEN_CTRL, grip_close)
     print("  shaft_in_grip = %s mm（搬运锁的相对偏移）"
           % np.round(state["offset"] * 1000, 2))
+    # 落座：抓起后先把料抬离台面几毫米再静置，让它在 V 槽里坐到底。
+    # 【已否掉，实测无效】料"落座"的真相不是沿斜面滑，而是 V 槽被料重撑开
+    # （两指间距 16.99 -> 20.77 mm，全程三爪接触=0），料跟着落到重力平衡位。
+    # 抓取必须过闭合才有摩擦保持，过闭合量就是落座量，提前提一下只能吃掉
+    # 0.33 / 1.43 mm。夹松一点落座变小、手臂下沉同步变大，峰谷守恒。
+    # 留在代码里只为复现这张对照表。
+    if SEAT_TAP > 0 and v_jaw and not carry_lock:
+        _rel0 = (shaft()[2] - arm.pad_center()[2]) * 1000.0
+        move3(pad_target(pick_at + np.array([0.0, 0.0, SEAT_TAP])), 260,
+              grip_close, False, label="落座")
+        settle(140, SM.CHUCK_OPEN_CTRL, grip_close)
+        _rel1 = (shaft()[2] - arm.pad_center()[2]) * 1000.0
+        state["offset"] = arm.pad_center() - shaft()
+        print("  落座     提 %.0f mm 后静置：料相对爪 z %+.2f -> %+.2f mm"
+              "（本步吃掉 %.2f mm）"
+              % (SEAT_TAP * 1000, _rel0, _rel1, _rel0 - _rel1))
     if v_jaw and not carry_lock:
         print("  V 槽形封闭抓取：轴线偏离 %.1f deg，搬运全靠真实接触（无锁）"
               % axdev())
@@ -2028,6 +2067,16 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             jaw_from = PRECLAMP_CTRL
         # 单段连续斜坡：丝杠从张开位（或预夹位）拧到夹紧力上限。
         state["label"] = "三爪拧紧"
+        _seat_pads = None
+        if SEAT_TRACE:
+            _seat_pads = ([gid(mujoco.mjtObj.mjOBJ_GEOM,
+                               "fixed_jaw_pad_v%d" % _k) for _k in (1, 2)],
+                          [gid(mujoco.mjtObj.mjOBJ_GEOM,
+                               "moving_jaw_pad_v%d" % _k) for _k in (1, 2)])
+            print("    SEAT 起始 指距=%.3f mm"
+                  % (np.linalg.norm(
+                      np.mean(data.geom_xpos[_seat_pads[1]], axis=0)
+                      - np.mean(data.geom_xpos[_seat_pads[0]], axis=0)) * 1000))
         for i in range(500):
             t = (i + 1) / 500.0
             s = t * t * (3.0 - 2.0 * t)
@@ -2046,6 +2095,12 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             state.setdefault("traj_t", []).append(float(data.time))
             track_pen("三爪拧紧")
             _a, _r, _rel = clamp_stat()
+            if _seat_pads is not None and i % 10 == 0 and i <= 200:
+                _gap = (np.mean(data.geom_xpos[_seat_pads[1]], axis=0)
+                        - np.mean(data.geom_xpos[_seat_pads[0]], axis=0))
+                print("    SEAT %3d 指距=%.3f mm 爪沉=%+.2f 相对=%+.2f 接触=%d"
+                      % (i, float(np.linalg.norm(_gap)) * 1000,
+                         _a, _rel, jaw_state()[0]))
             if CLAMP_TRACE and i % 25 == 0:
                 _p, _pc = shaft(), arm.pad_center()
                 print("    TRACE %3d 丝杠=%+.4f 料(y,z)=(%+.2f,%+.2f) "
