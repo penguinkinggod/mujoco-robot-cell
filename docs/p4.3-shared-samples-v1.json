@@ -1,0 +1,475 @@
+{
+  "manifest_id": "p4.3-shared-perturbation-v1",
+  "date": "2026-11-08",
+  "status": "frozen",
+  "seed_policy": {
+    "grid_generation": "canonical cartesian product; deterministic and needs no seed",
+    "m2_grid_error_seed": 20261109,
+    "training_sample_seed": 20261110,
+    "holdout_sample_seed": 20261111
+  },
+  "scope": {
+    "workpiece": "cylinder_d20_l80",
+    "fixture": "current_90deg_v_jaw_and_bushing",
+    "settle_steps": 600,
+    "settle_steps_source": "diag_feed_chuck.py initial_settle",
+    "requested_pose_stage": "after mj_resetData and before initial_settle",
+    "measured_pose_stage": "after initial_settle and before robot approach",
+    "interpretation": "incoming placement plus fixture self-centering; not robot-only disturbance tolerance",
+    "criterion_set_id": "feed-criteria-v1"
+  },
+  "physical_pose_design": {
+    "design": "full_factorial",
+    "dx_mm": [
+      0.0
+    ],
+    "dy_mm": [
+      -3.0,
+      0.0,
+      3.0
+    ],
+    "dz_mm": [
+      -2.0,
+      0.0,
+      2.0
+    ],
+    "yaw_world_z_deg": [
+      -5.0,
+      0.0,
+      5.0
+    ],
+    "sample_count": 27,
+    "order": "dy_then_dz_then_yaw_ascending",
+    "samples": [
+      {
+        "sample_id": "p43_dy_m3_dz_m2_yaw_m5",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": -3.0,
+          "dz_mm": -2.0,
+          "yaw_world_z_deg": -5.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": -0.632657,
+          "dz_mm": -0.02038,
+          "yaw_world_z_deg": 0.476398
+        }
+      },
+      {
+        "sample_id": "p43_dy_m3_dz_m2_yaw_z0",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": -3.0,
+          "dz_mm": -2.0,
+          "yaw_world_z_deg": 0.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": -0.151689,
+          "dz_mm": -0.635289,
+          "yaw_world_z_deg": 1.481408
+        }
+      },
+      {
+        "sample_id": "p43_dy_m3_dz_m2_yaw_p5",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": -3.0,
+          "dz_mm": -2.0,
+          "yaw_world_z_deg": 5.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": 0.753759,
+          "dz_mm": 0.987517,
+          "yaw_world_z_deg": -1.179606
+        }
+      },
+      {
+        "sample_id": "p43_dy_m3_dz_z0_yaw_m5",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": -3.0,
+          "dz_mm": 0.0,
+          "yaw_world_z_deg": -5.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": -0.572382,
+          "dz_mm": 0.951083,
+          "yaw_world_z_deg": -1.354665
+        }
+      },
+      {
+        "sample_id": "p43_dy_m3_dz_z0_yaw_z0",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": -3.0,
+          "dz_mm": 0.0,
+          "yaw_world_z_deg": 0.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": 0.30311,
+          "dz_mm": 0.683916,
+          "yaw_world_z_deg": -0.789996
+        }
+      },
+      {
+        "sample_id": "p43_dy_m3_dz_z0_yaw_p5",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": -3.0,
+          "dz_mm": 0.0,
+          "yaw_world_z_deg": 5.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": 0.838886,
+          "dz_mm": -0.258864,
+          "yaw_world_z_deg": -0.400047
+        }
+      },
+      {
+        "sample_id": "p43_dy_m3_dz_p2_yaw_m5",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": -3.0,
+          "dz_mm": 2.0,
+          "yaw_world_z_deg": -5.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": 0.157896,
+          "dz_mm": -0.161603,
+          "yaw_world_z_deg": 0.802264
+        }
+      },
+      {
+        "sample_id": "p43_dy_m3_dz_p2_yaw_z0",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": -3.0,
+          "dz_mm": 2.0,
+          "yaw_world_z_deg": 0.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": 0.942372,
+          "dz_mm": -0.624698,
+          "yaw_world_z_deg": 0.789049
+        }
+      },
+      {
+        "sample_id": "p43_dy_m3_dz_p2_yaw_p5",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": -3.0,
+          "dz_mm": 2.0,
+          "yaw_world_z_deg": 5.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": -0.682118,
+          "dz_mm": 0.691094,
+          "yaw_world_z_deg": -1.467872
+        }
+      },
+      {
+        "sample_id": "p43_dy_z0_dz_m2_yaw_m5",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": 0.0,
+          "dz_mm": -2.0,
+          "yaw_world_z_deg": -5.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": -0.367061,
+          "dz_mm": 0.266589,
+          "yaw_world_z_deg": 1.065103
+        }
+      },
+      {
+        "sample_id": "p43_dy_z0_dz_m2_yaw_z0",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": 0.0,
+          "dz_mm": -2.0,
+          "yaw_world_z_deg": 0.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": -0.077903,
+          "dz_mm": 0.10459,
+          "yaw_world_z_deg": -1.247922
+        }
+      },
+      {
+        "sample_id": "p43_dy_z0_dz_m2_yaw_p5",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": 0.0,
+          "dz_mm": -2.0,
+          "yaw_world_z_deg": 5.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": 0.913083,
+          "dz_mm": -0.840231,
+          "yaw_world_z_deg": -1.420883
+        }
+      },
+      {
+        "sample_id": "p43_dy_z0_dz_z0_yaw_m5",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": 0.0,
+          "dz_mm": 0.0,
+          "yaw_world_z_deg": -5.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": 0.224919,
+          "dz_mm": 0.373548,
+          "yaw_world_z_deg": -1.76312
+        }
+      },
+      {
+        "sample_id": "p43_dy_z0_dz_z0_yaw_z0",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": 0.0,
+          "dz_mm": 0.0,
+          "yaw_world_z_deg": 0.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": -0.484843,
+          "dz_mm": 0.641981,
+          "yaw_world_z_deg": 1.490502
+        }
+      },
+      {
+        "sample_id": "p43_dy_z0_dz_z0_yaw_p5",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": 0.0,
+          "dz_mm": 0.0,
+          "yaw_world_z_deg": 5.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": 0.908343,
+          "dz_mm": 0.231327,
+          "yaw_world_z_deg": 0.623025
+        }
+      },
+      {
+        "sample_id": "p43_dy_z0_dz_p2_yaw_m5",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": 0.0,
+          "dz_mm": 2.0,
+          "yaw_world_z_deg": -5.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": 0.367449,
+          "dz_mm": 0.383661,
+          "yaw_world_z_deg": 0.930226
+        }
+      },
+      {
+        "sample_id": "p43_dy_z0_dz_p2_yaw_z0",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": 0.0,
+          "dz_mm": 2.0,
+          "yaw_world_z_deg": 0.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": 0.515658,
+          "dz_mm": -0.016721,
+          "yaw_world_z_deg": 1.63444
+        }
+      },
+      {
+        "sample_id": "p43_dy_z0_dz_p2_yaw_p5",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": 0.0,
+          "dz_mm": 2.0,
+          "yaw_world_z_deg": 5.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": -0.100931,
+          "dz_mm": -0.63153,
+          "yaw_world_z_deg": -1.007743
+        }
+      },
+      {
+        "sample_id": "p43_dy_p3_dz_m2_yaw_m5",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": 3.0,
+          "dz_mm": -2.0,
+          "yaw_world_z_deg": -5.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": 0.677379,
+          "dz_mm": -0.909439,
+          "yaw_world_z_deg": 1.840807
+        }
+      },
+      {
+        "sample_id": "p43_dy_p3_dz_m2_yaw_z0",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": 3.0,
+          "dz_mm": -2.0,
+          "yaw_world_z_deg": 0.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": -0.766108,
+          "dz_mm": -0.194113,
+          "yaw_world_z_deg": -1.728335
+        }
+      },
+      {
+        "sample_id": "p43_dy_p3_dz_m2_yaw_p5",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": 3.0,
+          "dz_mm": -2.0,
+          "yaw_world_z_deg": 5.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": -0.779321,
+          "dz_mm": -0.611164,
+          "yaw_world_z_deg": -0.809193
+        }
+      },
+      {
+        "sample_id": "p43_dy_p3_dz_z0_yaw_m5",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": 3.0,
+          "dz_mm": 0.0,
+          "yaw_world_z_deg": -5.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": 0.571236,
+          "dz_mm": -0.036284,
+          "yaw_world_z_deg": -0.561623
+        }
+      },
+      {
+        "sample_id": "p43_dy_p3_dz_z0_yaw_z0",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": 3.0,
+          "dz_mm": 0.0,
+          "yaw_world_z_deg": 0.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": 0.203443,
+          "dz_mm": 0.312274,
+          "yaw_world_z_deg": 1.05187
+        }
+      },
+      {
+        "sample_id": "p43_dy_p3_dz_z0_yaw_p5",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": 3.0,
+          "dz_mm": 0.0,
+          "yaw_world_z_deg": 5.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": 0.736497,
+          "dz_mm": -0.496347,
+          "yaw_world_z_deg": -0.931342
+        }
+      },
+      {
+        "sample_id": "p43_dy_p3_dz_p2_yaw_m5",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": 3.0,
+          "dz_mm": 2.0,
+          "yaw_world_z_deg": -5.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": 0.003093,
+          "dz_mm": 0.212172,
+          "yaw_world_z_deg": 1.822226
+        }
+      },
+      {
+        "sample_id": "p43_dy_p3_dz_p2_yaw_z0",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": 3.0,
+          "dz_mm": 2.0,
+          "yaw_world_z_deg": 0.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": -0.675566,
+          "dz_mm": 0.69962,
+          "yaw_world_z_deg": -0.667552
+        }
+      },
+      {
+        "sample_id": "p43_dy_p3_dz_p2_yaw_p5",
+        "requested_pose_before_settle": {
+          "dx_mm": 0.0,
+          "dy_mm": 3.0,
+          "dz_mm": 2.0,
+          "yaw_world_z_deg": 5.0
+        },
+        "m2_estimation_error": {
+          "dy_mm": -0.932314,
+          "dz_mm": 0.369211,
+          "yaw_world_z_deg": 0.979674
+        }
+      }
+    ]
+  },
+  "paired_comparison": {
+    "insert_depth_mm": [
+      8.0,
+      10.0,
+      25.0
+    ],
+    "modes": {
+      "M0": "Use the fixed nominal grasp target; do not use the per-case measured workpiece pose for planning.",
+      "M1": "Use the settled true workpiece pose as an ideal oracle and transform the calibrated grasp pose.",
+      "M2": "Use settled true pose plus the sample's synthetic estimation error; never plan directly from truth."
+    },
+    "m2_error_definition": "estimated_pose = settled_true_pose + error",
+    "m2_error_range": {
+      "dy_mm": [
+        -1.0,
+        1.0
+      ],
+      "dz_mm": [
+        -1.0,
+        1.0
+      ],
+      "yaw_world_z_deg": [
+        -2.0,
+        2.0
+      ]
+    },
+    "m2_error_basis": "Exploratory simulation assumption only; no camera or sensor measurement supports these bounds.",
+    "m2_grid_error_seed": 20261109,
+    "same_physical_sample_across_modes_and_depths": true,
+    "expected_initial_grid_runs": 243,
+    "run_count_formula": "27 physical samples x 3 depths x 3 modes"
+  },
+  "future_random_splits": {
+    "samples_per_split": 20,
+    "physical_pose_distribution": {
+      "dy_mm": "uniform[-3.0, 3.0]",
+      "dz_mm": "uniform[-2.0, 2.0]",
+      "yaw_world_z_deg": "uniform[-5.0, 5.0]"
+    },
+    "m2_error_distribution": {
+      "dy_mm": "uniform[-1.0, 1.0]",
+      "dz_mm": "uniform[-1.0, 1.0]",
+      "yaw_world_z_deg": "uniform[-2.0, 2.0]"
+    },
+    "seeds": {
+      "training": 20261110,
+      "holdout": 20261111
+    },
+    "holdout_must_not_be_used_for_tuning": true,
+    "exact_rows_generated_and_saved_in": "P4.5"
+  }
+}

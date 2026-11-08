@@ -1,7 +1,7 @@
 # 现在在做什么
 
 给下一个接手的人或 agent 看的现场记录。只写"此刻"的状态，不写历史；换手前改这里，不要另开日志。
-最后更新：2026-11-08（P4.2 零扰动与单轴小扰动已验收）
+最后更新：2026-11-08（P4.3 共享扰动样本与 seed 已冻结）
 
 ## 先读：抓取回归已修复，P0 已完成
 
@@ -11,9 +11,9 @@
 
 **统一任务入口：[项目任务总账](docs/project-taskbook.md)**。它记录最终成果、分工、P0-P10 小任务、验收和决定。P1.1 指标字典见 [docs/metric-dictionary.md](docs/metric-dictionary.md)。P0.4 基准身份记录见 [docs/baseline-identity-2026-11-07.md](docs/baseline-identity-2026-11-07.md)，P3 退出段诊断见 [docs/exit-diagnostics-2026-11-07.md](docs/exit-diagnostics-2026-11-07.md)，P1.2/P1.3/P1.4 验收分别见 [docs/p1.2-state-transitions-2026-11-07.md](docs/p1.2-state-transitions-2026-11-07.md)、[docs/p1.3-validity-and-outcomes-2026-11-07.md](docs/p1.3-validity-and-outcomes-2026-11-07.md) 和 [docs/p1.4-failure-detection-2026-11-07.md](docs/p1.4-failure-detection-2026-11-07.md)。旧 T 清单是实现参考，不是允许一次做完所有步骤的授权。
 
-P0.1 审计结论见 [docs/audit-current-diff-2026-11-07.md](docs/audit-current-diff-2026-11-07.md)。最新基准 `diag_feed_chuck.py --v-jaw --lift --no-lock` 为 `FEED_METRIC PASS`：同轴 `0.64 mm`、倾角 `0.2°`、交接位移 `1.58 mm`、余量偏心 `0.70/2.0 mm`、20 N 拉拔位移 `0.00 mm`。负向 `dy=+50 mm` 在抓取阶段终止，未进入三爪闭合。P0.3 四档复验、8 mm 画面核验、P0.4 基准身份、P1.1 指标字典和 P3 退出段三模式诊断均已完成。P1.2 完成状态转换、ABORT/ERROR 和记账；P1.3 完成结果有效性与统计范围分类；P1.4 修复并验证机器人外壳碰撞漏报，夹空、碰撞、NaN 与正常分支均已测试。P2.1 记录实验复现配置；P2.2 记录六个关键节点；P2.3 将 JSON 升为 v6，补上每个物理步的接触/外加载荷汇总和节点快照，并将 20 N 拉拔单独统计。P2.4 让扫描器校验 v6 结构、case ID 和退出码，并处理缺失/损坏结果、启动错误和超时；CSV 可回溯到 schema 和逐 case JSON。P4.1 已定义世界坐标扰动和固定目标/真值重定位/带误差重定位三种模式，并发现旧 `roll` 入口实际是 yaw、抓取中心按静置后真值更新。P4.2 已完成明确的 yaw 入口、schema v7 位姿快照和 7 个零/单轴工况；它们全部 PASS，但静置后都回到同一基准，不能当成机械臂独立抗扰成绩。完整回归 **10/10**，22 项单测通过。高 IK 残差仍不自动判为不可达。下一步做 P4.3 冻结共享样本清单和固定 seed。
+P0.1 审计结论见 [docs/audit-current-diff-2026-11-07.md](docs/audit-current-diff-2026-11-07.md)。最新基准 `diag_feed_chuck.py --v-jaw --lift --no-lock` 为 `FEED_METRIC PASS`：同轴 `0.64 mm`、倾角 `0.2°`、交接位移 `1.58 mm`、余量偏心 `0.70/2.0 mm`、20 N 拉拔位移 `0.00 mm`。负向 `dy=+50 mm` 在抓取阶段终止，未进入三爪闭合。P0.3 四档复验、8 mm 画面核验、P0.4 基准身份、P1.1 指标字典和 P3 退出段三模式诊断均已完成。P1.2 完成状态转换、ABORT/ERROR 和记账；P1.3 完成结果有效性与统计范围分类；P1.4 修复并验证机器人外壳碰撞漏报，夹空、碰撞、NaN 与正常分支均已测试。P2.1 记录实验复现配置；P2.2 记录六个关键节点；P2.3 将 JSON 升为 v6，补上每个物理步的接触/外加载荷汇总和节点快照，并将 20 N 拉拔单独统计。P2.4 让扫描器校验 v6 结构、case ID 和退出码，并处理缺失/损坏结果、启动错误和超时；CSV 可回溯到 schema 和逐 case JSON。P4.1 已定义世界坐标扰动和固定目标/真值重定位/带误差重定位三种模式，并发现旧 `roll` 入口实际是 yaw、抓取中心按静置后真值更新。P4.2 已完成明确的 yaw 入口、schema v7 位姿快照和 7 个零/单轴工况；它们全部 PASS，但静置后都回到同一基准，不能当成机械臂独立抗扰成绩。P4.3 已冻结 27 个共享物理样本、M0/M1/M2 输入契约、M2 探索性误差包络和 train/holdout seed；正式矩阵更正为 243 组，尚未运行。完整回归 **10/10**，27 项单测通过。高 IK 残差仍不自动判为不可达。下一步做 P4.4：先实现三种模式隔离，再按冻结清单运行。
 
-**尚未验收的实现：** P4.3 之后的正式批量实验、M0/M1/M2 公平对照、尺寸边界、夹具搜索和模型训练仍未完成。当前扫描器只做插入深度扫描，不是通用批量扰动工具；不可达专用判据也尚未实现。P4.1 约定见 [docs/p4.1-perturbation-frames-2026-11-08.md](docs/p4.1-perturbation-frames-2026-11-08.md)，P4.2 证据见 [docs/p4.2-zero-and-axis-perturbations-2026-11-08.md](docs/p4.2-zero-and-axis-perturbations-2026-11-08.md)。P2.1-P2.4 证据见 [docs/p2.1-case-json-schema-2026-11-07.md](docs/p2.1-case-json-schema-2026-11-07.md)、[docs/p2.2-checkpoint-records-2026-11-08.md](docs/p2.2-checkpoint-records-2026-11-08.md)、[docs/p2.3-contact-force-records-2026-11-08.md](docs/p2.3-contact-force-records-2026-11-08.md) 和 [docs/p2.4-sweep-error-handling-2026-11-08.md](docs/p2.4-sweep-error-handling-2026-11-08.md)；其他历史证据见 [docs/insert-sweep-2026-11-07.md](docs/insert-sweep-2026-11-07.md)、[docs/baseline-identity-2026-11-07.md](docs/baseline-identity-2026-11-07.md)、[docs/exit-diagnostics-2026-11-07.md](docs/exit-diagnostics-2026-11-07.md)、[docs/p1.2-state-transitions-2026-11-07.md](docs/p1.2-state-transitions-2026-11-07.md)、[docs/p1.3-validity-and-outcomes-2026-11-07.md](docs/p1.3-validity-and-outcomes-2026-11-07.md) 和 [docs/p1.4-failure-detection-2026-11-07.md](docs/p1.4-failure-detection-2026-11-07.md)。当前仅本地 commit；不 push，直到完成可公开展示的项目成果。
+**尚未验收的实现：** P4.4 之后的正式批量实验、M0/M1/M2 公平对照、尺寸边界、夹具搜索和模型训练仍未完成。当前扫描器只做插入深度扫描，不是通用批量扰动工具；不可达专用判据也尚未实现。P4.1 约定见 [docs/p4.1-perturbation-frames-2026-11-08.md](docs/p4.1-perturbation-frames-2026-11-08.md)，P4.2 证据见 [docs/p4.2-zero-and-axis-perturbations-2026-11-08.md](docs/p4.2-zero-and-axis-perturbations-2026-11-08.md)，P4.3 清单见 [docs/p4.3-shared-sample-manifest-2026-11-08.md](docs/p4.3-shared-sample-manifest-2026-11-08.md)。P2.1-P2.4 证据见 [docs/p2.1-case-json-schema-2026-11-07.md](docs/p2.1-case-json-schema-2026-11-07.md)、[docs/p2.2-checkpoint-records-2026-11-08.md](docs/p2.2-checkpoint-records-2026-11-08.md)、[docs/p2.3-contact-force-records-2026-11-08.md](docs/p2.3-contact-force-records-2026-11-08.md) 和 [docs/p2.4-sweep-error-handling-2026-11-08.md](docs/p2.4-sweep-error-handling-2026-11-08.md)；其他历史证据见 [docs/insert-sweep-2026-11-07.md](docs/insert-sweep-2026-11-07.md)、[docs/baseline-identity-2026-11-07.md](docs/baseline-identity-2026-11-07.md)、[docs/exit-diagnostics-2026-11-07.md](docs/exit-diagnostics-2026-11-07.md)、[docs/p1.2-state-transitions-2026-11-07.md](docs/p1.2-state-transitions-2026-11-07.md)、[docs/p1.3-validity-and-outcomes-2026-11-07.md](docs/p1.3-validity-and-outcomes-2026-11-07.md) 和 [docs/p1.4-failure-detection-2026-11-07.md](docs/p1.4-failure-detection-2026-11-07.md)。当前仅本地 commit；不 push，直到完成可公开展示的项目成果。
 
 **要拿去问别人/别的 AI**：直接用 [docs/handoff-brief.md](docs/handoff-brief.md)，
 那份是自包含的，不需要读代码，末尾有 6 个待判断的问题。
@@ -45,6 +45,15 @@ P0.1 审计结论见 [docs/audit-current-diff-2026-11-07.md](docs/audit-current-
 - 静置后中心都约为 `(260.0, -130.0, 39.812) mm`，轴线都约为 `(1, 0, 0)`；当前 V 槽/托架把请求扰动消掉了。
 - 因而这轮不是 M0 固定目标抗扰，也不是完整 M1/M2 成绩；它只是证明了扰动入口和“支撑消扰动”现象。
 - 报告：[docs/p4.2-zero-and-axis-perturbations-2026-11-08.md](docs/p4.2-zero-and-axis-perturbations-2026-11-08.md)；证据 JSON 在 `_build/p42_*.json`。
+
+## P4.3 本轮验收
+
+- 冻结 27 个共享物理样本：`dx=0`，`dy∈{-3,0,3} mm`，`dz∈{-2,0,2} mm`，`yaw∈{-5,0,5}°`；网格按确定性笛卡尔积生成，不虚构网格 seed。
+- 明确请求位姿在静置前施加，抓取前真值在 600 步静置后读取；M0 不读真值，M1 读真值 oracle，M2 只读带合成误差的估计值。
+- M2 误差包络为探索性假设：`dy/dz ±1 mm`、`yaw ±2°`；27 行具体误差由独立 seed `20261109` 固化。
+- 8/10/25 mm × M0/M1/M2 的正式矩阵是 **243 组**，原来只写 81 组是漏算了模式维度；本轮没有运行这些仿真。
+- train/holdout 各 20 条的 seed 固定为 `20261110/20261111`，P4.5 才生成实际随机行。
+- 清单与生成器：[docs/p4.3-shared-samples-v1.json](docs/p4.3-shared-samples-v1.json)、[src/diag_feed_perturbation_manifest.py](src/diag_feed_perturbation_manifest.py)；报告：[docs/p4.3-shared-sample-manifest-2026-11-08.md](docs/p4.3-shared-sample-manifest-2026-11-08.md)。
 
 ## 状态：阶段 B 第三轮已落地为新默认
 
@@ -220,7 +229,7 @@ P0.1 审计结论见 [docs/audit-current-diff-2026-11-07.md](docs/audit-current-
 
 ## 下一步（按优先级）
 
-1. **下一张先做 P4.3，不要直接跑 81 个正式工况**：冻结共享样本、范围和固定 seed，先把 M0/M1/M2 的样本和输入来源定死；随后再做正式批量。
+1. **下一张先做 P4.4，不要直接盲跑 243 个正式工况**：先在单 case 证明 M0/M1/M2 的目标来源隔离，再按冻结清单批量执行。
 2. **不要再去挤"落座"这个分项**：已实测夹松 / 夹紧 / 提高夹爪力限 / 提高夹爪
    刚度 / 提前落座五条，落座能从小数点后压下来，但交接位移的峰谷不变甚至变大
    （1.51~1.67），因为料的总下垂是守恒的。要真的下去，只能动工装（形封闭夹持，
@@ -293,6 +302,6 @@ FEED_BUSHING=0 FEED_CLAMP_ANCHOR=0 FEED_CLAMP_LIFT=1 \
 
 ## 同步状态
 
-`verify_all.py` **10/10 通过**（新默认下重跑），单测 **22/22**。当前正式结果 JSON 为 schema v7。推送需用会话代理端口，
+`verify_all.py` **10/10 通过**（新默认下重跑），单测 **27/27**。当前正式结果 JSON 为 schema v7。推送需用会话代理端口，
 全局配置里的 7897 是坏的：
 `git -c http.proxy=$HTTP_PROXY -c https.proxy=$HTTPS_PROXY push origin main`

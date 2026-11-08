@@ -1,6 +1,6 @@
 # 项目路线图
 
-> 2026-11-08 更新：每日执行与任务状态统一看 [项目任务总账](project-taskbook.md)。本页保留大方向；历史数字与当前恢复后的复验结果必须按报告区分。P0.4 基准固化、P3 退出段诊断、P1.2-P1.4 验收、P2.1-P2.4 实验记录/读取和 P4.1-P4.2 扰动基础验收已完成；当前回归为 10/10，下一步为 P4.3 冻结共享样本清单和固定 seed。
+> 2026-11-08 更新：每日执行与任务状态统一看 [项目任务总账](project-taskbook.md)。本页保留大方向；历史数字与当前恢复后的复验结果必须按报告区分。P0.4 基准固化、P3 退出段诊断、P1.2-P1.4 验收、P2.1-P2.4 实验记录/读取和 P4.1-P4.3 扰动基础验收已完成；当前回归为 10/10，下一步为 P4.4 实现模式隔离并运行冻结清单。
 
 ## 项目方向
 
@@ -56,7 +56,7 @@
 
 这些数据只说明 **10 mm 是当前恢复代码四档中的最浅通过档位**，不是推荐的生产夹持深度。7.75/8 mm 首次超过余量偏心上限发生在轴向退出之后，提示退出路径、接触或姿态可能发生状态切换；当前脚本仍使用固定工件初态，不包含尺寸和姿态扰动，仿真也没有验证切削载荷。
 
-**当前下一步：** P1.2/P1.3/P1.4 验收分别见 [p1.2-state-transitions-2026-11-07.md](p1.2-state-transitions-2026-11-07.md)、[p1.3-validity-and-outcomes-2026-11-07.md](p1.3-validity-and-outcomes-2026-11-07.md) 和 [p1.4-failure-detection-2026-11-07.md](p1.4-failure-detection-2026-11-07.md)；P2.1-P2.4 的验收见 [P2.1 JSON 字段规范](p2.1-case-json-schema-2026-11-07.md)、[P2.2 六节点记录](p2.2-checkpoint-records-2026-11-08.md)、[P2.3 接触外力记录](p2.3-contact-force-records-2026-11-08.md) 与 [P2.4 扫描器错误处理](p2.4-sweep-error-handling-2026-11-08.md)；P4.1/P4.2 见 [P4.1 约定](p4.1-perturbation-frames-2026-11-08.md) 和 [P4.2 验收](p4.2-zero-and-axis-perturbations-2026-11-08.md)。下一步做 P4.3：先根据托架会消除小扰动这一事实冻结共同样本、范围与 seed，明确 M0/M1/M2 的输入时点，不直接跑 27 组全因子。之后才测尺寸边界、参数化夹具和搜索，最后评估辅助模型。
+**当前下一步：** P1.2/P1.3/P1.4 验收分别见 [p1.2-state-transitions-2026-11-07.md](p1.2-state-transitions-2026-11-07.md)、[p1.3-validity-and-outcomes-2026-11-07.md](p1.3-validity-and-outcomes-2026-11-07.md) 和 [p1.4-failure-detection-2026-11-07.md](p1.4-failure-detection-2026-11-07.md)；P2.1-P2.4 的验收见 [P2.1 JSON 字段规范](p2.1-case-json-schema-2026-11-07.md)、[P2.2 六节点记录](p2.2-checkpoint-records-2026-11-08.md)、[P2.3 接触外力记录](p2.3-contact-force-records-2026-11-08.md) 与 [P2.4 扫描器错误处理](p2.4-sweep-error-handling-2026-11-08.md)；P4.1/P4.2/P4.3 见 [P4.1 约定](p4.1-perturbation-frames-2026-11-08.md)、[P4.2 验收](p4.2-zero-and-axis-perturbations-2026-11-08.md) 和 [P4.3 样本清单](p4.3-shared-sample-manifest-2026-11-08.md)。下一步做 P4.4：先实现 M0/M1/M2 目标来源隔离，再按冻结清单运行 243 组；之后才测尺寸边界、参数化夹具和搜索，最后评估辅助模型。
 
 现有 `diag_diameter_sweep.py` 只测卡盘单站的变径夹持，不包含机械臂抓取和送料，不能代替完整任务扫描。`demo_06_learn_correction.py` 是独立的学习示例，也还不是送料策略的训练或验证结果。
 
