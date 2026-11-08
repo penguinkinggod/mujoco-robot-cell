@@ -20,8 +20,31 @@ for key in tuple(os.environ):
 import diag_feed_chuck as feed
 
 
+class WorldYawConventionTests(unittest.TestCase):
+    def test_world_yaw_rotates_shaft_axis_about_world_z(self):
+        quat = feed._apply_world_yaw_to_quaternion(feed.SHAFT_Q0, 30.0)
+        rotation = np.zeros(9)
+        mujoco.mju_quat2Mat(rotation, quat)
+        axis = rotation.reshape(3, 3)[:, 2]
+
+        np.testing.assert_allclose(
+            [np.cos(np.radians(30.0)),
+             np.sin(np.radians(30.0)), 0.0],
+            axis,
+            atol=1e-6,
+        )
+
+    def test_legacy_roll_argument_is_yaw_alias(self):
+        self.assertEqual(
+            5.0, feed._resolve_initial_yaw_deg(5.0, None))
+        self.assertEqual(
+            5.0, feed._resolve_initial_yaw_deg(None, 5.0))
+        with self.assertRaises(ValueError):
+            feed._resolve_initial_yaw_deg(5.0, -5.0)
+
+
 def assert_reproducibility_fields(test_case, result):
-    test_case.assertEqual(6, result["schema_version"])
+    test_case.assertEqual(7, result["schema_version"])
     test_case.assertEqual(1, result["metric_schema_version"])
     test_case.assertEqual("feed-criteria-v1", result["criterion_set_id"])
     test_case.assertTrue(result["case_id"])
@@ -44,6 +67,16 @@ def assert_reproducibility_fields(test_case, result):
     test_case.assertEqual(20.0, result["inputs"]["workpiece"]["diameter_mm"])
     test_case.assertEqual(80.0, result["inputs"]["workpiece"]["length_mm"])
     test_case.assertIn("requested_initial_pose", result["inputs"])
+    test_case.assertIn(
+        "offset_world_xyz_mm",
+        result["inputs"]["requested_initial_pose"])
+    test_case.assertIn(
+        "yaw_world_z_deg",
+        result["inputs"]["requested_initial_pose"])
+    test_case.assertIn("pose_before_perturbation", result["inputs"])
+    test_case.assertIn(
+        "pose_after_perturbation_before_settle", result["inputs"])
+    test_case.assertIn("grasp_target_pose", result["inputs"])
     test_case.assertIn("v_jaw", result["control_mode"])
     test_case.assertIn("feed", result["effective_parameters"])
     test_case.assertIn("bushing", result["effective_parameters"])
@@ -56,6 +89,8 @@ def assert_reproducibility_fields(test_case, result):
             3, len(result["actual_initial_pose"]["position_m"]))
         test_case.assertEqual(
             4, len(result["actual_initial_pose"]["quaternion_wxyz"]))
+        test_case.assertEqual(
+            3, len(result["actual_initial_pose"]["shaft_axis_world_unit"]))
 
 
 def assert_feed_checkpoints(test_case, result, expected_status=None):
@@ -352,6 +387,15 @@ class RobotMachineContactTests(unittest.TestCase):
         self.assertEqual(0, exit_code)
         self.assertTrue(result["overall_pass"])
         assert_reproducibility_fields(self, result)
+        self.assertEqual(
+            0.0,
+            result["inputs"]["requested_initial_pose"]["yaw_world_z_deg"])
+        self.assertEqual(
+            "settled_true_workpiece_center",
+            result["inputs"]["grasp_target_pose"]["position_source"])
+        self.assertEqual(
+            "fixed_calibrated_grasp_pose",
+            result["inputs"]["grasp_target_pose"]["orientation_source"])
         contact_scopes = result["contact_diagnostics"]["scopes"]
         feed_contacts = contact_scopes["feed"]["overall"]
         self.assertGreater(feed_contacts["samples"], 10000)

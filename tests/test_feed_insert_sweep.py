@@ -16,7 +16,7 @@ def make_result(case_id, status="completed", passed=True):
     hard_pass = passed
     quality_pass = passed if status == "completed" else None
     result = {
-        "schema_version": 6,
+        "schema_version": 7,
         "case_id": case_id,
         "execution_status": status,
         "evaluation_scope": "primary_physics_feed",
@@ -91,7 +91,7 @@ class FeedInsertSweepTests(unittest.TestCase):
 
         self.assertEqual("PASS", row["status"])
         self.assertEqual(0, row["exit_code"])
-        self.assertEqual(6, row["schema_version"])
+        self.assertEqual(7, row["schema_version"])
         self.assertEqual("sweep-test-case", row["case_id"])
         self.assertEqual(str(json_path), row["json_path"])
         self.assertEqual(0.64, row["coax_mm"])
@@ -144,7 +144,7 @@ class FeedInsertSweepTests(unittest.TestCase):
         self.assertEqual("unsupported_schema", row["execution_status"])
 
         non_integer_version = make_result("sweep-test-case")
-        non_integer_version["schema_version"] = 6.0
+        non_integer_version["schema_version"] = 7.0
         row, _ = self._run_case(non_integer_version)
         self.assertEqual("ERROR", row["status"])
         self.assertEqual("unsupported_schema", row["execution_status"])

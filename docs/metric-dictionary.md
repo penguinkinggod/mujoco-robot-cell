@@ -65,13 +65,13 @@
 2. `evaluation_scope`：这条记录属于主全物理送料、带运动学锁的历史参考，还是其他诊断配置。只有声明的主实验配置进入主实验统计；其他配置可以报告，但不混入同一个成功率。
 3. `outcome_class` 与原判据：可用的主实验尝试再分成功、硬失败、质量失败或中止。`hard_pass`、`quality_pass`、`overall_pass` 仍保留原含义，不能因新增标签而重算或覆盖。
 
-P1.3 的机读字段写在 case JSON 顶层，`schema_version=3`；P2.1 加入复现配置字段升为 v4；P2.2 增加标准阶段检查点升为 v5；P2.3 加入全过程接触与外加载荷汇总，当前正式结果为 `schema_version=6`。P2.1-P2.3 只扩展记录结构，不改变指标算法或判据版本：
+P1.3 的机读字段写在 case JSON 顶层，`schema_version=3`；P2.1 加入复现配置字段升为 v4；P2.2 增加标准阶段检查点升为 v5；P2.3 加入全过程接触与外加载荷汇总升为 v6；P4.2 增加扰动前/后位姿、world-Z yaw 和抓取目标快照，当前正式结果为 `schema_version=7`。这些改动只扩展记录结构，不改变指标算法或判据版本：
 
-- `schema_version=6`：JSON 字段结构版本。
+- `schema_version=7`：当前 JSON 字段结构版本；v6 是 P2.3 完成时的历史版本。
 - `metric_schema_version=1`：指标定义版本。
 - `criterion_set_id=feed-criteria-v1`：PASS/FAIL 门槛版本。
 
-P2.1 还记录工件输入、初始位姿、控制模式、实际参数、已设置的相关环境变量、仿真选项、代码与依赖版本；P2.2 记录六个稳定节点；P2.3 记录逐物理步采样后的接触/外加载荷汇总和节点瞬时快照。20 N 拉拔测试在 `pull_test` scope 单独统计，不算送料期间的隐藏外力。详细验收见 [P2.1 实验 JSON 规范](p2.1-case-json-schema-2026-11-07.md)、[P2.2 六节点记录](p2.2-checkpoint-records-2026-11-08.md) 和 [P2.3 接触与外力记录](p2.3-contact-force-records-2026-11-08.md)。
+P2.1 还记录工件输入、初始位姿、控制模式、实际参数、已设置的相关环境变量、仿真选项、代码与依赖版本；P2.2 记录六个稳定节点；P2.3 记录逐物理步采样后的接触/外加载荷汇总和节点瞬时快照；P4.2 增加名义位姿、施加扰动后的静置前位姿、静置后的抓取前真值、工件轴线单位向量和抓取目标来源。20 N 拉拔测试在 `pull_test` scope 单独统计，不算送料期间的隐藏外力。详细验收见 [P2.1 实验 JSON 规范](p2.1-case-json-schema-2026-11-07.md)、[P2.2 六节点记录](p2.2-checkpoint-records-2026-11-08.md)、[P2.3 接触与外力记录](p2.3-contact-force-records-2026-11-08.md) 和 [P4.2 扰动位姿记录](p4.2-zero-and-axis-perturbations-2026-11-08.md)。
 
 | 字段 | 解释 |
 |---|---|

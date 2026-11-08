@@ -1,6 +1,6 @@
 # 交班简报：SO-101 机械臂给三爪卡盘送一根棒料
 
-> 状态更正（2026-11-08）：P0.2-P0.4、P1.1-P1.4、P2.1-P2.4 已完成，完整回归为 10/10、单测为 20/20；固定初态四档中 10 mm 是最浅通过档，但不是通用标准。P1.4 修复并验证机器人外壳碰撞漏报；P2.1-P2.3 让结果 JSON 记录复现配置、六个关键节点和全过程接触/外加载荷，20 N 拉拔载荷单独统计；P2.4 让插入深度扫描器拒绝旧/坏 JSON 并把运行异常与仿真失败分开。当前 JSON schema v6；高 IK 残差仍不直接判为不可达。下一步先做 P4.1，明确坐标系与感知假设。详细状态见 [CURRENT.md](../CURRENT.md)、[任务总账](project-taskbook.md)、[P1.4 验收](p1.4-failure-detection-2026-11-07.md)、[P2.1 规范](p2.1-case-json-schema-2026-11-07.md)、[P2.2 验收](p2.2-checkpoint-records-2026-11-08.md)、[P2.3 验收](p2.3-contact-force-records-2026-11-08.md) 与 [P2.4 验收](p2.4-sweep-error-handling-2026-11-08.md)。
+> 状态更正（2026-11-08）：P0.2-P0.4、P1.1-P1.4、P2.1-P2.4、P4.1-P4.2 已完成，完整回归为 10/10、单测为 22/22；固定初态四档中 10 mm 是最浅通过档，但不是通用标准。P1.4 修复并验证机器人外壳碰撞漏报；P2.1-P2.3 让结果 JSON 记录复现配置、六个关键节点和全过程接触/外加载荷，20 N 拉拔载荷单独统计；P2.4 让插入深度扫描器拒绝旧/坏 JSON 并把运行异常与仿真失败分开。P4.1 定义扰动坐标和三种感知假设；P4.2 增加明确的 world-Z yaw 入口和 schema v7 位姿快照。7 个零/单轴 case 都 PASS，但静置后回到同一基准，不能当作机械臂独立抗扰。下一步做 P4.3，冻结共同样本和固定 seed。高 IK 残差仍不直接判为不可达。详细状态见 [CURRENT.md](../CURRENT.md)、[任务总账](project-taskbook.md)、[P1.4 验收](p1.4-failure-detection-2026-11-07.md)、[P2.1 规范](p2.1-case-json-schema-2026-11-07.md)、[P2.2 验收](p2.2-checkpoint-records-2026-11-08.md)、[P2.3 验收](p2.3-contact-force-records-2026-11-08.md)、[P2.4 验收](p2.4-sweep-error-handling-2026-11-08.md)、[P4.1 约定](p4.1-perturbation-frames-2026-11-08.md) 与 [P4.2 验收](p4.2-zero-and-axis-perturbations-2026-11-08.md)。
 
 这份文件是**对外**的：给别的 AI / 别人看，不需要读代码也能判断问题在哪。
 内部现场记录在 [CURRENT.md](../CURRENT.md)，代码在 `src/diag_feed_chuck.py`。

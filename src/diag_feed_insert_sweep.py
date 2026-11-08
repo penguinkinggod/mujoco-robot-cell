@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FEED_SCRIPT = ROOT / "src" / "diag_feed_chuck.py"
 DEFAULT_OUTPUT = ROOT / "_build" / "feed_insert_sweep.csv"
 DEFAULT_INSERTS_MM = (5, 6, 7, 8, 9, 10, 15, 20, 25, 30)
-EXPECTED_SCHEMA_VERSION = 6
+EXPECTED_SCHEMA_VERSION = 7
 CASE_TIMEOUT_SECONDS = 600
 COMPLETED_METRICS = (
     "coax_mm",
@@ -35,7 +35,7 @@ COMPLETED_METRICS = (
 )
 
 
-def _new_row(insert_mm, json_path, case_id, dy_mm, dz_mm, roll_deg,
+def _new_row(insert_mm, json_path, case_id, dy_mm, dz_mm, yaw_deg,
              random_seed):
     return {
         "case_id": case_id,
@@ -43,7 +43,7 @@ def _new_row(insert_mm, json_path, case_id, dy_mm, dz_mm, roll_deg,
         "insert_mm": insert_mm,
         "dy_mm": dy_mm,
         "dz_mm": dz_mm,
-        "roll_deg": roll_deg,
+        "yaw_deg": yaw_deg,
         "status": "ERROR",
         "execution_status": "",
         "evaluation_scope": "",
@@ -229,11 +229,11 @@ def _copy_classification(row, result):
 
 
 def run_case(insert_mm, json_path, case_id=None, dy_mm=0.0, dz_mm=0.0,
-             roll_deg=0.0, random_seed=None):
+             yaw_deg=0.0, random_seed=None):
     case_id = case_id or uuid.uuid4().hex[:12]
     json_path = Path(json_path)
     row = _new_row(
-        insert_mm, json_path, case_id, dy_mm, dz_mm, roll_deg, random_seed)
+        insert_mm, json_path, case_id, dy_mm, dz_mm, yaw_deg, random_seed)
     try:
         json_path.parent.mkdir(parents=True, exist_ok=True)
         json_path.unlink(missing_ok=True)
@@ -251,7 +251,7 @@ def run_case(insert_mm, json_path, case_id=None, dy_mm=0.0, dz_mm=0.0,
     command = [
         sys.executable, str(FEED_SCRIPT), "--v-jaw", "--lift", "--no-lock",
         "--initial-dy-mm", str(dy_mm), "--initial-dz-mm", str(dz_mm),
-        "--initial-roll-deg", str(roll_deg), "--case-id", case_id,
+        "--initial-yaw-deg", str(yaw_deg), "--case-id", case_id,
     ]
     if random_seed is not None:
         command.extend(["--random-seed", str(random_seed)])

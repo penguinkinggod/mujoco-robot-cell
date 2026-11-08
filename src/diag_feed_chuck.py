@@ -99,7 +99,7 @@ from demo_08_pick_and_load import (
 )
 
 
-RESULT_SCHEMA_VERSION = 6
+RESULT_SCHEMA_VERSION = 7
 METRIC_SCHEMA_VERSION = 1
 CRITERION_SET_ID = "feed-criteria-v1"
 FEED_CHECKPOINTS = (
@@ -110,6 +110,28 @@ FEED_CHECKPOINTS = (
     ("lateral_retreat_complete", "侧向退出完成"),
     ("unlock_settled", "解锁静置完成"),
 )
+
+
+def _resolve_initial_yaw_deg(legacy_roll_deg, yaw_world_z_deg):
+    legacy_value = 0.0 if legacy_roll_deg is None else float(legacy_roll_deg)
+    if yaw_world_z_deg is None:
+        return legacy_value
+    if legacy_value != 0.0:
+        raise ValueError(
+            "use either initial_yaw_deg or legacy initial_roll_deg")
+    return float(yaw_world_z_deg)
+
+
+def _apply_world_yaw_to_quaternion(quaternion_wxyz, yaw_world_z_deg):
+    half_angle = np.radians(float(yaw_world_z_deg)) / 2.0
+    yaw_quaternion = np.array([
+        np.cos(half_angle), 0.0, 0.0, np.sin(half_angle)])
+    rotated = np.zeros(4)
+    mujoco.mju_mulQuat(
+        rotated, yaw_quaternion, np.asarray(quaternion_wxyz, dtype=float))
+    return rotated
+
+
 _REPRODUCIBLE_ENV_KEYS = {
     "FEED_INSERT_MM", "FEED_Z_COMP_MM", "FEED_GRIP_STATION_MM",
     "FEED_RETREAT_AXIAL", "FEED_LEVEL_ROD", "FEED_AXIS_LEAD_DEG",
@@ -1316,8 +1338,8 @@ ARM_LEAD = F.ARM_SERVO_KV / F.ARM_SERVO_KP
 
 def main(frame_hook=None, model=None, data=None, carry_lock=True,
          v_jaw=False, lift=False, wrist=None, machine_solid=True,
-         initial_offset_mm=(0.0, 0.0, 0.0), initial_roll_deg=0.0,
-         random_seed=None):
+         initial_offset_mm=(0.0, 0.0, 0.0), initial_roll_deg=None,
+         random_seed=None, initial_yaw_deg=None):
     """Run the feed sequence.
 
     frame_hook(tag, model, data) is an OPTIONAL visualisation tap.
@@ -1504,6 +1526,18 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     def shaft():
         return data.qpos[sq:sq + 3].copy()
 
+    def shaft_pose_snapshot():
+        shaft_axis = data.xmat[shaft_body].reshape(3, 3)[:, 2]
+        shaft_axis = shaft_axis / max(
+            float(np.linalg.norm(shaft_axis)), 1e-12)
+        return {
+            "position_m": [float(x) for x in shaft()],
+            "quaternion_wxyz": [
+                float(x) for x in data.qpos[sq + 3:sq + 7]],
+            "shaft_axis_world_unit": [
+                float(x) for x in shaft_axis],
+        }
+
     def coax():
         p = shaft()
         return float(np.hypot(p[1] - axis[1], p[2] - axis[2]) * 1000)
@@ -1609,7 +1643,12 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     offset_mm = np.asarray(initial_offset_mm, dtype=float)
     if offset_mm.shape != (3,):
         raise ValueError("initial_offset_mm must have three values: dx, dy, dz")
-    if not np.all(np.isfinite(offset_mm)) or not np.isfinite(initial_roll_deg):
+    legacy_roll_deg = (
+        0.0 if initial_roll_deg is None else float(initial_roll_deg))
+    yaw_world_z_deg = _resolve_initial_yaw_deg(
+        legacy_roll_deg, initial_yaw_deg)
+    if (not np.all(np.isfinite(offset_mm))
+            or not np.isfinite(yaw_world_z_deg)):
         raise ValueError("initial pose values must be finite")
     _KP0 = [float(model.actuator_gainprm[a, 0]) for a in arm.qadr]
     # 夹爪执行器力矩上限（N·m）。SO-101 出厂 ±3.35，挂 80 mm 料时料重经
@@ -1666,8 +1705,17 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                  },
                  "requested_initial_pose": {
                      "offset_mm": [float(x) for x in offset_mm],
-                     "roll_deg": float(initial_roll_deg),
+                     "offset_world_xyz_mm": [
+                         float(x) for x in offset_mm],
+                     "yaw_world_z_deg": float(yaw_world_z_deg),
+                     "roll_deg": float(legacy_roll_deg),
+                     "legacy_roll_argument_deg": (
+                         None if initial_roll_deg is None
+                         else float(initial_roll_deg)),
                  },
+                 "pose_before_perturbation": None,
+                 "pose_after_perturbation_before_settle": None,
+                 "grasp_target_pose": None,
                  "insert_mm": float(INSERT_MM * 1000),
                  "random_seed": random_seed,
              },
@@ -1794,7 +1842,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                  "v_length_mm": float(V_LEN * 1000),
                  "v_angle_deg": 90.0,
                  "initial_offset_mm": [float(x) for x in offset_mm],
-                 "initial_roll_deg": float(initial_roll_deg),
+                 "initial_roll_deg": float(legacy_roll_deg),
+                 "initial_yaw_world_z_deg": float(yaw_world_z_deg),
                  "v_jaw": bool(v_jaw), "lift": bool(lift),
                  "carry_lock": bool(carry_lock),
                  "machine_solid": bool(machine_solid),
@@ -2524,15 +2573,15 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
 
     # ---------------- reset / home ----------------
     mujoco.mj_resetData(model, data)
-    data.qpos[sq:sq + 3] += offset_mm / 1000.0
-    if initial_roll_deg:
-        _roll = np.array([np.cos(np.radians(initial_roll_deg) / 2),
-                          0.0, 0.0,
-                          np.sin(np.radians(initial_roll_deg) / 2)])
-        _q = np.zeros(4)
-        mujoco.mju_mulQuat(_q, _roll, data.qpos[sq + 3:sq + 7].copy())
-        data.qpos[sq + 3:sq + 7] = _q
     mujoco.mj_forward(model, data)
+    state["inputs"]["pose_before_perturbation"] = shaft_pose_snapshot()
+    data.qpos[sq:sq + 3] += offset_mm / 1000.0
+    if yaw_world_z_deg:
+        data.qpos[sq + 3:sq + 7] = _apply_world_yaw_to_quaternion(
+            data.qpos[sq + 3:sq + 7].copy(), yaw_world_z_deg)
+    mujoco.mj_forward(model, data)
+    state["inputs"]["pose_after_perturbation_before_settle"] = (
+        shaft_pose_snapshot())
     data.qpos[arm.qadr[4]] = wrist
     data.ctrl[4] = wrist
     grip_direct(GRIP_OPEN)
@@ -2547,15 +2596,19 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
 
     tick("① 起始｜卡盘张开，工件在台面")
     home = shaft()
-    state["actual_initial_pose"] = {
-        "position_m": [float(x) for x in home],
-        "quaternion_wxyz": [
-            float(x) for x in data.qpos[sq + 3:sq + 7]],
-    }
+    state["actual_initial_pose"] = shaft_pose_snapshot()
     R = F.SHAFT_D / 2
     # Use the settled workpiece pose: --lift changes the nominal table pose.
     pick_at = home.copy()
     g = home
+    state["inputs"]["grasp_target_pose"] = {
+        "workpiece_center_m": [float(x) for x in pick_at],
+        "descent_position_m": [
+            float(pick_at[0]), float(pick_at[1]),
+            float(pick_at[2] + 0.002)],
+        "position_source": "settled_true_workpiece_center",
+        "orientation_source": "fixed_calibrated_grasp_pose",
+    }
     # The ARM still approaches the calibrated rod centre. The V groove is
     # physically shifted to GRIP_STATION inside the gripper, so the contact
     # patch is on the tail while the approach pose stays unchanged.
@@ -3573,10 +3626,22 @@ if __name__ == "__main__":
                     help="write structured case results to this JSON file")
     ap.add_argument("--initial-dy-mm", type=float, default=0.0)
     ap.add_argument("--initial-dz-mm", type=float, default=0.0)
-    ap.add_argument("--initial-roll-deg", type=float, default=0.0)
+    ap.add_argument(
+        "--initial-yaw-deg",
+        type=float,
+        help="rotate the workpiece about world +Z (positive X axis toward +Y)",
+    )
+    ap.add_argument(
+        "--initial-roll-deg",
+        type=float,
+        help="deprecated alias for --initial-yaw-deg; it was never axial roll",
+    )
     ap.add_argument("--random-seed", type=int)
     ap.add_argument("--case-id")
     args = ap.parse_args()
+    if (args.initial_yaw_deg is not None
+            and args.initial_roll_deg is not None):
+        ap.error("choose either --initial-yaw-deg or legacy --initial-roll-deg")
     if args.json_out:
         os.environ["FEED_RESULT_JSON"] = args.json_out
     if args.case_id:
@@ -3591,4 +3656,5 @@ if __name__ == "__main__":
                           initial_offset_mm=(0.0, args.initial_dy_mm,
                                              args.initial_dz_mm),
                           initial_roll_deg=args.initial_roll_deg,
+                          initial_yaw_deg=args.initial_yaw_deg,
                           random_seed=args.random_seed))

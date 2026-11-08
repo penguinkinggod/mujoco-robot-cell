@@ -1,26 +1,26 @@
 # 现在在做什么
 
 给下一个接手的人或 agent 看的现场记录。只写"此刻"的状态，不写历史；换手前改这里，不要另开日志。
-最后更新：2026-11-08（P2.4 扫描器错误处理验收完成）
+最后更新：2026-11-08（P4.2 零扰动与单轴小扰动已验收）
 
 ## 先读：抓取回归已修复，P0 已完成
 
-本轮给 `src/diag_feed_chuck.py` 和 `src/diag_feed_insert_sweep.py` 增加日志/扰动相关草稿后，完整送料测试出现回归：抓取目标过低、棒料被挤走，之后流程仍继续闭合卡盘。P0.2 已恢复抓取目标并加入抓取失败终止；P0.3 已重跑回归并完成画面核验。T1-T4 **仍没有完成验收**。
+本轮给 `src/diag_feed_chuck.py` 和 `src/diag_feed_insert_sweep.py` 增加日志/扰动相关代码后，完整送料测试曾出现回归：抓取目标过低、棒料被挤走，之后流程仍继续闭合卡盘。P0.2 已恢复抓取目标并加入抓取失败终止；P0.3 已重跑回归并完成画面核验。旧 T1-T4 已拆成 P1-P4 逐卡验收，当前以项目总账为准。
 
 已修复的首要差异：抓取目标恢复为仿真静置后的实际 `home`，包含 `--lift` 后的抬升高度；全物理 V 槽路径若抓取接触数为 0，则在 `grasp` 阶段 `FEED_ABORT`，不会继续搬运或闭合卡盘。官方兼容场景仍保留历史托力，并作为独立对照。P0.2、P0.3、P0.4 现已完成。
 
 **统一任务入口：[项目任务总账](docs/project-taskbook.md)**。它记录最终成果、分工、P0-P10 小任务、验收和决定。P1.1 指标字典见 [docs/metric-dictionary.md](docs/metric-dictionary.md)。P0.4 基准身份记录见 [docs/baseline-identity-2026-11-07.md](docs/baseline-identity-2026-11-07.md)，P3 退出段诊断见 [docs/exit-diagnostics-2026-11-07.md](docs/exit-diagnostics-2026-11-07.md)，P1.2/P1.3/P1.4 验收分别见 [docs/p1.2-state-transitions-2026-11-07.md](docs/p1.2-state-transitions-2026-11-07.md)、[docs/p1.3-validity-and-outcomes-2026-11-07.md](docs/p1.3-validity-and-outcomes-2026-11-07.md) 和 [docs/p1.4-failure-detection-2026-11-07.md](docs/p1.4-failure-detection-2026-11-07.md)。旧 T 清单是实现参考，不是允许一次做完所有步骤的授权。
 
-P0.1 审计结论见 [docs/audit-current-diff-2026-11-07.md](docs/audit-current-diff-2026-11-07.md)。最新基准 `diag_feed_chuck.py --v-jaw --lift --no-lock` 为 `FEED_METRIC PASS`：同轴 `0.64 mm`、倾角 `0.2°`、交接位移 `1.58 mm`、余量偏心 `0.70/2.0 mm`、20 N 拉拔位移 `0.00 mm`。负向 `dy=+50 mm` 在抓取阶段终止，未进入三爪闭合。P0.3 四档复验、8 mm 画面核验、P0.4 基准身份、P1.1 指标字典和 P3 退出段三模式诊断均已完成。P1.2 完成状态转换、ABORT/ERROR 和记账；P1.3 完成结果有效性与统计范围分类；P1.4 修复并验证机器人外壳碰撞漏报，夹空、碰撞、NaN 与正常分支均已测试。P2.1 记录实验复现配置；P2.2 记录六个关键节点；P2.3 将 JSON 升为 v6，补上每个物理步的接触/外加载荷汇总和节点快照，并将 20 N 拉拔单独统计。P2.4 让扫描器校验 v6 结构、case ID 和退出码，并处理缺失/损坏结果、启动错误和超时；CSV 可回溯到 schema 和逐 case JSON。完整回归 **10/10**，20 项单测通过。高 IK 残差仍不自动判为不可达。下一步做 P4.1，先明确坐标系与感知假设。
+P0.1 审计结论见 [docs/audit-current-diff-2026-11-07.md](docs/audit-current-diff-2026-11-07.md)。最新基准 `diag_feed_chuck.py --v-jaw --lift --no-lock` 为 `FEED_METRIC PASS`：同轴 `0.64 mm`、倾角 `0.2°`、交接位移 `1.58 mm`、余量偏心 `0.70/2.0 mm`、20 N 拉拔位移 `0.00 mm`。负向 `dy=+50 mm` 在抓取阶段终止，未进入三爪闭合。P0.3 四档复验、8 mm 画面核验、P0.4 基准身份、P1.1 指标字典和 P3 退出段三模式诊断均已完成。P1.2 完成状态转换、ABORT/ERROR 和记账；P1.3 完成结果有效性与统计范围分类；P1.4 修复并验证机器人外壳碰撞漏报，夹空、碰撞、NaN 与正常分支均已测试。P2.1 记录实验复现配置；P2.2 记录六个关键节点；P2.3 将 JSON 升为 v6，补上每个物理步的接触/外加载荷汇总和节点快照，并将 20 N 拉拔单独统计。P2.4 让扫描器校验 v6 结构、case ID 和退出码，并处理缺失/损坏结果、启动错误和超时；CSV 可回溯到 schema 和逐 case JSON。P4.1 已定义世界坐标扰动和固定目标/真值重定位/带误差重定位三种模式，并发现旧 `roll` 入口实际是 yaw、抓取中心按静置后真值更新。P4.2 已完成明确的 yaw 入口、schema v7 位姿快照和 7 个零/单轴工况；它们全部 PASS，但静置后都回到同一基准，不能当成机械臂独立抗扰成绩。完整回归 **10/10**，22 项单测通过。高 IK 残差仍不自动判为不可达。下一步做 P4.3 冻结共享样本清单和固定 seed。
 
-**尚未验收的实现：** 正式批量实验、姿态扰动入口、尺寸边界、夹具搜索和模型训练仍未完成。当前扫描器只做插入深度扫描，不是通用批量扰动工具；不可达专用判据也尚未实现。P2.1-P2.4 证据见 [docs/p2.1-case-json-schema-2026-11-07.md](docs/p2.1-case-json-schema-2026-11-07.md)、[docs/p2.2-checkpoint-records-2026-11-08.md](docs/p2.2-checkpoint-records-2026-11-08.md)、[docs/p2.3-contact-force-records-2026-11-08.md](docs/p2.3-contact-force-records-2026-11-08.md) 和 [docs/p2.4-sweep-error-handling-2026-11-08.md](docs/p2.4-sweep-error-handling-2026-11-08.md)；其他历史证据见 [docs/insert-sweep-2026-11-07.md](docs/insert-sweep-2026-11-07.md)、[docs/baseline-identity-2026-11-07.md](docs/baseline-identity-2026-11-07.md)、[docs/exit-diagnostics-2026-11-07.md](docs/exit-diagnostics-2026-11-07.md)、[docs/p1.2-state-transitions-2026-11-07.md](docs/p1.2-state-transitions-2026-11-07.md)、[docs/p1.3-validity-and-outcomes-2026-11-07.md](docs/p1.3-validity-and-outcomes-2026-11-07.md) 和 [docs/p1.4-failure-detection-2026-11-07.md](docs/p1.4-failure-detection-2026-11-07.md)。当前仅本地 commit；不 push，直到完成可公开展示的项目成果。
+**尚未验收的实现：** P4.3 之后的正式批量实验、M0/M1/M2 公平对照、尺寸边界、夹具搜索和模型训练仍未完成。当前扫描器只做插入深度扫描，不是通用批量扰动工具；不可达专用判据也尚未实现。P4.1 约定见 [docs/p4.1-perturbation-frames-2026-11-08.md](docs/p4.1-perturbation-frames-2026-11-08.md)，P4.2 证据见 [docs/p4.2-zero-and-axis-perturbations-2026-11-08.md](docs/p4.2-zero-and-axis-perturbations-2026-11-08.md)。P2.1-P2.4 证据见 [docs/p2.1-case-json-schema-2026-11-07.md](docs/p2.1-case-json-schema-2026-11-07.md)、[docs/p2.2-checkpoint-records-2026-11-08.md](docs/p2.2-checkpoint-records-2026-11-08.md)、[docs/p2.3-contact-force-records-2026-11-08.md](docs/p2.3-contact-force-records-2026-11-08.md) 和 [docs/p2.4-sweep-error-handling-2026-11-08.md](docs/p2.4-sweep-error-handling-2026-11-08.md)；其他历史证据见 [docs/insert-sweep-2026-11-07.md](docs/insert-sweep-2026-11-07.md)、[docs/baseline-identity-2026-11-07.md](docs/baseline-identity-2026-11-07.md)、[docs/exit-diagnostics-2026-11-07.md](docs/exit-diagnostics-2026-11-07.md)、[docs/p1.2-state-transitions-2026-11-07.md](docs/p1.2-state-transitions-2026-11-07.md)、[docs/p1.3-validity-and-outcomes-2026-11-07.md](docs/p1.3-validity-and-outcomes-2026-11-07.md) 和 [docs/p1.4-failure-detection-2026-11-07.md](docs/p1.4-failure-detection-2026-11-07.md)。当前仅本地 commit；不 push，直到完成可公开展示的项目成果。
 
 **要拿去问别人/别的 AI**：直接用 [docs/handoff-brief.md](docs/handoff-brief.md)，
 那份是自包含的，不需要读代码，末尾有 6 个待判断的问题。
 
 ## 当前目标
 
-当前先固定 Ø20 × 80 mm 棒料和现有 V 槽，完成成功判据与流程状态转换的可信记录，再开始受控扰动实验。大方向和后续阶段见 [docs/project-plan.md](docs/project-plan.md)；目前没有实体机械臂，视觉、流水线、多工件和策略训练都属于后续工作。
+当前先固定 Ø20 × 80 mm 棒料和现有 V 槽，完成成功判据、流程状态转换和基础扰动记录，再冻结可公平比较的扰动样本。大方向和后续阶段见 [docs/project-plan.md](docs/project-plan.md)；目前没有实体机械臂，视觉、流水线、多工件和策略训练都属于后续工作。
 
 用户要的是**交接过程的姿态**：松爪 ↔ 卡爪接手那一瞬不能"往左上怼一下 / 放掉料自己偏 /
 再夹紧又动一下 / 找轴心吨吨吨几下"。不能只看最终余量 PASS 就收尾。
@@ -35,7 +35,16 @@ P0.1 审计结论见 [docs/audit-current-diff-2026-11-07.md](docs/audit-current-
 - 新增 `src/diag_feed_insert_sweep.py`，运行 `python src/diag_feed_insert_sweep.py` 可扫描完整机械臂送料流程并写入 `_build/feed_insert_sweep.csv`。它只改变插入深度，其他 `FEED_*` 环境覆盖会清除。
 - 当前恢复后的四档复验：7.75 mm FAIL（余量偏心 2.19 mm），8 mm FAIL（2.28 mm），10 mm PASS（0.92 mm），25 mm PASS（0.70 mm）。
 - 本次固定初态四档中，最浅 PASS 是 **10 mm**；它不是生产标准或任意尺寸通用值。旧记录中的“8 mm PASS”属于另一轮代码/结果，已被本次复验覆盖。
-- 7.75/8 mm 首次超过 2.0 mm 余量偏心发生在轴向退出之后；进给完成、三爪夹紧、原地松爪仍未超线。8 mm 画面未见明显挤飞或穿模，但数值仍 FAIL。P3 对照显示：正常两段退出是 8 mm 三种模式中最不坏的路径，但唯一根因仍未证明。P1.2-P1.4、P2.1-P2.4 已完成，下一步先做 P4.1 的坐标系与感知假设定义。
+- 7.75/8 mm 首次超过 2.0 mm 余量偏心发生在轴向退出之后；进给完成、三爪夹紧、原地松爪仍未超线。8 mm 画面未见明显挤飞或穿模，但数值仍 FAIL。P3 对照显示：正常两段退出是 8 mm 三种模式中最不坏的路径，但唯一根因仍未证明。P1.2-P1.4、P2.1-P2.4、P4.1-P4.2 已完成；P4.2 的具体证据和解释边界见下方报告。
+
+## P4.2 本轮验收
+
+- 新增明确的 `--initial-yaw-deg`；旧 `--initial-roll-deg` 保留为兼容别名，并在 JSON 中标明它实际代表 world-Z yaw。
+- JSON schema 从 v6 升为 v7，记录扰动前、施加后静置前、静置后/抓取前和抓取目标四类位姿快照。
+- `dy=-3/+3 mm`、`dz=-2/+2 mm`、`yaw=-5/+5°` 加零扰动共 7 个 case 全部 `completed / PASS`。
+- 静置后中心都约为 `(260.0, -130.0, 39.812) mm`，轴线都约为 `(1, 0, 0)`；当前 V 槽/托架把请求扰动消掉了。
+- 因而这轮不是 M0 固定目标抗扰，也不是完整 M1/M2 成绩；它只是证明了扰动入口和“支撑消扰动”现象。
+- 报告：[docs/p4.2-zero-and-axis-perturbations-2026-11-08.md](docs/p4.2-zero-and-axis-perturbations-2026-11-08.md)；证据 JSON 在 `_build/p42_*.json`。
 
 ## 状态：阶段 B 第三轮已落地为新默认
 
@@ -211,14 +220,15 @@ P0.1 审计结论见 [docs/audit-current-diff-2026-11-07.md](docs/audit-current-
 
 ## 下一步（按优先级）
 
-1. **不要再去挤"落座"这个分项**：已实测夹松 / 夹紧 / 提高夹爪力限 / 提高夹爪
+1. **下一张先做 P4.3，不要直接跑 81 个正式工况**：冻结共享样本、范围和固定 seed，先把 M0/M1/M2 的样本和输入来源定死；随后再做正式批量。
+2. **不要再去挤"落座"这个分项**：已实测夹松 / 夹紧 / 提高夹爪力限 / 提高夹爪
    刚度 / 提前落座五条，落座能从小数点后压下来，但交接位移的峰谷不变甚至变大
    （1.51~1.67），因为料的总下垂是守恒的。要真的下去，只能动工装（形封闭夹持，
    不靠摩擦过闭合）或换刚度更高的臂/夹爪。
-2. **真机对应**：夹持点靠料重心是标准做法（短悬伸 + 靠近重心）；换成真机时
+3. **真机对应**：夹持点靠料重心是标准做法（短悬伸 + 靠近重心）；换成真机时
    夹爪本体与卡爪口的 20 mm 间隙要留住，否则会撞卡盘端面。
-3. 不要再用"调托架间隙"压指标——它是接触离散化的偶然结果，不稳健。
-4. 如果还要更小的位移：只能动工位（缩短棒料悬伸 / 加长插入深度），但
+4. 不要再用"调托架间隙"压指标——它是接触离散化的偶然结果，不稳健。
+5. 如果还要更小的位移：只能动工位（缩短棒料悬伸 / 加长插入深度），但
    47 mm 插入 IK 残差 26.8 mm，机械臂够不到。
 
 ## 实现要点（改代码前必读）
@@ -283,6 +293,6 @@ FEED_BUSHING=0 FEED_CLAMP_ANCHOR=0 FEED_CLAMP_LIFT=1 \
 
 ## 同步状态
 
-`verify_all.py` **9/9 通过**（新默认下重跑）。推送需用会话代理端口，
+`verify_all.py` **10/10 通过**（新默认下重跑），单测 **22/22**。当前正式结果 JSON 为 schema v7。推送需用会话代理端口，
 全局配置里的 7897 是坏的：
 `git -c http.proxy=$HTTP_PROXY -c https.proxy=$HTTPS_PROXY push origin main`
