@@ -99,9 +99,15 @@ from demo_08_pick_and_load import (
 )
 
 
-RESULT_SCHEMA_VERSION = 7
+RESULT_SCHEMA_VERSION = 8
 METRIC_SCHEMA_VERSION = 1
 CRITERION_SET_ID = "feed-criteria-v1"
+PLANNING_MODES = ("M0", "M1", "M2")
+WORLD_X_AXIS = np.array([1.0, 0.0, 0.0])
+# Frozen from the P4.2 zero-disturbance case after the same 600-step fixture
+# settle. This is calibration data, not a per-case measurement consumed by M0.
+NOMINAL_SETTLED_POSITION_M = np.array([
+    0.260000000, -0.130000000, 0.039812104])
 FEED_CHECKPOINTS = (
     ("feed_complete", "进给完成"),
     ("chuck_clamped", "三爪夹紧完成"),
@@ -130,6 +136,79 @@ def _apply_world_yaw_to_quaternion(quaternion_wxyz, yaw_world_z_deg):
     mujoco.mju_mulQuat(
         rotated, yaw_quaternion, np.asarray(quaternion_wxyz, dtype=float))
     return rotated
+
+
+def _normalise_axis(axis):
+    axis = np.asarray(axis, dtype=float)
+    return axis / max(float(np.linalg.norm(axis)), 1e-12)
+
+
+def _pose_axis_from_quaternion(quaternion_wxyz):
+    rotation = np.zeros(9)
+    mujoco.mju_quat2Mat(rotation, np.asarray(quaternion_wxyz, dtype=float))
+    return _normalise_axis(rotation.reshape(3, 3)[:, 2])
+
+
+def _resolve_planning_pose(planning_mode, true_pose, nominal_position_m,
+                           nominal_quaternion_wxyz, m2_error_mm=(0.0, 0.0,
+                                                                  0.0),
+                           m2_error_yaw_deg=0.0):
+    """Choose the pose the planner may consume for one physical case.
+
+    The simulator always keeps ``true_pose`` for evidence.  This function is
+    the information boundary: M0 never consumes it, M1 consumes it directly,
+    and M2 consumes only a deterministic noisy copy supplied by the caller.
+    """
+    mode = str(planning_mode).upper()
+    if mode not in PLANNING_MODES:
+        raise ValueError(
+            "planning_mode must be one of %s, got %r"
+            % ("/".join(PLANNING_MODES), planning_mode))
+    error_mm = np.asarray(m2_error_mm, dtype=float)
+    if error_mm.shape != (3,) or not np.all(np.isfinite(error_mm)):
+        raise ValueError("m2_error_mm must contain three finite values")
+    if not np.isfinite(float(m2_error_yaw_deg)):
+        raise ValueError("m2_error_yaw_deg must be finite")
+
+    if mode == "M0":
+        position = np.asarray(nominal_position_m, dtype=float).copy()
+        quaternion = np.asarray(
+            nominal_quaternion_wxyz, dtype=float).copy()
+        position_source = "fixed_nominal_settled_workpiece_center"
+        orientation_source = "fixed_nominal_workpiece_pose"
+        error_used = np.zeros(3)
+        yaw_error_used = 0.0
+    elif mode == "M1":
+        true_position = np.asarray(true_pose["position_m"], dtype=float)
+        true_quaternion = np.asarray(
+            true_pose["quaternion_wxyz"], dtype=float)
+        position = true_position.copy()
+        quaternion = true_quaternion.copy()
+        position_source = "settled_true_workpiece_center"
+        orientation_source = "settled_true_workpiece_pose"
+        error_used = np.zeros(3)
+        yaw_error_used = 0.0
+    else:
+        true_position = np.asarray(true_pose["position_m"], dtype=float)
+        true_quaternion = np.asarray(
+            true_pose["quaternion_wxyz"], dtype=float)
+        position = true_position + error_mm / 1000.0
+        quaternion = _apply_world_yaw_to_quaternion(
+            true_quaternion, m2_error_yaw_deg)
+        position_source = "estimated_workpiece_center"
+        orientation_source = "estimated_workpiece_pose"
+        error_used = error_mm
+        yaw_error_used = float(m2_error_yaw_deg)
+    return {
+        "mode": mode,
+        "position_m": position,
+        "quaternion_wxyz": quaternion,
+        "shaft_axis_world_unit": _pose_axis_from_quaternion(quaternion),
+        "position_source": position_source,
+        "orientation_source": orientation_source,
+        "m2_error_used_mm": error_used,
+        "m2_error_used_yaw_deg": yaw_error_used,
+    }
 
 
 _REPRODUCIBLE_ENV_KEYS = {
@@ -1339,7 +1418,8 @@ ARM_LEAD = F.ARM_SERVO_KV / F.ARM_SERVO_KP
 def main(frame_hook=None, model=None, data=None, carry_lock=True,
          v_jaw=False, lift=False, wrist=None, machine_solid=True,
          initial_offset_mm=(0.0, 0.0, 0.0), initial_roll_deg=None,
-         random_seed=None, initial_yaw_deg=None):
+         random_seed=None, initial_yaw_deg=None, planning_mode="M1",
+         m2_error_mm=(0.0, 0.0, 0.0), m2_error_yaw_deg=0.0):
     """Run the feed sequence.
 
     frame_hook(tag, model, data) is an OPTIONAL visualisation tap.
@@ -1650,6 +1730,16 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     if (not np.all(np.isfinite(offset_mm))
             or not np.isfinite(yaw_world_z_deg)):
         raise ValueError("initial pose values must be finite")
+    planning_mode = str(planning_mode).upper()
+    if planning_mode not in PLANNING_MODES:
+        raise ValueError(
+            "planning_mode must be one of %s, got %r"
+            % ("/".join(PLANNING_MODES), planning_mode))
+    m2_error_mm = np.asarray(m2_error_mm, dtype=float)
+    if m2_error_mm.shape != (3,) or not np.all(np.isfinite(m2_error_mm)):
+        raise ValueError("m2_error_mm must contain three finite values")
+    if not np.isfinite(float(m2_error_yaw_deg)):
+        raise ValueError("m2_error_yaw_deg must be finite")
     _KP0 = [float(model.actuator_gainprm[a, 0]) for a in arm.qadr]
     # 夹爪执行器力矩上限（N·m）。SO-101 出厂 ±3.35，挂 80 mm 料时料重经
     # V 槽楔形放大，实测把两指撑开 3.8 mm、料跟着下沉 1.4 mm。这里只是
@@ -1718,8 +1808,15 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                  "grasp_target_pose": None,
                  "insert_mm": float(INSERT_MM * 1000),
                  "random_seed": random_seed,
+                 "planning_mode": planning_mode,
+                 "m2_error_mm": [float(x) for x in m2_error_mm],
+                 "m2_error_yaw_deg": float(m2_error_yaw_deg),
              },
              "control_mode": {
+                 "planning_mode": planning_mode,
+                 "planning_pose_scope": "pre_grasp_target_only",
+                 "carry_feedback_policy": (
+                     "planned_pose_and_arm_site_transform_only"),
                  "v_jaw": bool(v_jaw),
                  "lift": bool(lift),
                  "carry": ("kinematic_lock" if carry_lock
@@ -1844,6 +1941,9 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                  "initial_offset_mm": [float(x) for x in offset_mm],
                  "initial_roll_deg": float(legacy_roll_deg),
                  "initial_yaw_world_z_deg": float(yaw_world_z_deg),
+                 "planning_mode": planning_mode,
+                 "m2_error_mm": [float(x) for x in m2_error_mm],
+                 "m2_error_yaw_deg": float(m2_error_yaw_deg),
                  "v_jaw": bool(v_jaw), "lift": bool(lift),
                  "carry_lock": bool(carry_lock),
                  "machine_solid": bool(machine_solid),
@@ -2018,15 +2118,13 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         return None
 
     def part_offset():
-        """Pad centre relative to the PART centre, measured right now.
-
-        The old constant offset was measured at pickup and reused all the way
-        to the chuck. Once the wrist changes orientation, a world-fixed
-        vector is wrong; re-measuring also absorbs a millimetre or two of
-        slip in the V jaws instead of accumulating it as a positioning error.
-        """
+        """Transform the grasp-time estimated part offset with the tool."""
         if carry_lock and state["offset"] is not None:
             return state["offset"]
+        if state.get("grasp_pad_offset_local") is not None:
+            mujoco.mj_forward(model, data)
+            R_site = data.site_xmat[arm.site].reshape(3, 3)
+            return R_site @ state["grasp_pad_offset_local"]
         return arm.pad_center() - shaft()
 
     def pad_target(tgt):
@@ -2075,7 +2173,9 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         """
         if axis_hold is None:
             axis_hold = state["axis_hold"]
-        if not axis_hold:
+        grasp_axis_active = state.get("grasp_axis_active", False)
+        use_axis_ik = axis_hold or grasp_axis_active
+        if not use_axis_ik:
             # 只写 ctrl，绝对不要写 qpos。
             # 直接给 qpos 会在每段第一帧把腕关节一步拽到 wrist，末端
             # 瞬跳 5~10 mm（实测 夹紧段 10.3 mm / 5.13 m/s、对中段
@@ -2088,12 +2188,17 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         q_start = np.array([data.qpos[a] for a in arm.qadr])
         q_path = None
         grid = None
-        if axis_hold:
+        if use_axis_ik:
             # Solve IK at several Cartesian waypoints instead of only at the
             # segment end. A straight joint-space interpolation between two
             # IK solutions lets the tool axis wander 20+ deg in between.
             R_site = data.site_xmat[arm.site].reshape(3, 3)
-            a_local = R_site.T @ rod_axis()
+            if axis_hold:
+                a_local = state["a_local"]
+                axis_target = _AXIS_TGT
+            else:
+                a_local = state["grasp_axis_local"]
+                axis_target = state["grasp_axis_target"]
             site_start = data.site_xpos[arm.site].copy()
             nwp = 8
             grid = np.linspace(0.0, 1.0, nwp + 1)
@@ -2103,7 +2208,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             for frac in grid[1:]:
                 p = site_start + frac * (site_target - site_start)
                 q_prev, pe, ae = arm.ik_axis(
-                    p, _AXIS_TGT, a_local,
+                    p, axis_target, a_local,
                     q_init=q_prev, iters=240)
                 last_ik = (pe, ae)
                 state.setdefault("ik_solver", []).append({
@@ -2372,7 +2477,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         # 逐点链式 IK：每一点的初值取上一点的解，避免跳分支。
         q_start = np.array([data.qpos[a] for a in arm.qadr])
         R_site = data.site_xmat[arm.site].reshape(3, 3)
-        a_local = R_site.T @ rod_axis()
+        a_local = state["a_local"]
         qs = [q_start]
         q_prev = q_start.copy()
         worst = 0.0
@@ -2597,18 +2702,72 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     tick("① 起始｜卡盘张开，工件在台面")
     home = shaft()
     state["actual_initial_pose"] = shaft_pose_snapshot()
-    R = F.SHAFT_D / 2
-    # Use the settled workpiece pose: --lift changes the nominal table pose.
-    pick_at = home.copy()
-    g = home
+    if lift:
+        nominal_position = NOMINAL_SETTLED_POSITION_M.copy()
+    else:
+        nominal_position = np.asarray(SM.SHAFT_POS, dtype=float).copy()
+    nominal_pose = _resolve_planning_pose(
+        "M0",
+        state["actual_initial_pose"],
+        nominal_position,
+        SHAFT_Q0,
+    )
+    planning_pose = _resolve_planning_pose(
+        planning_mode,
+        state["actual_initial_pose"],
+        nominal_position,
+        SHAFT_Q0,
+        m2_error_mm=m2_error_mm,
+        m2_error_yaw_deg=m2_error_yaw_deg,
+    )
+    pick_at = planning_pose["position_m"].copy()
+    planning_axis = planning_pose["shaft_axis_world_unit"].copy()
+    # Calibrate the tool-local rod axis at the fixed nominal grasp target.
+    # M0/M2 carry this planned axis forward instead of re-reading the shaft.
+    mujoco.mj_forward(model, data)
+    nominal_offset = arm.pad_offset()
+    nominal_q, _nominal_residual = arm.ik(
+        nominal_position - nominal_offset, lock_wrist_roll=wrist)
+    calibration_data = mujoco.MjData(model)
+    calibration_data.qpos[:] = data.qpos
+    for qadr, value in zip(arm.qadr, nominal_q):
+        calibration_data.qpos[qadr] = value
+    mujoco.mj_forward(model, calibration_data)
+    calibrated_site_rotation = calibration_data.site_xmat[
+        arm.site].reshape(3, 3)
+    state["grasp_axis_local"] = (
+        calibrated_site_rotation.T @ WORLD_X_AXIS)
+    state["grasp_axis_target"] = planning_axis
+    state["grasp_axis_active"] = (
+        np.degrees(np.arccos(np.clip(
+            float(np.dot(planning_axis, WORLD_X_AXIS)), -1.0, 1.0)))
+        > 0.25)
     state["inputs"]["grasp_target_pose"] = {
+        "mode": planning_mode,
         "workpiece_center_m": [float(x) for x in pick_at],
+        "quaternion_wxyz": [
+            float(x) for x in planning_pose["quaternion_wxyz"]],
+        "shaft_axis_world_unit": [
+            float(x) for x in planning_axis],
         "descent_position_m": [
             float(pick_at[0]), float(pick_at[1]),
             float(pick_at[2] + 0.002)],
-        "position_source": "settled_true_workpiece_center",
-        "orientation_source": "fixed_calibrated_grasp_pose",
+        "position_source": planning_pose["position_source"],
+        "orientation_source": planning_pose["orientation_source"],
+        "carry_offset_source": "planned_grasp_target_pose",
+        "m2_error_used_mm": [
+            float(x) for x in planning_pose["m2_error_used_mm"]],
+        "m2_error_used_yaw_deg": float(
+            planning_pose["m2_error_used_yaw_deg"]),
+        "nominal_workpiece_center_m": [
+            float(x) for x in nominal_pose["position_m"]],
+        "true_workpiece_center_m": [
+            float(x) for x in state["actual_initial_pose"]["position_m"]],
     }
+    R = F.SHAFT_D / 2
+    # Carry targets remain in the planner's pose estimate. The physical pose
+    # is retained separately for scoring and diagnosis.
+    g = pick_at
     # The ARM still approaches the calibrated rod centre. The V groove is
     # physically shifted to GRIP_STATION inside the gripper, so the contact
     # patch is on the tail while the approach pose stays unchanged.
@@ -2651,7 +2810,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 "moving_jaw_pad_v%d" % k) for k in (1, 2)]
             entry_axis = (np.mean(data.geom_xpos[moving], axis=0)
                           - np.mean(data.geom_xpos[fixed], axis=0))
-            rod = rod_axis()
+            rod = planning_axis
             entry_axis -= np.dot(entry_axis, rod) * rod
             entry_axis /= max(float(np.linalg.norm(entry_axis)), 1e-12)
             tgt = pick_at - 0.020 * entry_axis
@@ -2663,7 +2822,14 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
               % (name, np.round(shaft(), 4), axdev(),
                  np.linalg.norm(arm.pad_center() - shaft()) * 1000))
         if name == "夹紧":
-            state["offset"] = arm.pad_center() - shaft()
+            # Keep the same information boundary in every mode: the carry
+            # target is derived from the planned grasp pose, never a fresh
+            # measurement of the physical shaft at clamp time.
+            state["offset"] = arm.pad_center() - pick_at
+            R_site = data.site_xmat[arm.site].reshape(3, 3)
+            state["grasp_pad_offset_local"] = (
+                R_site.T @ state["offset"])
+            state["a_local"] = R_site.T @ planning_axis
         tick({"接近": "② 接近｜到槽口外侧",
               "侧向进入": "③ 侧向进入｜沿 V 槽开口",
               "下降": "④ 下降｜pad 到轴心",
@@ -2734,6 +2900,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         write_result_json(result)
         return 1
     record_stage("grasp_complete")
+    state["grasp_axis_target"] = None
+    state["grasp_axis_active"] = False
     print("  shaft_in_grip = %s mm（搬运锁的相对偏移）"
           % np.round(state["offset"] * 1000, 2))
     # 落座：抓起后先把料抬离台面几毫米再静置，让它在 V 槽里坐到底。
@@ -2764,8 +2932,6 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     # calibrated approach is over; from here the wrist must counter-rotate
     # so the rod never tips 80 deg during the long traverse.
     state["axis_hold"] = not carry_lock
-    state["a_local"] = (data.site_xmat[arm.site].reshape(3, 3).T
-                        @ rod_axis())
 
     # ---------------- carry: 先对轴，再直线进给 ----------------
     # 工艺顺序（真实车床上下料就是这么走的）：
@@ -2799,21 +2965,14 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         # 下垂）。进给是唯一必须精确到位的地方，所以只在这里补一次闭环，
         # 而不是把整条轨迹切回逐段 rest-to-rest。
         err = move3(pad_target(feed_goal), FEED_STEPS, grip_close, carry_lock,
-                    probe=None if carry_lock else shaft,
-                    probe_goal=None if carry_lock else feed_goal,
                     label="进给", iters=FEED_ITERS)
     else:
         for name, tgt, ns in carry:
-            # 只有最后一段闭环到「工件」，前三段必须闭环到「pad」：
-            # 工件此刻还躺在台面的 V 槽夹具里，把它当作被控对象就等于
-            # 命令机械臂去拽一个还被夹具夹着的零件。实测过：对中/抬起
-            # 一旦 probe=shaft，工件被硬拽出槽，轴向偏从 2.4 deg 飙到 81 deg，
-            # 后面三爪一个接触点都没有。
-            close_on_part = (name == "下到轴线") and not carry_lock
+            # All modes close the carry loop on the planned pad target. The
+            # settled shaft pose selects the grasp target once; no mode gets
+            # extra live shaft-state feedback during transport.
             err = move3(pad_target(tgt), ns,
                         grip_close, carry_lock,
-                        probe=shaft if close_on_part else None,
-                        probe_goal=np.array(tgt) if close_on_part else None,
                         label=name)
             ngc, fgrip = grip_state()
             a_site = (data.site_xmat[arm.site].reshape(3, 3)
@@ -2840,8 +2999,6 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                  (F.SHAFT_L - INSERT_MM) * 1000, FEED_Z_COMP * 1000))
         err = move3(pad_target(feed_goal), 500, grip_close,
                     carry_lock,
-                    probe=None if carry_lock else shaft,
-                    probe_goal=None if carry_lock else feed_goal,
                     label="进给")
     # 夹爪站位按 pad 中心量；真实碰撞再查机器人与机床的接触对。
     station_x = arm.pad_center()[0]
@@ -3636,6 +3793,16 @@ if __name__ == "__main__":
         type=float,
         help="deprecated alias for --initial-yaw-deg; it was never axial roll",
     )
+    ap.add_argument(
+        "--control-mode",
+        choices=PLANNING_MODES,
+        default="M1",
+        help="pose information available to grasp planning (default: M1)",
+    )
+    ap.add_argument("--m2-error-dx-mm", type=float, default=0.0)
+    ap.add_argument("--m2-error-dy-mm", type=float, default=0.0)
+    ap.add_argument("--m2-error-dz-mm", type=float, default=0.0)
+    ap.add_argument("--m2-error-yaw-deg", type=float, default=0.0)
     ap.add_argument("--random-seed", type=int)
     ap.add_argument("--case-id")
     args = ap.parse_args()
@@ -3657,4 +3824,9 @@ if __name__ == "__main__":
                                              args.initial_dz_mm),
                           initial_roll_deg=args.initial_roll_deg,
                           initial_yaw_deg=args.initial_yaw_deg,
+                          planning_mode=args.control_mode,
+                          m2_error_mm=(args.m2_error_dx_mm,
+                                       args.m2_error_dy_mm,
+                                       args.m2_error_dz_mm),
+                          m2_error_yaw_deg=args.m2_error_yaw_deg,
                           random_seed=args.random_seed))

@@ -43,8 +43,59 @@ class WorldYawConventionTests(unittest.TestCase):
             feed._resolve_initial_yaw_deg(5.0, -5.0)
 
 
+class PlanningModeIsolationTests(unittest.TestCase):
+    def setUp(self):
+        self.true_pose = {
+            "position_m": [0.26, -0.13, 0.04],
+            "quaternion_wxyz": [
+                0.7071067812, 0.0, 0.7071067812, 0.0],
+        }
+        self.nominal_position = [0.26, -0.13, 0.039812104]
+
+    def test_m0_does_not_consume_per_case_truth(self):
+        first = feed._resolve_planning_pose(
+            "M0", self.true_pose, self.nominal_position, feed.SHAFT_Q0)
+        second = feed._resolve_planning_pose(
+            "M0", {"invalid": "truth is not an input"},
+            self.nominal_position, feed.SHAFT_Q0)
+
+        np.testing.assert_allclose(first["position_m"], second["position_m"])
+        np.testing.assert_allclose(
+            first["shaft_axis_world_unit"],
+            second["shaft_axis_world_unit"])
+        self.assertEqual(
+            "fixed_nominal_settled_workpiece_center",
+            first["position_source"])
+
+    def test_m1_uses_the_settled_true_pose(self):
+        result = feed._resolve_planning_pose(
+            "M1", self.true_pose, self.nominal_position, feed.SHAFT_Q0)
+
+        np.testing.assert_allclose(
+            self.true_pose["position_m"], result["position_m"])
+        self.assertEqual(
+            "settled_true_workpiece_center", result["position_source"])
+
+    def test_m2_uses_true_pose_plus_declared_estimation_error(self):
+        result = feed._resolve_planning_pose(
+            "M2", self.true_pose, self.nominal_position, feed.SHAFT_Q0,
+            m2_error_mm=(0.0, 0.5, -0.25), m2_error_yaw_deg=2.0)
+
+        np.testing.assert_allclose(
+            [0.26, -0.1295, 0.03975], result["position_m"])
+        self.assertAlmostEqual(2.0, result["m2_error_used_yaw_deg"])
+        self.assertEqual(
+            "estimated_workpiece_center", result["position_source"])
+
+    def test_m2_rejects_nonfinite_error(self):
+        with self.assertRaises(ValueError):
+            feed._resolve_planning_pose(
+                "M2", self.true_pose, self.nominal_position,
+                feed.SHAFT_Q0, m2_error_mm=(0.0, float("nan"), 0.0))
+
+
 def assert_reproducibility_fields(test_case, result):
-    test_case.assertEqual(7, result["schema_version"])
+    test_case.assertEqual(8, result["schema_version"])
     test_case.assertEqual(1, result["metric_schema_version"])
     test_case.assertEqual("feed-criteria-v1", result["criterion_set_id"])
     test_case.assertTrue(result["case_id"])
@@ -394,7 +445,7 @@ class RobotMachineContactTests(unittest.TestCase):
             "settled_true_workpiece_center",
             result["inputs"]["grasp_target_pose"]["position_source"])
         self.assertEqual(
-            "fixed_calibrated_grasp_pose",
+            "settled_true_workpiece_pose",
             result["inputs"]["grasp_target_pose"]["orientation_source"])
         contact_scopes = result["contact_diagnostics"]["scopes"]
         feed_contacts = contact_scopes["feed"]["overall"]

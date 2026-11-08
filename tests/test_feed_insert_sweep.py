@@ -16,7 +16,7 @@ def make_result(case_id, status="completed", passed=True):
     hard_pass = passed
     quality_pass = passed if status == "completed" else None
     result = {
-        "schema_version": 7,
+        "schema_version": 8,
         "case_id": case_id,
         "execution_status": status,
         "evaluation_scope": "primary_physics_feed",
@@ -29,6 +29,20 @@ def make_result(case_id, status="completed", passed=True):
             "aborted" if status == "aborted" else "runtime_error"
         ),
         "config": {"diagnostic_mode": "standard"},
+        "control_mode": {
+            "planning_mode": "M1",
+            "planning_pose_scope": "pre_grasp_target_only",
+            "carry_feedback_policy": (
+                "planned_pose_and_arm_site_transform_only"),
+        },
+        "inputs": {
+            "grasp_target_pose": {
+                "mode": "M1",
+                "carry_offset_source": "planned_grasp_target_pose",
+                "m2_error_used_mm": [0.0, 0.0, 0.0],
+                "m2_error_used_yaw_deg": 0.0,
+            }
+        },
         "metrics": {},
         "hard_pass": hard_pass,
         "quality_pass": quality_pass,
@@ -91,12 +105,38 @@ class FeedInsertSweepTests(unittest.TestCase):
 
         self.assertEqual("PASS", row["status"])
         self.assertEqual(0, row["exit_code"])
-        self.assertEqual(7, row["schema_version"])
+        self.assertEqual(8, row["schema_version"])
         self.assertEqual("sweep-test-case", row["case_id"])
         self.assertEqual(str(json_path), row["json_path"])
         self.assertEqual(0.64, row["coax_mm"])
         self.assertEqual(1.25, row["feed_residual_mm"])
         self.assertEqual("standard", row["diagnostic_mode"])
+        self.assertEqual("M1", row["planning_mode"])
+
+    def test_result_planning_mode_and_m2_error_must_match_request(self):
+        result = make_result("sweep-test-case")
+        result["control_mode"]["planning_mode"] = "M2"
+        result["inputs"]["grasp_target_pose"]["mode"] = "M2"
+        row, _ = self._run_case(result)
+        self.assertEqual("ERROR", row["status"])
+        self.assertEqual("invalid_result", row["execution_status"])
+        self.assertIn("planning mode mismatch", row["error"])
+
+        result = make_result("sweep-test-case")
+        result["inputs"]["grasp_target_pose"]["m2_error_used_mm"][1] = 0.5
+        row, _ = self._run_case(result)
+        self.assertEqual("ERROR", row["status"])
+        self.assertIn("M2 errors differ", row["error"])
+
+    def test_result_rejects_unplanned_carry_offset_source(self):
+        result = make_result("sweep-test-case")
+        result["inputs"]["grasp_target_pose"][
+            "carry_offset_source"] = "live_shaft_pose"
+
+        row, _ = self._run_case(result)
+
+        self.assertEqual("ERROR", row["status"])
+        self.assertIn("carry offset source", row["error"])
 
     def test_expected_simulation_fail_and_abort_are_not_runtime_errors(self):
         failed = make_result(

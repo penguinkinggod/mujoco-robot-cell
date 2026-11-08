@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FEED_SCRIPT = ROOT / "src" / "diag_feed_chuck.py"
 DEFAULT_OUTPUT = ROOT / "_build" / "feed_insert_sweep.csv"
 DEFAULT_INSERTS_MM = (5, 6, 7, 8, 9, 10, 15, 20, 25, 30)
-EXPECTED_SCHEMA_VERSION = 7
+EXPECTED_SCHEMA_VERSION = 8
 CASE_TIMEOUT_SECONDS = 600
 COMPLETED_METRICS = (
     "coax_mm",
@@ -36,14 +36,21 @@ COMPLETED_METRICS = (
 
 
 def _new_row(insert_mm, json_path, case_id, dy_mm, dz_mm, yaw_deg,
-             random_seed):
+             random_seed, planning_mode="M1", sample_id="",
+             m2_error_dy_mm=0.0, m2_error_dz_mm=0.0,
+             m2_error_yaw_deg=0.0):
     return {
         "case_id": case_id,
+        "sample_id": sample_id,
         "random_seed": "" if random_seed is None else random_seed,
         "insert_mm": insert_mm,
         "dy_mm": dy_mm,
         "dz_mm": dz_mm,
         "yaw_deg": yaw_deg,
+        "planning_mode": planning_mode,
+        "m2_error_dy_mm": m2_error_dy_mm,
+        "m2_error_dz_mm": m2_error_dz_mm,
+        "m2_error_yaw_deg": m2_error_yaw_deg,
         "status": "ERROR",
         "execution_status": "",
         "evaluation_scope": "",
@@ -113,7 +120,8 @@ def _is_finite_number(value):
     )
 
 
-def _result_error(result, case_id):
+def _result_error(result, case_id, expected_mode=None,
+                  expected_m2_error=None):
     """Return why a case JSON is unusable, or None for a supported schema."""
     if not isinstance(result, dict):
         return "result JSON root must be an object"
@@ -134,6 +142,8 @@ def _result_error(result, case_id):
 
     required = (
         "config",
+        "control_mode",
+        "inputs",
         "evaluation_scope",
         "trial_data_valid",
         "include_in_primary_trial_stats",
@@ -152,6 +162,45 @@ def _result_error(result, case_id):
 
     if not isinstance(result["config"], dict):
         return "config must be an object"
+    if not isinstance(result["control_mode"], dict):
+        return "control_mode must be an object"
+    if not isinstance(result["inputs"], dict):
+        return "inputs must be an object"
+    mode = result["control_mode"].get("planning_mode")
+    if mode not in ("M0", "M1", "M2"):
+        return "control_mode.planning_mode must be M0, M1, or M2"
+    if (result["control_mode"].get("planning_pose_scope")
+            != "pre_grasp_target_only"):
+        return "unsupported planning pose scope"
+    if (result["control_mode"].get("carry_feedback_policy")
+            != "planned_pose_and_arm_site_transform_only"):
+        return "unsupported carry feedback policy"
+    if expected_mode is not None and mode != expected_mode:
+        return "planning mode mismatch: expected %s, got %s" % (
+            expected_mode, mode)
+    target = result["inputs"].get("grasp_target_pose")
+    if status != "error" and not isinstance(target, dict):
+        return "completed/aborted result must include grasp_target_pose"
+    if target is not None:
+        if not isinstance(target, dict) or target.get("mode") != mode:
+            return "grasp_target_pose mode does not match control_mode"
+        if (target.get("carry_offset_source")
+                != "planned_grasp_target_pose"):
+            return "unsupported grasp-time carry offset source"
+        if expected_m2_error is not None:
+            actual_error = target.get("m2_error_used_mm")
+            actual_yaw = target.get("m2_error_used_yaw_deg")
+            if (not isinstance(actual_error, list)
+                    or len(actual_error) != 3
+                    or any(not _is_finite_number(value)
+                           for value in actual_error)
+                    or not _is_finite_number(actual_yaw)):
+                return "grasp_target_pose has invalid M2 error audit fields"
+            expected_position_error, expected_yaw_error = expected_m2_error
+            if (any(abs(float(actual_error[index]) - expected_position_error[index])
+                    > 1e-9 for index in range(3))
+                    or abs(float(actual_yaw) - expected_yaw_error) > 1e-9):
+                return "grasp_target_pose M2 errors differ from requested values"
     if not isinstance(result["evaluation_scope"], str):
         return "evaluation_scope must be a string"
     for key in (
@@ -220,6 +269,7 @@ def _copy_classification(row, result):
         "physical_task_success": result["physical_task_success"],
         "outcome_class": result["outcome_class"],
         "diagnostic_mode": result["config"].get("diagnostic_mode", ""),
+        "planning_mode": result["control_mode"].get("planning_mode", ""),
         "abort_stage": result.get("abort_stage", ""),
         "hard_pass": result["hard_pass"],
         "quality_pass": result["quality_pass"],
@@ -229,11 +279,15 @@ def _copy_classification(row, result):
 
 
 def run_case(insert_mm, json_path, case_id=None, dy_mm=0.0, dz_mm=0.0,
-             yaw_deg=0.0, random_seed=None):
+             yaw_deg=0.0, random_seed=None, planning_mode="M1",
+             sample_id="", m2_error_dy_mm=0.0, m2_error_dz_mm=0.0,
+             m2_error_yaw_deg=0.0):
     case_id = case_id or uuid.uuid4().hex[:12]
     json_path = Path(json_path)
     row = _new_row(
-        insert_mm, json_path, case_id, dy_mm, dz_mm, yaw_deg, random_seed)
+        insert_mm, json_path, case_id, dy_mm, dz_mm, yaw_deg, random_seed,
+        planning_mode, sample_id, m2_error_dy_mm, m2_error_dz_mm,
+        m2_error_yaw_deg)
     try:
         json_path.parent.mkdir(parents=True, exist_ok=True)
         json_path.unlink(missing_ok=True)
@@ -252,6 +306,10 @@ def run_case(insert_mm, json_path, case_id=None, dy_mm=0.0, dz_mm=0.0,
         sys.executable, str(FEED_SCRIPT), "--v-jaw", "--lift", "--no-lock",
         "--initial-dy-mm", str(dy_mm), "--initial-dz-mm", str(dz_mm),
         "--initial-yaw-deg", str(yaw_deg), "--case-id", case_id,
+        "--control-mode", planning_mode,
+        "--m2-error-dy-mm", str(m2_error_dy_mm),
+        "--m2-error-dz-mm", str(m2_error_dz_mm),
+        "--m2-error-yaw-deg", str(m2_error_yaw_deg),
     ]
     if random_seed is not None:
         command.extend(["--random-seed", str(random_seed)])
@@ -289,7 +347,13 @@ def run_case(insert_mm, json_path, case_id=None, dy_mm=0.0, dz_mm=0.0,
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         return _set_error(row, "invalid_result", str(error), output)
 
-    invalid_reason = _result_error(result, case_id)
+    expected_m2_error = (
+        (0.0, m2_error_dy_mm, m2_error_dz_mm),
+        m2_error_yaw_deg,
+    )
+    invalid_reason = _result_error(
+        result, case_id, expected_mode=planning_mode,
+        expected_m2_error=expected_m2_error)
     if isinstance(result, dict):
         row["schema_version"] = result.get("schema_version", "")
     if invalid_reason:
