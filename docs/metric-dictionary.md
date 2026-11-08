@@ -65,9 +65,9 @@
 2. `evaluation_scope`：这条记录属于主全物理送料、带运动学锁的历史参考，还是其他诊断配置。只有声明的主实验配置进入主实验统计；其他配置可以报告，但不混入同一个成功率。
 3. `outcome_class` 与原判据：可用的主实验尝试再分成功、硬失败、质量失败或中止。`hard_pass`、`quality_pass`、`overall_pass` 仍保留原含义，不能因新增标签而重算或覆盖。
 
-P1.3 的机读字段写在 case JSON 顶层，`schema_version=3`；P2.1 又加入复现配置字段，当前正式结果为 `schema_version=4`。这次结构升级不改变指标算法或判据版本：
+P1.3 的机读字段写在 case JSON 顶层，`schema_version=3`；P2.1 加入复现配置字段升为 v4；P2.2 增加标准阶段检查点，当前正式结果为 `schema_version=5`。P2.2 只扩展记录结构，不改变指标算法或判据版本：
 
-- `schema_version=4`：JSON 字段结构版本。
+- `schema_version=5`：JSON 字段结构版本。
 - `metric_schema_version=1`：指标定义版本。
 - `criterion_set_id=feed-criteria-v1`：PASS/FAIL 门槛版本。
 

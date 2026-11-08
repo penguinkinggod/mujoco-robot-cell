@@ -21,13 +21,14 @@ import diag_feed_chuck as feed
 
 
 def assert_reproducibility_fields(test_case, result):
-    test_case.assertEqual(4, result["schema_version"])
+    test_case.assertEqual(5, result["schema_version"])
     test_case.assertEqual(1, result["metric_schema_version"])
     test_case.assertEqual("feed-criteria-v1", result["criterion_set_id"])
     test_case.assertTrue(result["case_id"])
     test_case.assertIn(result["execution_status"],
                        ("completed", "aborted", "error"))
     test_case.assertIn("stages", result)
+    test_case.assertIn("checkpoints", result)
     test_case.assertIn("hard_failures", result)
     test_case.assertIn("quality_failures", result)
     test_case.assertEqual(result["git_revision"],
@@ -51,6 +52,35 @@ def assert_reproducibility_fields(test_case, result):
             4, len(result["actual_initial_pose"]["quaternion_wxyz"]))
 
 
+def assert_feed_checkpoints(test_case, result, expected_status=None):
+    checkpoints = result["checkpoints"]
+    expected_ids = (
+        "feed_complete",
+        "chuck_clamped",
+        "gripper_released_in_place",
+        "axial_retreat_complete",
+        "lateral_retreat_complete",
+        "unlock_settled",
+    )
+    test_case.assertEqual(expected_ids, tuple(
+        row["checkpoint_id"] for row in checkpoints))
+    for order, row in enumerate(checkpoints, start=1):
+        test_case.assertEqual(order, row["checkpoint_order"])
+        test_case.assertTrue(row["checkpoint_label"])
+        test_case.assertIn(
+            row["checkpoint_status"], ("completed", "skipped"))
+        test_case.assertIsInstance(row["sim_time_s"], float)
+        test_case.assertEqual(3, len(row["shaft_position_m"]))
+        test_case.assertEqual(3, len(row["shaft_axis"]))
+        test_case.assertIn("coax_mm", row)
+        test_case.assertIn("stock_ecc_mm", row)
+        test_case.assertIn("jaw_contact_count", row)
+    if expected_status is not None:
+        test_case.assertEqual(
+            expected_status,
+            tuple(row["checkpoint_status"] for row in checkpoints))
+
+
 class ExperimentEnvironmentCaptureTests(unittest.TestCase):
     def test_captures_physics_overrides_not_run_bookkeeping(self):
         captured = feed._capture_environment_overrides({
@@ -71,6 +101,20 @@ class ExperimentEnvironmentCaptureTests(unittest.TestCase):
             "SMOOTH": "0",
             "GRIP_RAMP": "400",
         }, captured)
+
+    def test_retreat_diagnostics_distinguish_skipped_actions(self):
+        self.assertEqual({
+            "axial_retreat_complete": "completed",
+            "lateral_retreat_complete": "completed",
+        }, feed._feed_checkpoint_statuses(True, False))
+        self.assertEqual({
+            "axial_retreat_complete": "skipped",
+            "lateral_retreat_complete": "completed",
+        }, feed._feed_checkpoint_statuses(False, False))
+        self.assertEqual({
+            "axial_retreat_complete": "skipped",
+            "lateral_retreat_complete": "skipped",
+        }, feed._feed_checkpoint_statuses(True, True))
 
 
 class RobotMachineContactTests(unittest.TestCase):
@@ -184,6 +228,8 @@ class RobotMachineContactTests(unittest.TestCase):
         self.assertTrue(injected[0])
         self.assertEqual(1, exit_code)
         assert_reproducibility_fields(self, result)
+        assert_feed_checkpoints(
+            self, result, ("completed",) * 6)
         self.assertEqual("completed", result["execution_status"])
         self.assertGreater(
             result["metrics"]["robot_machine_contact_max"], 0)

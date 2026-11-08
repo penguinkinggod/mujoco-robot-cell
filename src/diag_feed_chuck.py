@@ -99,9 +99,17 @@ from demo_08_pick_and_load import (
 )
 
 
-RESULT_SCHEMA_VERSION = 4
+RESULT_SCHEMA_VERSION = 5
 METRIC_SCHEMA_VERSION = 1
 CRITERION_SET_ID = "feed-criteria-v1"
+FEED_CHECKPOINTS = (
+    ("feed_complete", "进给完成"),
+    ("chuck_clamped", "三爪夹紧完成"),
+    ("gripper_released_in_place", "原地松爪完成"),
+    ("axial_retreat_complete", "轴向退出完成"),
+    ("lateral_retreat_complete", "侧向退出完成"),
+    ("unlock_settled", "解锁静置完成"),
+)
 _REPRODUCIBLE_ENV_KEYS = {
     "FEED_INSERT_MM", "FEED_Z_COMP_MM", "FEED_GRIP_STATION_MM",
     "FEED_RETREAT_AXIAL", "FEED_LEVEL_ROD", "FEED_AXIS_LEAD_DEG",
@@ -225,6 +233,16 @@ def _case_metadata(state, model):
         "versions": versions,
         # Keep the original top-level version fields for existing readers.
         **versions,
+    }
+
+
+def _feed_checkpoint_statuses(axial_retreat, no_retreat_diagnostic):
+    axial_done = axial_retreat and not no_retreat_diagnostic
+    lateral_done = not no_retreat_diagnostic
+    return {
+        "axial_retreat_complete": "completed" if axial_done else "skipped",
+        "lateral_retreat_complete": (
+            "completed" if lateral_done else "skipped"),
     }
 
 
@@ -1329,7 +1347,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
 
     state = {"offset": None, "off_site": None, "abs_pos": None,
              "lock_active": True, "axis_hold": False,
-             "stage_records": [], "case_id": case_id,
+             "stage_records": [], "checkpoints": [], "case_id": case_id,
              "random_seed": random_seed,
              "rod_force_max": 0.0, "robot_machine_contact_max": 0,
              "shaft_contact_max": 0, "phase_stats": {}, "ik_solver": [],
@@ -1532,6 +1550,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             "ik_solver": state.get("ik_solver", []),
             "ik_residuals_mm": state.get("ik_residuals_mm", {}),
             "stages": state.get("stage_records", []),
+            "checkpoints": state.get("checkpoints", []),
         }
         result.update(_case_classification(
             result["execution_status"], evaluation_scope,
@@ -1547,7 +1566,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         mujoco.mj_step(model, data)
         ensure_finite_state("%s:after_step" % label)
 
-    def record_stage(name):
+    def record_stage(name, checkpoint_id=None,
+                     checkpoint_status="completed"):
         ensure_finite_state(name)
         mujoco.mj_forward(model, data)
         ensure_finite_state("%s:after_forward" % name)
@@ -1596,6 +1616,27 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             "penetration_pair": PEN["pair"],
             "penetration_phase": PEN["label"],
         }
+        if checkpoint_id is not None:
+            checkpoint_order = next(
+                (index for index, (key, _label)
+                 in enumerate(FEED_CHECKPOINTS, start=1)
+                 if key == checkpoint_id),
+                None,
+            )
+            if checkpoint_order is None:
+                raise ValueError("unknown feed checkpoint: %s" % checkpoint_id)
+            if checkpoint_status not in ("completed", "skipped"):
+                raise ValueError(
+                    "invalid feed checkpoint status: %s"
+                    % checkpoint_status)
+            row.update({
+                "checkpoint_id": checkpoint_id,
+                "checkpoint_order": checkpoint_order,
+                "checkpoint_label": FEED_CHECKPOINTS[
+                    checkpoint_order - 1][1],
+                "checkpoint_status": checkpoint_status,
+            })
+            state["checkpoints"].append(dict(row))
         state["stage_records"].append(row)
         return row
 
@@ -2310,6 +2351,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             "ik_solver": state.get("ik_solver", []),
             "ik_residuals_mm": state.get("ik_residuals_mm", {}),
             "stages": state.get("stage_records", []),
+            "checkpoints": state.get("checkpoints", []),
         }
         result.update(_case_classification(
             result["execution_status"], evaluation_scope,
@@ -2440,7 +2482,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     print("  夹爪站位  x=%.3f，距卡爪前端 %.0f mm，机器人-机床接触=%d"
           % (station_x, (jaw_front - station_x) * 1000, machine_hits))
     state["ik_residuals_mm"]["feed"] = float(err * 1000)
-    record_stage("feed_complete")
+    record_stage("feed_complete", checkpoint_id="feed_complete")
     tick("⑨ 直线进给｜沿 +x 插入")
 
     # ---------------- clamp: align friction solver with the chuck scene ----
@@ -2798,7 +2840,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                  (clamp_z_max - clamp_p0[2]) * 1000,
                  (clamp_p[1] - clamp_p0[1]) * 1000,
                  (clamp_p[2] - clamp_p0[2]) * 1000))
-        record_stage("three_jaw_clamped")
+        record_stage("three_jaw_clamped", checkpoint_id="chuck_clamped")
         # 交接全程的 z 峰谷 = 人眼看到的「下沉—回升」。slip_mm 只在解锁
         # 静置后测，完全覆盖不到这一段，必须单列并纳入判据，否则又会
         # 出现「指标 0.02 mm 但画面明显在动」。采样延伸到松爪/退出段。
@@ -2876,7 +2918,10 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
               "相对夹紧终点 dz=%+.2f mm 翘向=%+.2f deg"
               % (coax(), axdev(), jaw_state()[0],
                  (release_p[2] - clamp_p[2]) * 1000, rod_pitch()))
-        record_stage("gripper_released_in_place")
+        record_stage(
+            "gripper_released_in_place",
+            checkpoint_id="gripper_released_in_place",
+        )
         # 退出必须分两段：先沿轴线退到料尾之外，再侧向撤离。一次斜着
         # 撤退时，张开的刀片会横刮还没脱离的料尾，把卡盘里刚定好心的
         # 料带歪（-5 mm 站点实测：同轴 0.44 -> 1.20 mm、倾斜 1.2 -> 2.0
@@ -2891,14 +2936,28 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                   % (70.0))
         elif os.environ.get("FEED_DIAG_NO_RETREAT") == "1":
             print("  诊断对照     松爪后不移动机械臂（仅定位用）")
-        record_stage("after_axial_retreat")
+        checkpoint_statuses = _feed_checkpoint_statuses(
+            RETREAT_AXIAL,
+            os.environ.get("FEED_DIAG_NO_RETREAT") == "1",
+        )
+        record_stage(
+            "after_axial_retreat",
+            checkpoint_id="axial_retreat_complete",
+            checkpoint_status=checkpoint_statuses[
+                "axial_retreat_complete"],
+        )
         # 侧向撤离从「已在料尾外侧」起步，行程比原来长 70 mm。
         if os.environ.get("FEED_DIAG_NO_RETREAT") == "1":
             rerr = 0.0
         else:
             rerr = move(retreat, 1100, GRIP_OPEN, False,
                         SM.CHUCK_CLAMP_CTRL)
-        record_stage("after_lateral_retreat")
+        record_stage(
+            "after_lateral_retreat",
+            checkpoint_id="lateral_retreat_complete",
+            checkpoint_status=checkpoint_statuses[
+                "lateral_retreat_complete"],
+        )
         retreat_p = shaft()
         _z = float(retreat_p[2])
         clamp_z_min = min(clamp_z_min, _z)
@@ -2936,7 +2995,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
           "导套=%d/%.1fN"
           % (np.round(shaft(), 4), coax(), axdev(), jaw_state()[0], bn, bf))
     tick("⑪ 解锁｜交还真实物理")
-    record_stage("after_unlock_settle")
+    record_stage("after_unlock_settle", checkpoint_id="unlock_settled")
 
     # The full-physics path has already released and retreated in one move.
     # Only the legacy kinematic-lock path still needs its separate retreat.
@@ -3163,6 +3222,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         "ik_solver": state.get("ik_solver", []),
         "ik_residuals_mm": state.get("ik_residuals_mm", {}),
         "stages": state.get("stage_records", []),
+        "checkpoints": state.get("checkpoints", []),
     }
     result.update(_case_classification(
         result["execution_status"], evaluation_scope,
