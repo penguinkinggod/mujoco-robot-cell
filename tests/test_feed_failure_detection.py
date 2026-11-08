@@ -95,7 +95,7 @@ class PlanningModeIsolationTests(unittest.TestCase):
 
 
 def assert_reproducibility_fields(test_case, result):
-    test_case.assertEqual(8, result["schema_version"])
+    test_case.assertEqual(9, result["schema_version"])
     test_case.assertEqual(1, result["metric_schema_version"])
     test_case.assertEqual("feed-criteria-v1", result["criterion_set_id"])
     test_case.assertTrue(result["case_id"])
@@ -118,6 +118,7 @@ def assert_reproducibility_fields(test_case, result):
     test_case.assertEqual(20.0, result["inputs"]["workpiece"]["diameter_mm"])
     test_case.assertEqual(80.0, result["inputs"]["workpiece"]["length_mm"])
     test_case.assertIn("requested_initial_pose", result["inputs"])
+    test_case.assertIn("initial_settle_steps", result["inputs"])
     test_case.assertIn(
         "offset_world_xyz_mm",
         result["inputs"]["requested_initial_pose"])
@@ -513,6 +514,34 @@ class FeedFailureStatusTests(unittest.TestCase):
         self.assertTrue(result["trial_data_valid"])
         self.assertTrue(result["include_in_primary_trial_stats"])
         self.assertEqual("aborted", result["outcome_class"])
+
+    def test_zero_initial_settle_records_the_perturbed_grasp_start_pose(self):
+        _exit_code, result = self._run_feed(
+            "test-zero-initial-settle",
+            v_jaw=True,
+            lift=True,
+            carry_lock=False,
+            initial_offset_mm=(0.0, 3.0, 2.0),
+            initial_yaw_deg=5.0,
+            initial_settle_steps=0,
+        )
+
+        self.assertEqual(0, result["inputs"]["initial_settle_steps"])
+        requested = result["inputs"]["pose_after_perturbation_before_settle"]
+        actual = result["actual_initial_pose"]
+        np.testing.assert_allclose(
+            requested["position_m"], actual["position_m"], atol=1e-9)
+        np.testing.assert_allclose(
+            requested["shaft_axis_world_unit"],
+            actual["shaft_axis_world_unit"],
+            atol=1e-9,
+        )
+
+    def test_initial_settle_steps_must_be_a_nonnegative_integer(self):
+        for value in (-1, 1.5, True):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    feed.main(initial_settle_steps=value)
 
     def test_non_finite_state_is_runtime_error_not_task_failure(self):
         stage_calls = [0]

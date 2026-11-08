@@ -18,7 +18,8 @@ ROOT = Path(__file__).resolve().parents[1]
 FEED_SCRIPT = ROOT / "src" / "diag_feed_chuck.py"
 DEFAULT_OUTPUT = ROOT / "_build" / "feed_insert_sweep.csv"
 DEFAULT_INSERTS_MM = (5, 6, 7, 8, 9, 10, 15, 20, 25, 30)
-EXPECTED_SCHEMA_VERSION = 8
+EXPECTED_SCHEMA_VERSION = 9
+EXPECTED_INITIAL_SETTLE_STEPS = 600
 CASE_TIMEOUT_SECONDS = 600
 COMPLETED_METRICS = (
     "coax_mm",
@@ -166,6 +167,11 @@ def _result_error(result, case_id, expected_mode=None,
         return "control_mode must be an object"
     if not isinstance(result["inputs"], dict):
         return "inputs must be an object"
+    initial_settle_steps = result["inputs"].get("initial_settle_steps")
+    if initial_settle_steps != EXPECTED_INITIAL_SETTLE_STEPS:
+        return (
+            "initial_settle_steps mismatch: expected %d, got %r"
+            % (EXPECTED_INITIAL_SETTLE_STEPS, initial_settle_steps))
     mode = result["control_mode"].get("planning_mode")
     if mode not in ("M0", "M1", "M2"):
         return "control_mode.planning_mode must be M0, M1, or M2"

@@ -99,10 +99,11 @@ from demo_08_pick_and_load import (
 )
 
 
-RESULT_SCHEMA_VERSION = 8
+RESULT_SCHEMA_VERSION = 9
 METRIC_SCHEMA_VERSION = 1
 CRITERION_SET_ID = "feed-criteria-v1"
 PLANNING_MODES = ("M0", "M1", "M2")
+DEFAULT_INITIAL_SETTLE_STEPS = 600
 WORLD_X_AXIS = np.array([1.0, 0.0, 0.0])
 # Frozen from the P4.2 zero-disturbance case after the same 600-step fixture
 # settle. This is calibration data, not a per-case measurement consumed by M0.
@@ -1419,7 +1420,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
          v_jaw=False, lift=False, wrist=None, machine_solid=True,
          initial_offset_mm=(0.0, 0.0, 0.0), initial_roll_deg=None,
          random_seed=None, initial_yaw_deg=None, planning_mode="M1",
-         m2_error_mm=(0.0, 0.0, 0.0), m2_error_yaw_deg=0.0):
+         m2_error_mm=(0.0, 0.0, 0.0), m2_error_yaw_deg=0.0,
+         initial_settle_steps=DEFAULT_INITIAL_SETTLE_STEPS):
     """Run the feed sequence.
 
     frame_hook(tag, model, data) is an OPTIONAL visualisation tap.
@@ -1434,6 +1436,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     lets the grasp carry the load on its own. Default True keeps the
     numbers that verify_all.py asserts.
     """
+    if type(initial_settle_steps) is not int or initial_settle_steps < 0:
+        raise ValueError("initial_settle_steps must be a nonnegative integer")
     # Flat pads tolerate any wrist angle; a V groove only closes properly
     # when the jaw axis is square to the rod. Keep the stock value for the
     # verified 7/7 path and switch automatically for the V-jaw experiment.
@@ -1811,6 +1815,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                  "planning_mode": planning_mode,
                  "m2_error_mm": [float(x) for x in m2_error_mm],
                  "m2_error_yaw_deg": float(m2_error_yaw_deg),
+                 "initial_settle_steps": initial_settle_steps,
              },
              "control_mode": {
                  "planning_mode": planning_mode,
@@ -2691,7 +2696,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     data.ctrl[4] = wrist
     grip_direct(GRIP_OPEN)
     data.ctrl[jaw_act] = SM.CHUCK_OPEN_CTRL
-    for _ in range(600):
+    for _ in range(initial_settle_steps):
         for k in range(5):
             data.ctrl[k] = data.qpos[arm.qadr[k]]
         step_sim("initial_settle")
@@ -3784,6 +3789,13 @@ if __name__ == "__main__":
     ap.add_argument("--initial-dy-mm", type=float, default=0.0)
     ap.add_argument("--initial-dz-mm", type=float, default=0.0)
     ap.add_argument(
+        "--initial-settle-steps",
+        type=int,
+        default=DEFAULT_INITIAL_SETTLE_STEPS,
+        help=("physics steps to let the incoming workpiece settle before "
+              "robot approach (default: 600)"),
+    )
+    ap.add_argument(
         "--initial-yaw-deg",
         type=float,
         help="rotate the workpiece about world +Z (positive X axis toward +Y)",
@@ -3809,6 +3821,8 @@ if __name__ == "__main__":
     if (args.initial_yaw_deg is not None
             and args.initial_roll_deg is not None):
         ap.error("choose either --initial-yaw-deg or legacy --initial-roll-deg")
+    if args.initial_settle_steps < 0:
+        ap.error("--initial-settle-steps must be nonnegative")
     if args.json_out:
         os.environ["FEED_RESULT_JSON"] = args.json_out
     if args.case_id:
@@ -3829,4 +3843,5 @@ if __name__ == "__main__":
                                        args.m2_error_dy_mm,
                                        args.m2_error_dz_mm),
                           m2_error_yaw_deg=args.m2_error_yaw_deg,
-                          random_seed=args.random_seed))
+                          random_seed=args.random_seed,
+                          initial_settle_steps=args.initial_settle_steps))
