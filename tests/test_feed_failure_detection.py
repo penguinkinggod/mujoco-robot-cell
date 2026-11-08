@@ -21,7 +21,7 @@ import diag_feed_chuck as feed
 
 
 def assert_reproducibility_fields(test_case, result):
-    test_case.assertEqual(5, result["schema_version"])
+    test_case.assertEqual(6, result["schema_version"])
     test_case.assertEqual(1, result["metric_schema_version"])
     test_case.assertEqual("feed-criteria-v1", result["criterion_set_id"])
     test_case.assertTrue(result["case_id"])
@@ -29,6 +29,12 @@ def assert_reproducibility_fields(test_case, result):
                        ("completed", "aborted", "error"))
     test_case.assertIn("stages", result)
     test_case.assertIn("checkpoints", result)
+    test_case.assertIn("contact_diagnostics", result)
+    test_case.assertIn("applied_load_diagnostics", result)
+    test_case.assertTrue(
+        result["contact_diagnostics"]["sampled_every_physics_step"])
+    test_case.assertTrue(
+        result["applied_load_diagnostics"]["sampled_every_physics_step"])
     test_case.assertIn("hard_failures", result)
     test_case.assertIn("quality_failures", result)
     test_case.assertEqual(result["git_revision"],
@@ -75,6 +81,9 @@ def assert_feed_checkpoints(test_case, result, expected_status=None):
         test_case.assertIn("coax_mm", row)
         test_case.assertIn("stock_ecc_mm", row)
         test_case.assertIn("jaw_contact_count", row)
+        test_case.assertIn("contact_diagnostics", row)
+        test_case.assertIn("applied_loads", row)
+        test_case.assertEqual("feed", row["diagnostic_scope"])
     if expected_status is not None:
         test_case.assertEqual(
             expected_status,
@@ -137,6 +146,63 @@ class RobotMachineContactTests(unittest.TestCase):
                 robot_geoms, machine_geoms)
         ]
         self.assertEqual([], hits)
+
+    def test_semantic_categories_do_not_depend_on_collision_masks(self):
+        model, _data = self._build_model()
+        robot_geoms, _machine_geoms = feed._robot_machine_geom_ids(model)
+        shaft_geom = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_GEOM, "shaft_geom")
+        jaw_geom = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_GEOM, "jaw_geom_0_00")
+        table_geom = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_GEOM, "table")
+        bushing_geom = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_GEOM, "bushing_06")
+        robot_geom = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_GEOM, "fixed_jaw_pad_v1")
+
+        # Deliberately make mask values uninformative: role classification
+        # must continue to come from model identity and robot ancestry.
+        model.geom_contype[[shaft_geom, jaw_geom, table_geom, bushing_geom]] = 0
+        sets = feed._semantic_contact_geom_sets(model, robot_geoms)
+
+        self.assertEqual(
+            "robot_workpiece",
+            feed._contact_category(robot_geom, shaft_geom, sets))
+        self.assertEqual(
+            "workpiece_machine",
+            feed._contact_category(shaft_geom, jaw_geom, sets))
+        self.assertEqual(
+            "workpiece_fixture",
+            feed._contact_category(shaft_geom, bushing_geom, sets))
+        self.assertEqual(
+            "robot_fixture",
+            feed._contact_category(robot_geom, table_geom, sets))
+
+    def test_applied_load_snapshot_reports_force_and_torque_units(self):
+        model, data = self._build_model()
+        shaft_joint = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_JOINT, "shaft_free")
+        shaft_dof = int(model.jnt_dofadr[shaft_joint])
+        data.qfrc_applied[shaft_dof] = -2.5
+        data.qfrc_applied[shaft_dof + 3] = 0.75
+        shaft_body = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_BODY, "shaft")
+        data.xfrc_applied[shaft_body, :3] = [-20.0, 0.0, 0.0]
+
+        snapshot = feed._applied_load_snapshot(model, data)
+
+        self.assertEqual(
+            ["N", "N*m"],
+            [load["unit"] for load in snapshot["qfrc_applied"]])
+        self.assertEqual([-2.5, 0.75], [
+            load["value"] for load in snapshot["qfrc_applied"]])
+        self.assertEqual(20.0, snapshot["xfrc_applied"][0][
+            "force_magnitude_N"])
+        rollup = feed._new_load_rollup()
+        feed._accumulate_load_rollup(rollup, snapshot, 0.002)
+        self.assertEqual(2.5, rollup["qfrc_by_dof"]["shaft_free:dof0"][
+            "peak_abs"])
 
     def test_collision_between_robot_shell_and_machine_is_detected(self):
         model, data = self._build_model()
@@ -235,6 +301,80 @@ class RobotMachineContactTests(unittest.TestCase):
             result["metrics"]["robot_machine_contact_max"], 0)
         self.assertIn("robot_machine_collision", result["hard_failures"])
         self.assertEqual("hard_fail", result["outcome_class"])
+        feed_contacts = result["contact_diagnostics"]["scopes"]["feed"]
+        self.assertGreater(feed_contacts["overall"]["samples"], 10000)
+        self.assertGreater(
+            feed_contacts["overall"]["categories"]["robot_machine"][
+                "peak_contacts_per_step"], 0)
+        load_scopes = result["applied_load_diagnostics"]["scopes"]
+        self.assertNotIn("shaft", load_scopes["feed"]["overall"]["xfrc_by_body"])
+        pull_load = load_scopes["pull_test"]["overall"]["xfrc_by_body"]["shaft"]
+        self.assertAlmostEqual(20.0, pull_load["force_peak_N"], places=6)
+        self.assertEqual(700, pull_load["nonzero_samples"])
+        self.assertGreater(
+            feed_contacts["overall"]["categories"]["robot_workpiece"][
+                "peak_contacts_per_step"], 0)
+        self.assertGreater(
+            feed_contacts["overall"]["categories"]["workpiece_machine"][
+                "peak_contacts_per_step"], 0)
+        self.assertTrue(feed_contacts["overall"]["pairs"])
+        pull_stage = next(
+            row for row in result["stages"]
+            if row["stage"] == "after_20N_pull_test")
+        self.assertEqual("pull_test", pull_stage["diagnostic_scope"])
+        self.assertEqual(
+            20.0,
+            pull_stage["applied_loads"]["xfrc_applied"][0][
+                "force_magnitude_N"])
+
+    def test_full_physics_records_contacts_and_separates_pull_load(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result_path = Path(temp_dir) / "contact_loads.json"
+            previous_path = os.environ.get("FEED_RESULT_JSON")
+            previous_case_id = os.environ.get("FEED_CASE_ID")
+            os.environ["FEED_RESULT_JSON"] = str(result_path)
+            os.environ["FEED_CASE_ID"] = "test-contact-load-records"
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    exit_code = feed.main(
+                        v_jaw=True, lift=True, carry_lock=False)
+            finally:
+                if previous_path is None:
+                    os.environ.pop("FEED_RESULT_JSON", None)
+                else:
+                    os.environ["FEED_RESULT_JSON"] = previous_path
+                if previous_case_id is None:
+                    os.environ.pop("FEED_CASE_ID", None)
+                else:
+                    os.environ["FEED_CASE_ID"] = previous_case_id
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(0, exit_code)
+        self.assertTrue(result["overall_pass"])
+        assert_reproducibility_fields(self, result)
+        contact_scopes = result["contact_diagnostics"]["scopes"]
+        feed_contacts = contact_scopes["feed"]["overall"]
+        self.assertGreater(feed_contacts["samples"], 10000)
+        self.assertGreater(
+            feed_contacts["categories"]["robot_workpiece"][
+                "peak_contacts_per_step"], 0)
+        self.assertGreater(
+            feed_contacts["categories"]["workpiece_machine"][
+                "peak_contacts_per_step"], 0)
+        self.assertTrue(any(
+            pair["peak_normal_force_per_contact_N"] > 0.0
+            for pair in feed_contacts["pairs"].values()))
+
+        load_scopes = result["applied_load_diagnostics"]["scopes"]
+        self.assertNotIn(
+            "shaft", load_scopes["feed"]["overall"]["xfrc_by_body"])
+        pull_load = load_scopes["pull_test"]["overall"]["xfrc_by_body"]["shaft"]
+        self.assertAlmostEqual(20.0, pull_load["force_peak_N"], places=6)
+        self.assertEqual(700, pull_load["nonzero_samples"])
+        pull_stage = next(
+            row for row in result["stages"]
+            if row["stage"] == "after_20N_pull_test")
+        self.assertEqual("pull_test", pull_stage["diagnostic_scope"])
 
 
 class FeedFailureStatusTests(unittest.TestCase):

@@ -99,7 +99,7 @@ from demo_08_pick_and_load import (
 )
 
 
-RESULT_SCHEMA_VERSION = 5
+RESULT_SCHEMA_VERSION = 6
 METRIC_SCHEMA_VERSION = 1
 CRITERION_SET_ID = "feed-criteria-v1"
 FEED_CHECKPOINTS = (
@@ -316,6 +316,293 @@ def _is_robot_machine_contact(geom1, geom2, robot_geom_ids,
                               machine_geom_ids):
     return ((geom1 in robot_geom_ids and geom2 in machine_geom_ids)
             or (geom2 in robot_geom_ids and geom1 in machine_geom_ids))
+
+
+_CONTACT_CATEGORIES = (
+    "robot_workpiece",
+    "robot_machine",
+    "workpiece_machine",
+    "workpiece_fixture",
+    "robot_fixture",
+    "other",
+)
+
+
+def _semantic_contact_geom_sets(model, robot_geom_ids=None):
+    """Classify collision geometry by model identity, not mask bits."""
+    if robot_geom_ids is None:
+        robot_geom_ids, _ = _robot_machine_geom_ids(model)
+    shaft_geom_ids = set()
+    machine_geom_ids = set()
+    fixture_geom_ids = set()
+    for geom_id in range(model.ngeom):
+        name = (mujoco.mj_id2name(
+            model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or "")
+        if name.startswith("shaft_"):
+            shaft_geom_ids.add(geom_id)
+        elif (name.startswith(("lathe_", "chuck_", "jaw_geom_",
+                               "jaw_back_"))
+              or name == "spindle"):
+            machine_geom_ids.add(geom_id)
+        elif name in ("floor", "table") or name.startswith(
+                ("bushing_", "cradle_", "fixture_", "vise_")):
+            fixture_geom_ids.add(geom_id)
+    return {
+        "robot": set(robot_geom_ids),
+        "workpiece": shaft_geom_ids,
+        "machine": machine_geom_ids,
+        "fixture": fixture_geom_ids,
+    }
+
+
+def _contact_category(geom1, geom2, geom_sets):
+    """Return a semantic class for one MuJoCo contact geometry pair."""
+    first, second = int(geom1), int(geom2)
+    robot = geom_sets["robot"]
+    workpiece = geom_sets["workpiece"]
+    machine = geom_sets["machine"]
+    fixture = geom_sets["fixture"]
+    if ((first in robot and second in workpiece)
+            or (second in robot and first in workpiece)):
+        return "robot_workpiece"
+    if ((first in robot and second in machine)
+            or (second in robot and first in machine)):
+        return "robot_machine"
+    if ((first in workpiece and second in machine)
+            or (second in workpiece and first in machine)):
+        return "workpiece_machine"
+    if ((first in workpiece and second in fixture)
+            or (second in workpiece and first in fixture)):
+        return "workpiece_fixture"
+    if ((first in robot and second in fixture)
+            or (second in robot and first in fixture)):
+        return "robot_fixture"
+    return "other"
+
+
+def _contact_frame_snapshot(model, data, geom_sets):
+    """Describe all contacts in the current physics frame."""
+    counts = {category: 0 for category in _CONTACT_CATEGORIES}
+    force_sums = {category: 0.0 for category in _CONTACT_CATEGORIES}
+    pairs = {}
+    force6 = np.zeros(6)
+    for contact_id in range(data.ncon):
+        contact = data.contact[contact_id]
+        geom_ids = (int(contact.geom1), int(contact.geom2))
+        category = _contact_category(
+            geom_ids[0], geom_ids[1], geom_sets)
+        names = []
+        bodies = []
+        for geom_id in geom_ids:
+            names.append(mujoco.mj_id2name(
+                model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or "?")
+            body_id = int(model.geom_bodyid[geom_id])
+            bodies.append(mujoco.mj_id2name(
+                model, mujoco.mjtObj.mjOBJ_BODY, body_id) or "?")
+        geom_body_pairs = sorted(zip(names, bodies))
+        pair_geoms = [row[0] for row in geom_body_pairs]
+        pair_bodies = [row[1] for row in geom_body_pairs]
+        key = "%s|%s|%s" % (category, pair_geoms[0], pair_geoms[1])
+        mujoco.mj_contactForce(model, data, contact_id, force6)
+        normal_force = abs(float(force6[0]))
+        counts[category] += 1
+        force_sums[category] += normal_force
+        pair = pairs.setdefault(key, {
+            "category": category,
+            "geoms": pair_geoms,
+            "bodies": pair_bodies,
+            "contact_count": 0,
+            "normal_force_sum_N": 0.0,
+            "normal_force_peak_N": 0.0,
+        })
+        pair["contact_count"] += 1
+        pair["normal_force_sum_N"] += normal_force
+        pair["normal_force_peak_N"] = max(
+            pair["normal_force_peak_N"], normal_force)
+    return {
+        "total_contact_count": int(data.ncon),
+        "counts_by_category": counts,
+        "normal_force_sum_by_category_N": force_sums,
+        "pairs": [pairs[key] for key in sorted(pairs)],
+    }
+
+
+def _applied_load_snapshot(model, data):
+    """Read externally applied generalized and body-space loads."""
+    qfrc = []
+    for dof_id, value in enumerate(data.qfrc_applied):
+        value = float(value)
+        if value == 0.0:
+            continue
+        joint_id = int(model.dof_jntid[dof_id])
+        joint_type = int(model.jnt_type[joint_id])
+        local_dof = dof_id - int(model.jnt_dofadr[joint_id])
+        force_dof = (
+            joint_type == int(mujoco.mjtJoint.mjJNT_SLIDE)
+            or (joint_type == int(mujoco.mjtJoint.mjJNT_FREE)
+                and local_dof < 3))
+        body_id = int(model.jnt_bodyid[joint_id])
+        qfrc.append({
+            "dof_id": int(dof_id),
+            "joint": mujoco.mj_id2name(
+                model, mujoco.mjtObj.mjOBJ_JOINT, joint_id) or "?",
+            "body": mujoco.mj_id2name(
+                model, mujoco.mjtObj.mjOBJ_BODY, body_id) or "?",
+            "local_dof": int(local_dof),
+            "value": value,
+            "unit": "N" if force_dof else "N*m",
+        })
+
+    xfrc = []
+    for body_id in range(1, model.nbody):
+        wrench = np.asarray(data.xfrc_applied[body_id], dtype=float)
+        if not np.any(wrench != 0.0):
+            continue
+        xfrc.append({
+            "body_id": int(body_id),
+            "body": mujoco.mj_id2name(
+                model, mujoco.mjtObj.mjOBJ_BODY, body_id) or "?",
+            "force_N": [float(value) for value in wrench[:3]],
+            "force_magnitude_N": float(np.linalg.norm(wrench[:3])),
+            "torque_Nm": [float(value) for value in wrench[3:]],
+            "torque_magnitude_Nm": float(np.linalg.norm(wrench[3:])),
+        })
+    return {"qfrc_applied": qfrc, "xfrc_applied": xfrc}
+
+
+def _new_diagnostic_rollup():
+    return {
+        "samples": 0,
+        "sim_time_start_s": None,
+        "sim_time_end_s": None,
+        "categories": {
+            category: {
+                "samples_with_contacts": 0,
+                "peak_contacts_per_step": 0,
+                "peak_normal_force_sum_N": 0.0,
+            }
+            for category in _CONTACT_CATEGORIES
+        },
+        "pairs": {},
+        "qfrc_by_dof": {},
+        "xfrc_by_body": {},
+    }
+
+
+def _new_load_rollup():
+    return {
+        "samples": 0,
+        "sim_time_start_s": None,
+        "sim_time_end_s": None,
+        "qfrc_by_dof": {},
+        "xfrc_by_body": {},
+    }
+
+
+def _accumulate_contact_rollup(rollup, snapshot, sim_time_s):
+    if rollup["sim_time_start_s"] is None:
+        rollup["sim_time_start_s"] = float(sim_time_s)
+    rollup["samples"] += 1
+    rollup["sim_time_end_s"] = float(sim_time_s)
+    for category in _CONTACT_CATEGORIES:
+        count = snapshot["counts_by_category"][category]
+        summary = rollup["categories"][category]
+        if count:
+            summary["samples_with_contacts"] += 1
+        summary["peak_contacts_per_step"] = max(
+            summary["peak_contacts_per_step"], count)
+        summary["peak_normal_force_sum_N"] = max(
+            summary["peak_normal_force_sum_N"],
+            snapshot["normal_force_sum_by_category_N"][category])
+    for pair in snapshot["pairs"]:
+        key = "%s|%s" % (pair["category"], "|".join(pair["geoms"]))
+        summary = rollup["pairs"].setdefault(key, {
+            "category": pair["category"],
+            "geoms": pair["geoms"],
+            "bodies": pair["bodies"],
+            "contact_samples": 0,
+            "peak_contacts_per_step": 0,
+            "peak_normal_force_per_contact_N": 0.0,
+            "peak_normal_force_sum_N": 0.0,
+        })
+        summary["contact_samples"] += 1
+        summary["peak_contacts_per_step"] = max(
+            summary["peak_contacts_per_step"], pair["contact_count"])
+        summary["peak_normal_force_per_contact_N"] = max(
+            summary["peak_normal_force_per_contact_N"],
+            pair["normal_force_peak_N"])
+        summary["peak_normal_force_sum_N"] = max(
+            summary["peak_normal_force_sum_N"],
+            pair["normal_force_sum_N"])
+
+
+def _accumulate_load_rollup(rollup, snapshot, sim_time_s):
+    if rollup["sim_time_start_s"] is None:
+        rollup["sim_time_start_s"] = float(sim_time_s)
+    rollup["samples"] += 1
+    rollup["sim_time_end_s"] = float(sim_time_s)
+    for load in snapshot["qfrc_applied"]:
+        key = "%s:dof%d" % (load["joint"], load["local_dof"])
+        summary = rollup["qfrc_by_dof"].setdefault(key, {
+            "joint": load["joint"],
+            "body": load["body"],
+            "local_dof": load["local_dof"],
+            "unit": load["unit"],
+            "nonzero_samples": 0,
+            "peak_abs": 0.0,
+            "value_at_peak": 0.0,
+        })
+        summary["nonzero_samples"] += 1
+        if abs(load["value"]) > summary["peak_abs"]:
+            summary["peak_abs"] = abs(load["value"])
+            summary["value_at_peak"] = load["value"]
+    for load in snapshot["xfrc_applied"]:
+        summary = rollup["xfrc_by_body"].setdefault(load["body"], {
+            "body_id": load["body_id"],
+            "nonzero_samples": 0,
+            "force_peak_N": 0.0,
+            "force_vector_at_peak_N": [0.0, 0.0, 0.0],
+            "torque_peak_Nm": 0.0,
+            "torque_vector_at_peak_Nm": [0.0, 0.0, 0.0],
+        })
+        summary["nonzero_samples"] += 1
+        if load["force_magnitude_N"] > summary["force_peak_N"]:
+            summary["force_peak_N"] = load["force_magnitude_N"]
+            summary["force_vector_at_peak_N"] = load["force_N"]
+        if load["torque_magnitude_Nm"] > summary["torque_peak_Nm"]:
+            summary["torque_peak_Nm"] = load["torque_magnitude_Nm"]
+            summary["torque_vector_at_peak_Nm"] = load["torque_Nm"]
+
+
+def _update_diagnostic_rollups(state, scope_name, phase, sim_time_s,
+                              contact_snapshot, load_snapshot):
+    contact_scope = state["contact_diagnostics"]["scopes"].setdefault(
+        scope_name, {"overall": _new_diagnostic_rollup(), "phases": {}})
+    contact_phase = contact_scope["phases"].setdefault(
+        phase, _new_diagnostic_rollup())
+    _accumulate_contact_rollup(
+        contact_scope["overall"], contact_snapshot, sim_time_s)
+    _accumulate_contact_rollup(contact_phase, contact_snapshot, sim_time_s)
+
+    load_scope = state["applied_load_diagnostics"]["scopes"].setdefault(
+        scope_name, {"overall": _new_load_rollup(), "phases": {}})
+    load_phase = load_scope["phases"].setdefault(
+        phase, _new_load_rollup())
+    _accumulate_load_rollup(load_scope["overall"], load_snapshot, sim_time_s)
+    _accumulate_load_rollup(load_phase, load_snapshot, sim_time_s)
+
+
+def _diagnostic_result_fields(state):
+    return {
+        "contact_diagnostics": state.get(
+            "contact_diagnostics", {"scopes": {}}),
+        "applied_load_diagnostics": state.get(
+            "applied_load_diagnostics", {"scopes": {}}),
+        "diagnostic_scope_definitions": {
+            "feed": "送料、夹紧、松爪、退出和解锁静置；不含 20 N 拉拔测试",
+            "pull_test": "机器人退出后单独施加的 20 N 轴向拉拔测试",
+        },
+    }
 
 
 COAX_LIMIT = 2.0       # mm
@@ -1089,6 +1376,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         .startswith("shaft_")
     ]
     robot_geom_ids, machine_geom_ids = _robot_machine_geom_ids(model)
+    contact_geom_sets = _semantic_contact_geom_sets(model, robot_geom_ids)
     bushing_ids = [
         i for i in range(model.ngeom)
         if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, i) or "")
@@ -1351,6 +1639,17 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
              "random_seed": random_seed,
              "rod_force_max": 0.0, "robot_machine_contact_max": 0,
              "shaft_contact_max": 0, "phase_stats": {}, "ik_solver": [],
+             "diagnostic_scope": "feed",
+             "contact_diagnostics": {
+                 "sampled_every_physics_step": True,
+                 "sample_interval_s": float(model.opt.timestep),
+                 "scopes": {},
+             },
+             "applied_load_diagnostics": {
+                 "sampled_every_physics_step": True,
+                 "sample_interval_s": float(model.opt.timestep),
+                 "scopes": {},
+             },
              "ik_residuals_mm": {}, "versions": _versions_snapshot(),
              "actual_initial_pose": None,
              "model_options_initial": _model_options_snapshot(model),
@@ -1507,6 +1806,21 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
 
     robot_machine_peaks = {}
 
+    def record_diagnostic_frame(phase=None):
+        """Capture one post-step contact/load frame into compact rollups."""
+        contact_snapshot = _contact_frame_snapshot(
+            model, data, contact_geom_sets)
+        load_snapshot = _applied_load_snapshot(model, data)
+        _update_diagnostic_rollups(
+            state,
+            state.get("diagnostic_scope", "feed"),
+            phase or state.get("label") or "simulation",
+            float(data.time),
+            contact_snapshot,
+            load_snapshot,
+        )
+        return contact_snapshot, load_snapshot
+
     def write_result_json(result):
         json_path = os.environ.get("FEED_RESULT_JSON")
         if not json_path:
@@ -1547,6 +1861,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             "hard_failures": ["non_finite_state"],
             "quality_failures": [],
             "phase_stats": state.get("phase_stats", {}),
+            **_diagnostic_result_fields(state),
             "ik_solver": state.get("ik_solver", []),
             "ik_residuals_mm": state.get("ik_residuals_mm", {}),
             "stages": state.get("stage_records", []),
@@ -1560,11 +1875,12 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         raise FloatingPointError(
             "non-finite simulation state at stage %s" % label)
 
-    def step_sim():
-        label = state.get("label", "simulation")
+    def step_sim(phase=None):
+        label = phase or state.get("label") or "simulation"
         ensure_finite_state("%s:before_step" % label)
         mujoco.mj_step(model, data)
         ensure_finite_state("%s:after_step" % label)
+        record_diagnostic_frame(label)
 
     def record_stage(name, checkpoint_id=None,
                      checkpoint_status="completed"):
@@ -1615,6 +1931,10 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             "penetration_min_m": float(PEN["min"]),
             "penetration_pair": PEN["pair"],
             "penetration_phase": PEN["label"],
+            "diagnostic_scope": state.get("diagnostic_scope", "feed"),
+            "contact_diagnostics": _contact_frame_snapshot(
+                model, data, contact_geom_sets),
+            "applied_loads": _applied_load_snapshot(model, data),
         }
         if checkpoint_id is not None:
             checkpoint_order = next(
@@ -2220,7 +2540,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     for _ in range(600):
         for k in range(5):
             data.ctrl[k] = data.qpos[arm.qadr[k]]
-        step_sim()
+        step_sim("initial_settle")
     # Pick uses the calibrated position-only IK. Axis holding starts only
     # AFTER the V jaws close; applying it during approach changes the
     # calibrated grasp pose and the blades shove the rod into the table.
@@ -2348,6 +2668,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             "hard_failures": ["grasp_empty"],
             "quality_failures": [],
             "phase_stats": state.get("phase_stats", {}),
+            **_diagnostic_result_fields(state),
             "ik_solver": state.get("ik_solver", []),
             "ik_residuals_mm": state.get("ik_residuals_mm", {}),
             "stages": state.get("stage_records", []),
@@ -2521,7 +2842,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                                   + s * (SM.CHUCK_CLAMP_CTRL
                                          - SM.CHUCK_OPEN_CTRL))
             data.ctrl[arm.grip_act] = grip_cmd(GRIP_OPEN)
-            step_sim()
+            step_sim("locked_chuck_clamp")
             state.setdefault("traj", []).append(
                 data.site_xpos[arm.site].copy())
             state.setdefault("traj_label", []).append(state.get("label", "?"))
@@ -2575,7 +2896,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                                             + s * (q_goal[k] - q_now[k]))
                         data.ctrl[arm.grip_act] = grip_cmd(grip_close)
                         data.ctrl[jaw_act] = SM.CHUCK_OPEN_CTRL
-                        step_sim()
+                        step_sim("axis_leveling")
                         state.setdefault("traj", []).append(
                             data.site_xpos[arm.site].copy())
                         state.setdefault("traj_label", []).append("料轴调平")
@@ -2631,7 +2952,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 data.ctrl[jaw_act] = SM.CHUCK_OPEN_CTRL
                 data.ctrl[arm.grip_act] = grip_cmd(grip_close)
                 float_arm()
-                step_sim()
+                step_sim("servo_convergence")
                 _used = _j + 1
                 _qvel = float(np.linalg.norm(
                     [data.qvel[a] for a in arm.qadr]))
@@ -2668,7 +2989,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 grip_direct(grip_close + s * (GRIP_OPEN - grip_close))
                 seat_rod(seat_x0)
                 float_arm()
-                step_sim()
+                step_sim("先松夹爪")
                 _z = float(shaft()[2])
                 clamp_z_min = min(clamp_z_min, _z)
                 clamp_z_max = max(clamp_z_max, _z)
@@ -2687,7 +3008,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 data.ctrl[arm.grip_act] = grip_cmd(GRIP_OPEN)
                 seat_rod(seat_x0)
                 float_arm()
-                step_sim()
+                step_sim("端面就位")
                 _z = float(shaft()[2])
                 clamp_z_min = min(clamp_z_min, _z)
                 clamp_z_max = max(clamp_z_max, _z)
@@ -2715,7 +3036,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 pusher_rod(seat_x0)
                 seat_rod(seat_x0)
                 float_arm()
-                step_sim()
+                step_sim("低压预夹")
                 clamp_p = shaft()
                 clamp_z_min = min(clamp_z_min, float(clamp_p[2]))
                 clamp_z_max = max(clamp_z_max, float(clamp_p[2]))
@@ -2732,7 +3053,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 pusher_rod(seat_x0)
                 seat_rod(seat_x0)
                 float_arm()
-                step_sim()
+                step_sim("端面顶正")
                 clamp_p = shaft()
                 clamp_z_min = min(clamp_z_min, float(clamp_p[2]))
                 clamp_z_max = max(clamp_z_max, float(clamp_p[2]))
@@ -2767,7 +3088,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             data.ctrl[arm.grip_act] = grip_cmd(clamp_grip)
             seat_rod(seat_x0)
             float_arm()
-            step_sim()
+            step_sim("三爪拧紧")
             clamp_p = shaft()
             clamp_z_min = min(clamp_z_min, float(clamp_p[2]))
             clamp_z_max = max(clamp_z_max, float(clamp_p[2]))
@@ -2803,7 +3124,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             data.ctrl[arm.grip_act] = grip_cmd(clamp_grip)
             seat_rod(seat_x0)
             float_arm()
-            step_sim()
+            step_sim("三爪稳定")
             clamp_p = shaft()
             clamp_z_min = min(clamp_z_min, float(clamp_p[2]))
             clamp_z_max = max(clamp_z_max, float(clamp_p[2]))
@@ -2880,7 +3201,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                            - cr2 * float(data.qvel[sv + 2])))
                 data.ctrl[jaw_act] = SM.CHUCK_CLAMP_CTRL
                 data.ctrl[arm.grip_act] = grip_cmd(clamp_grip)
-                step_sim()
+                step_sim("卸载托力")
                 _z = float(shaft()[2])
                 clamp_z_min = min(clamp_z_min, _z)
                 clamp_z_max = max(clamp_z_max, _z)
@@ -2898,7 +3219,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             s = t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
             data.ctrl[jaw_act] = SM.CHUCK_CLAMP_CTRL
             grip_direct(clamp_grip + s * (GRIP_OPEN - clamp_grip))
-            step_sim()
+            step_sim("原地松爪")
             _z = float(shaft()[2])
             clamp_z_min = min(clamp_z_min, _z)
             clamp_z_max = max(clamp_z_max, _z)
@@ -3023,10 +3344,11 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     settle(800, SM.CHUCK_CLAMP_CTRL, GRIP_OPEN)
     slip = abs(z0 - shaft()[2]) * 1000
     x0 = shaft()[0]
+    state["diagnostic_scope"] = "pull_test"
     for i in range(700):
         data.ctrl[jaw_act] = SM.CHUCK_CLAMP_CTRL
         data.xfrc_applied[shaft_body, 0] = -20.0
-        step_sim()
+        step_sim("20N_axial_pull_test")
         if frame_hook is not None and i % (FRAME_EVERY * 2) == 0:
             tick()
     pull = abs(shaft()[0] - x0) * 1000
@@ -3219,6 +3541,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         "hard_failures": hard_failures,
         "quality_failures": quality_failures,
         "phase_stats": state.get("phase_stats", {}),
+        **_diagnostic_result_fields(state),
         "ik_solver": state.get("ik_solver", []),
         "ik_residuals_mm": state.get("ik_residuals_mm", {}),
         "stages": state.get("stage_records", []),
