@@ -84,7 +84,7 @@
 | P2.1 | 定义实验 JSON 必填字段及版本 | **已完成**：[p2.1-case-json-schema-2026-11-07.md](p2.1-case-json-schema-2026-11-07.md)；schema v4 对 completed/aborted/error 统一记录输入、实际起始位姿、有效参数、环境覆盖、仿真设置、版本、判据、阶段和失败原因；动作与门槛未变 |
 | P2.2 | 只加六个关键节点记录 | **已完成**：[p2.2-checkpoint-records-2026-11-08.md](p2.2-checkpoint-records-2026-11-08.md)；schema v5 顶层 `checkpoints` 固定顺序记录进给完成、三爪夹紧、原地松爪、轴向退出、侧向退出、解锁静置；跳过的诊断动作标 `skipped`；动作与判据未变 |
 | P2.3 | 补齐全过程接触与外力记录 | **已完成**：[p2.3-contact-force-records-2026-11-08.md](p2.3-contact-force-records-2026-11-08.md)；逐物理步采样并按几何归属、阶段汇总接触/法向力；`qfrc_applied` 与 `xfrc_applied` 分开记录；20 N 拉拔独立归档；动作和判据未变 |
-| P2.4 | 扫描器读取 JSON 并处理失败 | JSON 缺失、旧文件、子进程崩溃、超时均报 ERROR，不误读成 PASS；CSV 可追溯 |
+| P2.4 | 扫描器读取 JSON 并处理失败 | **已完成**：[P2.4 验收](p2.4-sweep-error-handling-2026-11-08.md)；schema v6/必需字段/case ID 校验；缺失、旧/损坏结果、启动失败、超时和退出码冲突报 ERROR；PASS/FAIL/ABORT 不混淆；CSV 可追溯 |
 
 ### P3：解释 7.75 与 8 mm（对应旧 T2）
 
@@ -197,6 +197,6 @@ P3 不要求一定把 7.75 mm 调成成功。解释为什么失败本身就是�
 
 **P0.1 已完成：** 审计报告见 [docs/audit-current-diff-2026-11-07.md](audit-current-diff-2026-11-07.md)。首要回归原因是 `--lift` 后抓取目标误用未抬升的 `F.SHAFT_POS`；还确认了失败未终止、扰动目标混用、姿态轴定义不清和阶段记录重复等风险。
 
-P1.1-P1.4 与 P2.1-P2.3 已完成。P2 记录分别见 [P2.1 JSON 字段规范](p2.1-case-json-schema-2026-11-07.md)、[P2.2 六节点验收](p2.2-checkpoint-records-2026-11-08.md) 和 [P2.3 接触与外力验收](p2.3-contact-force-records-2026-11-08.md)。当前 `verify_all.py` 为 10/10。下一步做 **P2.4 扫描器错误处理**，继续保持动作不变。姿态扰动和批量实验尚未开始；不可达仍需独立判据，不能把高 IK 残差直接当证明，也不能把 10 mm 写成通用标准。
+P1.1-P1.4 与 P2.1-P2.4 已完成。P2 验收记录见 [P2.1 JSON 字段规范](p2.1-case-json-schema-2026-11-07.md)、[P2.2 六节点验收](p2.2-checkpoint-records-2026-11-08.md)、[P2.3 接触与外力验收](p2.3-contact-force-records-2026-11-08.md) 和 [P2.4 扫描器错误处理](p2.4-sweep-error-handling-2026-11-08.md)。当前 `verify_all.py` 为 10/10，单测 20/20。下一步做 **P4.1**：先写清固定目标抗扰、已知真实位姿重定位、带估计误差重定位的坐标系与实验假设，再动扰动入口。姿态扰动和正式批量实验尚未开始；不可达仍需独立判据，不能把高 IK 残差直接当证明，也不能把 10 mm 写成通用标准。
 
 请先读 CURRENT.md 的状态、本文件与 next-agent-playbook.md。每次只领取一张卡，保留其他差异，输出修改文件、复现命令、证据路径和未解决问题；不要整文件覆盖或清空工作树。可按验收点创建本地 commit；未经用户明确同意不要 push。

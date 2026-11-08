@@ -6,6 +6,7 @@ Only FEED_INSERT_MM changes. Results are written to _build/feed_insert_sweep.csv
 import argparse
 import csv
 import json
+import math
 import os
 import subprocess
 import sys
@@ -17,38 +18,26 @@ ROOT = Path(__file__).resolve().parents[1]
 FEED_SCRIPT = ROOT / "src" / "diag_feed_chuck.py"
 DEFAULT_OUTPUT = ROOT / "_build" / "feed_insert_sweep.csv"
 DEFAULT_INSERTS_MM = (5, 6, 7, 8, 9, 10, 15, 20, 25, 30)
+EXPECTED_SCHEMA_VERSION = 6
+CASE_TIMEOUT_SECONDS = 600
+COMPLETED_METRICS = (
+    "coax_mm",
+    "tilt_deg",
+    "contacts",
+    "slip_mm",
+    "pull_mm",
+    "jaw_force_N",
+    "grasp_tilt_deg",
+    "clamp_swing_mm",
+    "stock_ecc_mm",
+    "rod_external_force_max_N",
+    "robot_machine_contact_max",
+)
 
 
-def run_case(insert_mm, json_path, case_id=None, dy_mm=0.0, dz_mm=0.0,
-             roll_deg=0.0, random_seed=None):
-    case_id = case_id or uuid.uuid4().hex[:12]
-    json_path = Path(json_path)
-    json_path.parent.mkdir(parents=True, exist_ok=True)
-    json_path.unlink(missing_ok=True)
-    env = os.environ.copy()
-    for key in tuple(env):
-        if key.startswith("FEED_"):
-            env.pop(key)
-    env["FEED_INSERT_MM"] = format(insert_mm, "g")
-    env["FEED_CASE_ID"] = case_id
-    env["FEED_RESULT_JSON"] = str(json_path.resolve())
-
-    completed = subprocess.run(
-        [sys.executable, str(FEED_SCRIPT), "--v-jaw", "--lift", "--no-lock",
-         "--initial-dy-mm", str(dy_mm), "--initial-dz-mm", str(dz_mm),
-         "--initial-roll-deg", str(roll_deg), "--case-id", case_id]
-        + ([] if random_seed is None else
-           ["--random-seed", str(random_seed)]),
-        cwd=ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
-    output = completed.stdout + completed.stderr
-    row = {
+def _new_row(insert_mm, json_path, case_id, dy_mm, dz_mm, roll_deg,
+             random_seed):
+    return {
         "case_id": case_id,
         "random_seed": "" if random_seed is None else random_seed,
         "insert_mm": insert_mm,
@@ -61,14 +50,15 @@ def run_case(insert_mm, json_path, case_id=None, dy_mm=0.0, dz_mm=0.0,
         "trial_data_valid": "",
         "include_in_primary_trial_stats": "",
         "physical_task_success": "",
-        "outcome_class": "missing_result",
+        "outcome_class": "runtime_error",
         "diagnostic_mode": "",
         "abort_stage": "",
         "hard_pass": "",
         "quality_pass": "",
         "hard_failures": "",
         "quality_failures": "",
-        "exit_code": completed.returncode,
+        "exit_code": "",
+        "schema_version": "",
         "coax_mm": "",
         "tilt_deg": "",
         "contacts": "",
@@ -87,75 +77,280 @@ def run_case(insert_mm, json_path, case_id=None, dy_mm=0.0, dz_mm=0.0,
         "json_path": str(json_path),
         "error": "",
     }
-    try:
-        with Path(json_path).open(encoding="utf-8") as stream:
-            result = json.load(stream)
-    except (OSError, json.JSONDecodeError):
-        result = None
-    if result:
-        execution_status = result.get("execution_status", "completed")
-        if execution_status == "error":
-            row.update({
-                "execution_status": execution_status,
-                "evaluation_scope": result.get("evaluation_scope", ""),
-                "trial_data_valid": result.get("trial_data_valid", False),
-                "include_in_primary_trial_stats": result.get(
-                    "include_in_primary_trial_stats", False),
-                "physical_task_success": result.get(
-                    "physical_task_success", False),
-                "outcome_class": result.get("outcome_class", "runtime_error"),
-                "diagnostic_mode": result.get("config", {}).get(
-                    "diagnostic_mode", ""),
-                "abort_stage": result.get("abort_stage", ""),
-                "error": result.get("abort_reason", "simulation_error"),
-            })
-            return row
+
+
+def _text(value):
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _output_tail(output):
+    return _text(output).strip()[-1200:]
+
+
+def _set_error(row, execution_status, message, output=""):
+    row.update({
+        "status": "ERROR",
+        "execution_status": execution_status,
+        "trial_data_valid": False,
+        "include_in_primary_trial_stats": False,
+        "physical_task_success": False,
+        "outcome_class": "runtime_error",
+    })
+    details = [part for part in (message, _output_tail(output)) if part]
+    row["error"] = "\n".join(details)
+    return row
+
+
+def _is_finite_number(value):
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def _result_error(result, case_id):
+    """Return why a case JSON is unusable, or None for a supported schema."""
+    if not isinstance(result, dict):
+        return "result JSON root must be an object"
+    schema_version = result.get("schema_version")
+    if (type(schema_version) is not int
+            or schema_version != EXPECTED_SCHEMA_VERSION):
+        return (
+            "unsupported schema_version: %r (expected %d)"
+            % (schema_version, EXPECTED_SCHEMA_VERSION)
+        )
+    if result.get("case_id") != case_id:
+        return "case_id mismatch: expected %s, got %r" % (
+            case_id, result.get("case_id"))
+
+    status = result.get("execution_status")
+    if status not in ("completed", "aborted", "error"):
+        return "invalid execution_status: %r" % status
+
+    required = (
+        "config",
+        "evaluation_scope",
+        "trial_data_valid",
+        "include_in_primary_trial_stats",
+        "physical_task_success",
+        "outcome_class",
+        "metrics",
+        "hard_pass",
+        "quality_pass",
+        "overall_pass",
+        "hard_failures",
+        "quality_failures",
+    )
+    missing = [key for key in required if key not in result]
+    if missing:
+        return "missing required fields: %s" % ", ".join(missing)
+
+    if not isinstance(result["config"], dict):
+        return "config must be an object"
+    if not isinstance(result["evaluation_scope"], str):
+        return "evaluation_scope must be a string"
+    for key in (
+        "trial_data_valid",
+        "include_in_primary_trial_stats",
+        "physical_task_success",
+        "hard_pass",
+        "overall_pass",
+    ):
+        if not isinstance(result[key], bool):
+            return "%s must be a boolean" % key
+    if result["quality_pass"] is not None and not isinstance(
+            result["quality_pass"], bool):
+        return "quality_pass must be a boolean or null"
+    if not isinstance(result["outcome_class"], str):
+        return "outcome_class must be a string"
+    for key in ("hard_failures", "quality_failures"):
+        if (not isinstance(result[key], list)
+                or any(not isinstance(item, str) for item in result[key])):
+            return "%s must be a list of strings" % key
+    if not isinstance(result["metrics"], dict):
+        return "metrics must be an object"
+
+    if status == "completed":
+        if not isinstance(result["quality_pass"], bool):
+            return "completed result quality_pass must be a boolean"
+        if result["overall_pass"] != (
+                result["hard_pass"] and result["quality_pass"]):
+            return "overall_pass disagrees with hard_pass/quality_pass"
         metrics = result["metrics"]
+        missing_metrics = [
+            key for key in COMPLETED_METRICS if key not in metrics
+        ]
+        if missing_metrics:
+            return "missing metrics: %s" % ", ".join(missing_metrics)
+        invalid_metrics = [
+            key for key in COMPLETED_METRICS
+            if not _is_finite_number(metrics[key])
+        ]
+        if invalid_metrics:
+            return "non-numeric or non-finite metrics: %s" % ", ".join(
+                invalid_metrics)
+        residuals = result.get("ik_residuals_mm")
+        if not isinstance(residuals, dict):
+            return "ik_residuals_mm must be an object"
+        if not _is_finite_number(residuals.get("feed")):
+            return "ik_residuals_mm.feed must be a finite number"
+    elif status == "error":
+        if not isinstance(result.get("abort_reason"), str):
+            return "error result must include abort_reason"
+    elif status == "aborted":
+        if (not isinstance(result.get("abort_stage"), str)
+                or not isinstance(result.get("abort_reason"), str)):
+            return "aborted result must include abort_stage and abort_reason"
+
+    return None
+
+
+def _copy_classification(row, result):
+    row.update({
+        "execution_status": result["execution_status"],
+        "evaluation_scope": result["evaluation_scope"],
+        "trial_data_valid": result["trial_data_valid"],
+        "include_in_primary_trial_stats": result[
+            "include_in_primary_trial_stats"],
+        "physical_task_success": result["physical_task_success"],
+        "outcome_class": result["outcome_class"],
+        "diagnostic_mode": result["config"].get("diagnostic_mode", ""),
+        "abort_stage": result.get("abort_stage", ""),
+        "hard_pass": result["hard_pass"],
+        "quality_pass": result["quality_pass"],
+        "hard_failures": ";".join(result["hard_failures"]),
+        "quality_failures": ";".join(result["quality_failures"]),
+    })
+
+
+def run_case(insert_mm, json_path, case_id=None, dy_mm=0.0, dz_mm=0.0,
+             roll_deg=0.0, random_seed=None):
+    case_id = case_id or uuid.uuid4().hex[:12]
+    json_path = Path(json_path)
+    row = _new_row(
+        insert_mm, json_path, case_id, dy_mm, dz_mm, roll_deg, random_seed)
+    try:
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.unlink(missing_ok=True)
+    except OSError as error:
+        return _set_error(row, "result_path_error", str(error))
+
+    env = os.environ.copy()
+    for key in tuple(env):
+        if key.startswith("FEED_"):
+            env.pop(key)
+    env["FEED_INSERT_MM"] = format(insert_mm, "g")
+    env["FEED_CASE_ID"] = case_id
+    env["FEED_RESULT_JSON"] = str(json_path.resolve())
+
+    command = [
+        sys.executable, str(FEED_SCRIPT), "--v-jaw", "--lift", "--no-lock",
+        "--initial-dy-mm", str(dy_mm), "--initial-dz-mm", str(dz_mm),
+        "--initial-roll-deg", str(roll_deg), "--case-id", case_id,
+    ]
+    if random_seed is not None:
+        command.extend(["--random-seed", str(random_seed)])
+
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=CASE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        output = _text(error.stdout) + "\n" + _text(error.stderr)
+        row["exit_code"] = -1
+        return _set_error(
+            row, "timeout",
+            "child process timed out after %d seconds"
+            % CASE_TIMEOUT_SECONDS, output)
+    except (OSError, subprocess.SubprocessError) as error:
+        return _set_error(row, "launch_error", str(error))
+
+    output = completed.stdout + completed.stderr
+    row["exit_code"] = completed.returncode
+    try:
+        with json_path.open(encoding="utf-8") as stream:
+            result = json.load(stream)
+    except FileNotFoundError:
+        return _set_error(row, "missing_result", "result JSON was not created",
+                          output)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        return _set_error(row, "invalid_result", str(error), output)
+
+    invalid_reason = _result_error(result, case_id)
+    if isinstance(result, dict):
+        row["schema_version"] = result.get("schema_version", "")
+    if invalid_reason:
+        schema_version = (
+            result.get("schema_version")
+            if isinstance(result, dict) else None
+        )
+        status = (
+            "unsupported_schema"
+            if (type(schema_version) is not int
+                    or schema_version != EXPECTED_SCHEMA_VERSION)
+            else "invalid_result"
+        )
+        return _set_error(row, status, invalid_reason, output)
+
+    execution_status = result["execution_status"]
+    if execution_status == "error":
+        _copy_classification(row, result)
+        return _set_error(
+            row, "error",
+            result.get("abort_reason", "simulation_error"), output)
+
+    expected_exit_code = (
+        0 if execution_status == "completed" and result["overall_pass"]
+        else 1
+    )
+    if completed.returncode != expected_exit_code:
+        _copy_classification(row, result)
+        return _set_error(
+            row, "exit_code_mismatch",
+            "exit code %s conflicts with %s result (expected %s)"
+            % (completed.returncode, execution_status, expected_exit_code),
+            output)
+
+    _copy_classification(row, result)
+    if execution_status == "aborted":
         row.update({
-            "status": (
-                "ABORT" if execution_status == "aborted"
-                else "PASS" if result["overall_pass"] else "FAIL"),
-            "execution_status": execution_status,
-            "evaluation_scope": result.get("evaluation_scope", ""),
-            "trial_data_valid": result.get("trial_data_valid", ""),
-            "include_in_primary_trial_stats": result.get(
-                "include_in_primary_trial_stats", ""),
-            "physical_task_success": result.get(
-                "physical_task_success", ""),
-            "outcome_class": result.get("outcome_class", ""),
-            "diagnostic_mode": result.get("config", {}).get(
-                "diagnostic_mode", ""),
-            "abort_stage": result.get("abort_stage", ""),
-            "hard_pass": result["hard_pass"],
-            "quality_pass": result["quality_pass"],
-            "hard_failures": ";".join(result["hard_failures"]),
-            "quality_failures": ";".join(result["quality_failures"]),
-            "coax_mm": metrics["coax_mm"],
-            "tilt_deg": metrics["tilt_deg"],
-            "contacts": metrics["contacts"],
-            "grasp_contact_count": metrics.get("grasp_contact_count", ""),
-            "slip_mm": metrics["slip_mm"],
-            "pull_mm": metrics["pull_mm"],
-            "jaw_force_N": metrics["jaw_force_N"],
-            "grasp_tilt_deg": metrics["grasp_tilt_deg"],
-            "carry": "physics",
-            "physics_after_clamp": 1,
-            "clamp_swing_mm": metrics["clamp_swing_mm"],
-            "stock_ecc_mm": metrics["stock_ecc_mm"],
-            "rod_external_force_max_N": metrics[
-                "rod_external_force_max_N"],
-            "robot_machine_contact_max": metrics[
-                "robot_machine_contact_max"],
-            "feed_residual_mm": result["ik_residuals_mm"].get("feed", ""),
+            "status": "ABORT",
+            "error": result["abort_reason"],
         })
-    else:
-        row["error"] = output[-1200:].strip()
-        row.update({
-            "execution_status": "missing",
-            "trial_data_valid": False,
-            "include_in_primary_trial_stats": False,
-            "physical_task_success": False,
-        })
+        return row
+
+    metrics = result["metrics"]
+    row.update({
+        "status": "PASS" if result["overall_pass"] else "FAIL",
+        "coax_mm": metrics["coax_mm"],
+        "tilt_deg": metrics["tilt_deg"],
+        "contacts": metrics["contacts"],
+        "grasp_contact_count": metrics.get("grasp_contact_count", ""),
+        "slip_mm": metrics["slip_mm"],
+        "pull_mm": metrics["pull_mm"],
+        "jaw_force_N": metrics["jaw_force_N"],
+        "grasp_tilt_deg": metrics["grasp_tilt_deg"],
+        "carry": "physics",
+        "physics_after_clamp": 1,
+        "clamp_swing_mm": metrics["clamp_swing_mm"],
+        "stock_ecc_mm": metrics["stock_ecc_mm"],
+        "rod_external_force_max_N": metrics["rod_external_force_max_N"],
+        "robot_machine_contact_max": metrics["robot_machine_contact_max"],
+        "feed_residual_mm": result["ik_residuals_mm"]["feed"],
+    })
     return row
 
 
@@ -187,7 +382,7 @@ def main():
     for insert_mm in args.inserts:
         case_id = "d%g-%s" % (insert_mm, uuid.uuid4().hex[:8])
         row = run_case(insert_mm, cases_dir / (case_id + ".json"),
-                        case_id=case_id)
+                       case_id=case_id)
         rows.append(row)
         print(
             "D=%g mm  %-5s hard=%s quality=%s coax=%s mm tilt=%s deg "
