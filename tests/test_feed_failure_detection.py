@@ -95,7 +95,7 @@ class PlanningModeIsolationTests(unittest.TestCase):
 
 
 def assert_reproducibility_fields(test_case, result):
-    test_case.assertEqual(9, result["schema_version"])
+    test_case.assertEqual(10, result["schema_version"])
     test_case.assertEqual(1, result["metric_schema_version"])
     test_case.assertEqual("feed-criteria-v1", result["criterion_set_id"])
     test_case.assertTrue(result["case_id"])
@@ -105,6 +105,7 @@ def assert_reproducibility_fields(test_case, result):
     test_case.assertIn("checkpoints", result)
     test_case.assertIn("contact_diagnostics", result)
     test_case.assertIn("applied_load_diagnostics", result)
+    test_case.assertIn("initial_stability", result)
     test_case.assertTrue(
         result["contact_diagnostics"]["sampled_every_physics_step"])
     test_case.assertTrue(
@@ -448,6 +449,45 @@ class RobotMachineContactTests(unittest.TestCase):
         self.assertEqual(
             "settled_true_workpiece_pose",
             result["inputs"]["grasp_target_pose"]["orientation_source"])
+        workpiece = result["inputs"]["workpiece"]
+        self.assertEqual(
+            "reset_model_pose_before_requested_perturbation",
+            workpiece["nominal_start_position_source"])
+        np.testing.assert_allclose(
+            result["inputs"]["pose_before_perturbation"]["position_m"],
+            workpiece["nominal_start_position_m"],
+            atol=1e-12,
+        )
+        self.assertNotEqual(
+            list(feed.SM.SHAFT_POS),
+            workpiece["nominal_start_position_m"])
+        stability = result["initial_stability"]
+        self.assertEqual("evaluated", stability["status"])
+        self.assertEqual(100, stability["sample_count"])
+        self.assertEqual(100, len(stability["samples"]))
+        self.assertTrue(stability["stability_pass"])
+        self.assertLessEqual(
+            stability["max_endpoint_excursion_mm"],
+            stability["endpoint_excursion_limit_mm"])
+        self.assertEqual(
+            {"L": True, "R": True},
+            stability["support_contact_continuous_by_side"])
+        self.assertEqual(
+            100, stability["support_contact_samples_by_side"]["L"])
+        self.assertEqual(
+            100, stability["support_contact_samples_by_side"]["R"])
+        self.assertEqual(0.0, stability["workpiece_gravcomp"])
+        self.assertTrue(stability["no_external_applied_loads_on_workpiece"])
+        self.assertEqual([0.0, 0.0, -9.81], stability["gravity_m_s2"])
+        for sample in stability["samples"]:
+            self.assertEqual(
+                [0.0, 0.0, 0.0], sample["qfrc_applied_force_N"])
+            self.assertEqual(
+                [0.0, 0.0, 0.0], sample["qfrc_applied_torque_Nm"])
+            self.assertEqual(
+                [0.0, 0.0, 0.0], sample["xfrc_applied_force_N"])
+            self.assertEqual(
+                [0.0, 0.0, 0.0], sample["xfrc_applied_torque_Nm"])
         contact_scopes = result["contact_diagnostics"]["scopes"]
         feed_contacts = contact_scopes["feed"]["overall"]
         self.assertGreater(feed_contacts["samples"], 10000)
@@ -527,6 +567,9 @@ class FeedFailureStatusTests(unittest.TestCase):
         )
 
         self.assertEqual(0, result["inputs"]["initial_settle_steps"])
+        self.assertEqual(
+            "insufficient_samples", result["initial_stability"]["status"])
+        self.assertIsNone(result["initial_stability"]["stability_pass"])
         requested = result["inputs"]["pose_after_perturbation_before_settle"]
         actual = result["actual_initial_pose"]
         np.testing.assert_allclose(

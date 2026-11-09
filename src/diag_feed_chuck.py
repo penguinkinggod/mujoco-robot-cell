@@ -99,11 +99,13 @@ from demo_08_pick_and_load import (
 )
 
 
-RESULT_SCHEMA_VERSION = 9
+RESULT_SCHEMA_VERSION = 10
 METRIC_SCHEMA_VERSION = 1
 CRITERION_SET_ID = "feed-criteria-v1"
 PLANNING_MODES = ("M0", "M1", "M2")
 DEFAULT_INITIAL_SETTLE_STEPS = 600
+INITIAL_STABILITY_WINDOW_STEPS = 100
+INITIAL_STABILITY_ENDPOINT_EXCURSION_LIMIT_MM = 0.2
 WORLD_X_AXIS = np.array([1.0, 0.0, 0.0])
 # Frozen from the P4.2 zero-disturbance case after the same 600-step fixture
 # settle. This is calibration data, not a per-case measurement consumed by M0.
@@ -700,11 +702,169 @@ def _diagnostic_result_fields(state):
             "contact_diagnostics", {"scopes": {}}),
         "applied_load_diagnostics": state.get(
             "applied_load_diagnostics", {"scopes": {}}),
+        "initial_stability": state.get("initial_stability"),
         "diagnostic_scope_definitions": {
             "feed": "送料、夹紧、松爪、退出和解锁静置；不含 20 N 拉拔测试",
             "pull_test": "机器人退出后单独施加的 20 N 轴向拉拔测试",
         },
     }
+
+
+def _summarize_initial_stability(
+        samples, timestep_s, shaft_length_m, support_geom_names_by_side,
+        gravity, workpiece_gravcomp):
+    """Summarize the pre-motion settling window without changing feed criteria."""
+    samples = list(samples)
+    sample_count = len(samples)
+    window_complete = sample_count == INITIAL_STABILITY_WINDOW_STEPS
+    summary = {
+        "status": "evaluated" if window_complete else "insufficient_samples",
+        "sample_count": sample_count,
+        "required_sample_count": INITIAL_STABILITY_WINDOW_STEPS,
+        "sample_interval_s": float(timestep_s),
+        "observed_span_s": (
+            float(samples[-1]["sim_time_s"] - samples[0]["sim_time_s"])
+            if sample_count > 1 else 0.0),
+        "support_geom_names_by_side": {
+            side: sorted(names)
+            for side, names in support_geom_names_by_side.items()
+        },
+        "endpoint_excursion_limit_mm": (
+            INITIAL_STABILITY_ENDPOINT_EXCURSION_LIMIT_MM),
+        "endpoint_excursion_limit_basis": (
+            "project provisional budget: 10% of the existing 2.0 mm "
+            "stock allowance; not an industry standard"),
+        "workpiece_gravcomp": float(workpiece_gravcomp),
+        "gravity_m_s2": [float(value) for value in gravity],
+        "samples": samples,
+        "stability_pass": None,
+    }
+    if not samples:
+        return summary
+
+    reference_position = np.asarray(samples[0]["position_m"], dtype=float)
+    reference_axis = np.asarray(
+        samples[0]["shaft_axis_world_unit"], dtype=float)
+    reference_axis /= max(float(np.linalg.norm(reference_axis)), 1e-12)
+    half_length = float(shaft_length_m) / 2.0
+    max_center_excursion_m = 0.0
+    max_axis_change_deg = 0.0
+    max_endpoint_excursion_m = 0.0
+    max_linear_speed_m_s = 0.0
+    max_angular_speed_rad_s = 0.0
+    support_contact_samples = {"L": 0, "R": 0}
+    max_qfrc_force_N = 0.0
+    max_qfrc_torque_Nm = 0.0
+    max_xfrc_force_N = 0.0
+    max_xfrc_torque_Nm = 0.0
+
+    for sample in samples:
+        position = np.asarray(sample["position_m"], dtype=float)
+        axis = np.asarray(
+            sample["shaft_axis_world_unit"], dtype=float)
+        axis /= max(float(np.linalg.norm(axis)), 1e-12)
+        max_center_excursion_m = max(
+            max_center_excursion_m,
+            float(np.linalg.norm(position - reference_position)))
+        axis_dot = float(np.clip(np.dot(reference_axis, axis), -1.0, 1.0))
+        max_axis_change_deg = max(
+            max_axis_change_deg,
+            float(np.degrees(np.arccos(abs(axis_dot)))))
+        if axis_dot < 0.0:
+            axis = -axis
+        for sign in (-1.0, 1.0):
+            reference_end = (
+                reference_position + sign * half_length * reference_axis)
+            current_end = position + sign * half_length * axis
+            max_endpoint_excursion_m = max(
+                max_endpoint_excursion_m,
+                float(np.linalg.norm(current_end - reference_end)))
+
+        linear_velocity = np.asarray(
+            sample["linear_velocity_m_s"], dtype=float)
+        angular_velocity = np.asarray(
+            sample["angular_velocity_rad_s"], dtype=float)
+        max_linear_speed_m_s = max(
+            max_linear_speed_m_s, float(np.linalg.norm(linear_velocity)))
+        max_angular_speed_rad_s = max(
+            max_angular_speed_rad_s, float(np.linalg.norm(angular_velocity)))
+        for side in ("L", "R"):
+            if sample["support_contact_count_by_side"].get(side, 0) > 0:
+                support_contact_samples[side] += 1
+
+        qfrc_force = np.asarray(
+            sample["qfrc_applied_force_N"], dtype=float)
+        qfrc_torque = np.asarray(
+            sample["qfrc_applied_torque_Nm"], dtype=float)
+        xfrc_force = np.asarray(
+            sample["xfrc_applied_force_N"], dtype=float)
+        xfrc_torque = np.asarray(
+            sample["xfrc_applied_torque_Nm"], dtype=float)
+        max_qfrc_force_N = max(
+            max_qfrc_force_N, float(np.linalg.norm(qfrc_force)))
+        max_qfrc_torque_Nm = max(
+            max_qfrc_torque_Nm, float(np.linalg.norm(qfrc_torque)))
+        max_xfrc_force_N = max(
+            max_xfrc_force_N, float(np.linalg.norm(xfrc_force)))
+        max_xfrc_torque_Nm = max(
+            max_xfrc_torque_Nm, float(np.linalg.norm(xfrc_torque)))
+
+    endpoint_excursion_mm = max_endpoint_excursion_m * 1000.0
+    support_contact_continuous = {
+        side: (
+            bool(support_geom_names_by_side.get(side))
+            and support_contact_samples[side] == sample_count
+        )
+        for side in ("L", "R")
+    }
+    gravity_enabled = bool(np.allclose(
+        np.asarray(gravity, dtype=float),
+        np.array([0.0, 0.0, -9.81]),
+        rtol=0.0,
+        atol=1e-12,
+    ))
+    no_external_applied_loads = all(value == 0.0 for value in (
+        max_qfrc_force_N, max_qfrc_torque_Nm,
+        max_xfrc_force_N, max_xfrc_torque_Nm,
+    ))
+    checks = {
+        "endpoint_excursion_within_limit": (
+            endpoint_excursion_mm
+            <= INITIAL_STABILITY_ENDPOINT_EXCURSION_LIMIT_MM),
+        "left_support_contact_continuous": (
+            support_contact_continuous["L"]),
+        "right_support_contact_continuous": (
+            support_contact_continuous["R"]),
+        "gravity_enabled": gravity_enabled,
+        "workpiece_gravcomp_disabled": float(workpiece_gravcomp) == 0.0,
+        "no_external_applied_loads_on_workpiece": (
+            no_external_applied_loads),
+    }
+    summary.update({
+        "reference_pose": {
+            "position_m": [float(value) for value in reference_position],
+            "shaft_axis_world_unit": [
+                float(value) for value in reference_axis],
+        },
+        "max_center_excursion_mm": max_center_excursion_m * 1000.0,
+        "max_axis_change_deg": max_axis_change_deg,
+        "max_endpoint_excursion_mm": endpoint_excursion_mm,
+        "max_linear_speed_m_s": max_linear_speed_m_s,
+        "max_angular_speed_rad_s": max_angular_speed_rad_s,
+        "support_contact_samples_by_side": support_contact_samples,
+        "support_contact_continuous_by_side": (
+            support_contact_continuous),
+        "max_qfrc_applied_force_N": max_qfrc_force_N,
+        "max_qfrc_applied_torque_Nm": max_qfrc_torque_Nm,
+        "max_xfrc_applied_force_N": max_xfrc_force_N,
+        "max_xfrc_applied_torque_Nm": max_xfrc_torque_Nm,
+        "no_external_applied_loads_on_workpiece": (
+            no_external_applied_loads),
+        "checks": checks if window_complete else None,
+        "stability_pass": (
+            bool(all(checks.values())) if window_complete else None),
+    })
+    return summary
 
 
 COAX_LIMIT = 2.0       # mm
@@ -1481,6 +1641,15 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, i) or "")
         .startswith("shaft_")
     ]
+    initial_support_geom_ids_by_side = {
+        side: {
+            i for i in range(model.ngeom)
+            if (mujoco.mj_id2name(
+                model, mujoco.mjtObj.mjOBJ_GEOM, i) or "")
+            .startswith("cradle_%s" % side)
+        }
+        for side in ("L", "R")
+    }
     robot_geom_ids, machine_geom_ids = _robot_machine_geom_ids(model)
     contact_geom_sets = _semantic_contact_geom_sets(model, robot_geom_ids)
     bushing_ids = [
@@ -1783,6 +1952,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                  "sample_interval_s": float(model.opt.timestep),
                  "scopes": {},
              },
+             "initial_stability": None,
              "ik_residuals_mm": {}, "versions": _versions_snapshot(),
              "actual_initial_pose": None,
              "model_options_initial": _model_options_snapshot(model),
@@ -1791,12 +1961,13 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                      "shape": "cylinder",
                      "material": "steel",
                      "diameter_mm": float(SM.SHAFT_D * 1000),
-                     "length_mm": float(SM.SHAFT_L * 1000),
-                     "mass_kg": float(SM.SHAFT_MASS),
-                     "density_kg_m3": float(SM.STEEL_RHO),
-                     "nominal_start_position_m": [
-                         float(x) for x in SM.SHAFT_POS],
-                 },
+                      "length_mm": float(SM.SHAFT_L * 1000),
+                      "mass_kg": float(SM.SHAFT_MASS),
+                      "density_kg_m3": float(SM.STEEL_RHO),
+                      "nominal_start_position_m": None,
+                      "nominal_start_position_source": (
+                          "reset_model_pose_before_requested_perturbation"),
+                  },
                  "requested_initial_pose": {
                      "offset_mm": [float(x) for x in offset_mm],
                      "offset_world_xyz_mm": [
@@ -2684,7 +2855,10 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     # ---------------- reset / home ----------------
     mujoco.mj_resetData(model, data)
     mujoco.mj_forward(model, data)
-    state["inputs"]["pose_before_perturbation"] = shaft_pose_snapshot()
+    reset_pose = shaft_pose_snapshot()
+    state["inputs"]["workpiece"]["nominal_start_position_m"] = (
+        reset_pose["position_m"])
+    state["inputs"]["pose_before_perturbation"] = reset_pose
     data.qpos[sq:sq + 3] += offset_mm / 1000.0
     if yaw_world_z_deg:
         data.qpos[sq + 3:sq + 7] = _apply_world_yaw_to_quaternion(
@@ -2696,10 +2870,97 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     data.ctrl[4] = wrist
     grip_direct(GRIP_OPEN)
     data.ctrl[jaw_act] = SM.CHUCK_OPEN_CTRL
-    for _ in range(initial_settle_steps):
+    initial_stability_samples = []
+    for settle_step in range(initial_settle_steps):
         for k in range(5):
             data.ctrl[k] = data.qpos[arm.qadr[k]]
         step_sim("initial_settle")
+        if (settle_step >=
+                initial_settle_steps - INITIAL_STABILITY_WINDOW_STEPS):
+            velocity = np.zeros(6, dtype=float)
+            mujoco.mj_objectVelocity(
+                model, data, mujoco.mjtObj.mjOBJ_BODY,
+                shaft_body, velocity, 0)
+            support_contact_count_by_side = {"L": 0, "R": 0}
+            for contact_id in range(data.ncon):
+                contact = data.contact[contact_id]
+                first, second = int(contact.geom1), int(contact.geom2)
+                if first in shaft_geoms:
+                    other = second
+                elif second in shaft_geoms:
+                    other = first
+                else:
+                    continue
+                for side, support_geom_ids in (
+                        initial_support_geom_ids_by_side.items()):
+                    if other in support_geom_ids:
+                        support_contact_count_by_side[side] += 1
+            shaft_qfrc_applied = np.asarray(
+                data.qfrc_applied[sv:sv + 6], dtype=float)
+            shaft_xfrc_applied = np.asarray(
+                data.xfrc_applied[shaft_body], dtype=float)
+            pose = shaft_pose_snapshot()
+            initial_stability_samples.append({
+                "sim_time_s": float(data.time),
+                **pose,
+                "angular_velocity_rad_s": [
+                    float(value) for value in velocity[:3]],
+                "linear_velocity_m_s": [
+                    float(value) for value in velocity[3:]],
+                "support_contact_count_by_side": (
+                    support_contact_count_by_side),
+                "qfrc_applied_force_N": [
+                    float(value) for value in shaft_qfrc_applied[:3]],
+                "qfrc_applied_torque_Nm": [
+                    float(value) for value in shaft_qfrc_applied[3:]],
+                "xfrc_applied_force_N": [
+                    float(value) for value in shaft_xfrc_applied[:3]],
+                "xfrc_applied_torque_Nm": [
+                    float(value) for value in shaft_xfrc_applied[3:]],
+            })
+    support_geom_names_by_side = {
+        side: [
+            mujoco.mj_id2name(
+                model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or "?"
+            for geom_id in sorted(geom_ids)
+        ]
+        for side, geom_ids in initial_support_geom_ids_by_side.items()
+    }
+    state["initial_stability"] = _summarize_initial_stability(
+        initial_stability_samples,
+        model.opt.timestep,
+        F.SHAFT_L,
+        support_geom_names_by_side,
+        model.opt.gravity,
+        model.body_gravcomp[shaft_body],
+    )
+    stability = state["initial_stability"]
+    stability_result = (
+        "PASS" if stability["stability_pass"] is True else
+        "FAIL" if stability["stability_pass"] is False else
+        "NOT_EVALUATED")
+    print(
+        "FEED_STABILITY %s samples=%d/%d endpoint_excursion_mm=%.6f "
+        "limit_mm=%.3f support_L=%d/%d support_R=%d/%d "
+        "max_linear_speed_m_s=%.9g max_angular_speed_rad_s=%.9g "
+        "gravcomp=%.1f external_loads=%s"
+        % (
+            stability_result,
+            stability["sample_count"],
+            stability["required_sample_count"],
+            stability.get("max_endpoint_excursion_mm", 0.0),
+            stability["endpoint_excursion_limit_mm"],
+            stability.get("support_contact_samples_by_side", {}).get("L", 0),
+            stability["sample_count"],
+            stability.get("support_contact_samples_by_side", {}).get("R", 0),
+            stability["sample_count"],
+            stability.get("max_linear_speed_m_s", 0.0),
+            stability.get("max_angular_speed_rad_s", 0.0),
+            stability["workpiece_gravcomp"],
+            "none" if stability.get(
+                "no_external_applied_loads_on_workpiece") is True
+            else "present_or_unmeasured",
+        ))
     # Pick uses the calibrated position-only IK. Axis holding starts only
     # AFTER the V jaws close; applying it during approach changes the
     # calibrated grasp pose and the blades shove the rod into the table.

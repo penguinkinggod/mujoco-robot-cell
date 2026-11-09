@@ -18,8 +18,9 @@ ROOT = Path(__file__).resolve().parents[1]
 FEED_SCRIPT = ROOT / "src" / "diag_feed_chuck.py"
 DEFAULT_OUTPUT = ROOT / "_build" / "feed_insert_sweep.csv"
 DEFAULT_INSERTS_MM = (5, 6, 7, 8, 9, 10, 15, 20, 25, 30)
-EXPECTED_SCHEMA_VERSION = 9
+EXPECTED_SCHEMA_VERSION = 10
 EXPECTED_INITIAL_SETTLE_STEPS = 600
+EXPECTED_INITIAL_STABILITY_WINDOW_STEPS = 100
 CASE_TIMEOUT_SECONDS = 600
 COMPLETED_METRICS = (
     "coax_mm",
@@ -145,6 +146,7 @@ def _result_error(result, case_id, expected_mode=None,
         "config",
         "control_mode",
         "inputs",
+        "initial_stability",
         "evaluation_scope",
         "trial_data_valid",
         "include_in_primary_trial_stats",
@@ -167,6 +169,16 @@ def _result_error(result, case_id, expected_mode=None,
         return "control_mode must be an object"
     if not isinstance(result["inputs"], dict):
         return "inputs must be an object"
+    stability = result["initial_stability"]
+    if status != "error":
+        if not isinstance(stability, dict):
+            return "completed/aborted result must include initial_stability"
+        if (stability.get("status") != "evaluated"
+                or stability.get("sample_count")
+                != EXPECTED_INITIAL_STABILITY_WINDOW_STEPS):
+            return "initial_stability window was not fully evaluated"
+        if stability.get("stability_pass") is not True:
+            return "initial_stability did not pass"
     initial_settle_steps = result["inputs"].get("initial_settle_steps")
     if initial_settle_steps != EXPECTED_INITIAL_SETTLE_STEPS:
         return (

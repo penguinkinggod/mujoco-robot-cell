@@ -16,7 +16,7 @@ def make_result(case_id, status="completed", passed=True):
     hard_pass = passed
     quality_pass = passed if status == "completed" else None
     result = {
-        "schema_version": 9,
+        "schema_version": 10,
         "case_id": case_id,
         "execution_status": status,
         "evaluation_scope": "primary_physics_feed",
@@ -43,6 +43,11 @@ def make_result(case_id, status="completed", passed=True):
                 "m2_error_used_mm": [0.0, 0.0, 0.0],
                 "m2_error_used_yaw_deg": 0.0,
             }
+        },
+        "initial_stability": {
+            "status": "evaluated",
+            "sample_count": 100,
+            "stability_pass": True,
         },
         "metrics": {},
         "hard_pass": hard_pass,
@@ -106,7 +111,7 @@ class FeedInsertSweepTests(unittest.TestCase):
 
         self.assertEqual("PASS", row["status"])
         self.assertEqual(0, row["exit_code"])
-        self.assertEqual(9, row["schema_version"])
+        self.assertEqual(10, row["schema_version"])
         self.assertEqual("sweep-test-case", row["case_id"])
         self.assertEqual(str(json_path), row["json_path"])
         self.assertEqual(0.64, row["coax_mm"])
@@ -137,6 +142,15 @@ class FeedInsertSweepTests(unittest.TestCase):
 
         self.assertEqual("ERROR", row["status"])
         self.assertIn("initial_settle_steps mismatch", row["error"])
+
+    def test_insert_sweep_rejects_unstable_initial_condition(self):
+        result = make_result("sweep-test-case")
+        result["initial_stability"]["stability_pass"] = False
+
+        row, _ = self._run_case(result)
+
+        self.assertEqual("ERROR", row["status"])
+        self.assertIn("initial_stability did not pass", row["error"])
 
     def test_result_rejects_unplanned_carry_offset_source(self):
         result = make_result("sweep-test-case")
