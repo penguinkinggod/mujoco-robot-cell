@@ -236,6 +236,7 @@ _REPRODUCIBLE_ENV_KEYS = {
     "FEED_GRIP_CLOSE", "FEED_DIAG_NO_RETREAT", "SMOOTH",
     "SO101_KP", "SO101_KV", "SM_JAW_BORE_Q", "FEED_DEBUG",
     "FEED_CLAMP_TRACE", "FEED_SEAT_TRACE",
+    "FEED_V_CONTACT_SOLREF_TIME",
 }
 _SOURCE_IDENTITY = None
 
@@ -1257,6 +1258,32 @@ def _install_v_jaws(spec):
     print("    v_jaw: both pads -> 90 deg V slot, depth %.0f mm" % (V_DEPTH * 1000))
 
 
+def _apply_v_contact_solref_time(model, time_constant_s):
+    """Set the experimental solref time on the shaft and four V-jaw geoms."""
+    time_constant_s = float(time_constant_s)
+    if not np.isfinite(time_constant_s) or time_constant_s <= 0.0:
+        raise ValueError(
+            "FEED_V_CONTACT_SOLREF_TIME must be a positive finite number")
+    target_names = {
+        "shaft_geom",
+        "fixed_jaw_pad_v1", "fixed_jaw_pad_v2",
+        "moving_jaw_pad_v1", "moving_jaw_pad_v2",
+    }
+    found = set()
+    for geom_id in range(model.ngeom):
+        name = (mujoco.mj_id2name(
+            model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or "")
+        if name in target_names:
+            model.geom_solref[geom_id, 0] = time_constant_s
+            found.add(name)
+    missing = target_names - found
+    if missing:
+        raise ValueError(
+            "contact sensitivity model is missing geoms: %s"
+            % ", ".join(sorted(missing)))
+    return tuple(sorted(found))
+
+
 def _lift_workpiece(spec):
     """Raise the rod and put a V cradle under each end."""
     b = next(bb for bb in spec.bodies if bb.name == "shaft")
@@ -1433,7 +1460,19 @@ def build_model(grip_fix=None, v_jaw=False, lift=False, arc_jaw=False,
         _install_v_jaws(spec)
     if grip_fix:
         add_grip_fix(spec, grip_fix)
-    return spec.compile()
+    model = spec.compile()
+    contact_solref_time = os.environ.get("FEED_V_CONTACT_SOLREF_TIME")
+    if contact_solref_time is not None:
+        if not v_jaw:
+            raise ValueError(
+                "FEED_V_CONTACT_SOLREF_TIME requires --v-jaw")
+        changed = _apply_v_contact_solref_time(
+            model, contact_solref_time)
+        print(
+            "  接触敏感性探索  shaft + 4 V 爪 solref 时间常数 = %.4f s"
+            " (%s)"
+            % (float(contact_solref_time), ", ".join(changed)))
+    return model
 
 
 FRAME_EVERY = 60         # 每 N 步采一帧；仅 frame_hook 非 None 时生效

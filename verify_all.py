@@ -48,6 +48,7 @@ CORE_FILES = [
     # Also a real CHECKS entry below (kept here for py_compile coverage).
     "src/diag_feed_chuck.py",
     "src/diag_feed_insert_sweep.py",
+    "src/diag_contact_sensitivity.py",
     "tests/test_feed_failure_detection.py",
     "tests/test_feed_insert_sweep.py",
 ]
