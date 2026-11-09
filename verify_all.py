@@ -18,6 +18,7 @@ Run:
 Exit code: 0 = all passed, 1 = at least one failed.
 """
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -192,6 +193,42 @@ def check_feed_physics(out, err, rc):
                       if stock is not None else "缺失"))
 
 
+def check_grasp_target_tracking(out, err, rc):
+    match = re.search(r"GRASP_HOLD_RESULT_JSON\s+(.+)", out)
+    if not match:
+        return False, "missing grasp-hold result path"
+    try:
+        with open(match.group(1).strip(), "r", encoding="utf-8") as handle:
+            result = json.load(handle)
+    except (OSError, ValueError) as exc:
+        return False, "cannot read grasp-hold result: %s" % exc
+
+    lift = result.get("lift", {})
+    error = lift.get("actual_pad_target_error_norm_mm")
+    tolerance = lift.get("target_tolerance_mm")
+    samples = lift.get("jaw_shaft_contact_samples")
+    samples_with_contact = lift.get("jaw_shaft_contact_samples_with_contact")
+    good = (
+        rc == 0
+        and result.get("execution_status") == "completed_observation"
+        and lift.get("target_reached_within_tolerance") is True
+        and isinstance(error, (int, float))
+        and isinstance(tolerance, (int, float))
+        and error <= tolerance
+        and isinstance(samples, int)
+        and samples > 0
+        and samples_with_contact == samples
+        and lift.get("jaw_shaft_contact_end", 0) > 0
+    )
+    return good, (
+        "夹爪终点误差%s/%s mm，V爪接触采样%s/%s" % (
+            "%.3f" % error if isinstance(error, (int, float)) else "缺失",
+            "%.3f" % tolerance
+            if isinstance(tolerance, (int, float)) else "缺失",
+            samples_with_contact if samples_with_contact is not None else "缺失",
+            samples if samples is not None else "缺失"))
+
+
 def check_env_cell(out, err, rc):
     """Same physics, but in the official lerobot/so101-tabletop-mujoco world.
 
@@ -245,6 +282,9 @@ CHECKS = [
     dict(name="送料·全物理(V槽)",
          cmd=[PY, "src/diag_feed_chuck.py", "--v-jaw", "--lift", "--no-lock"],
          check=check_feed_physics, slow=True, hint="约 20 秒"),
+    dict(name="带载抬升目标跟踪",
+         cmd=[PY, "src/diag_grasp_hold_matched.py"],
+         check=check_grasp_target_tracking, slow=True, hint="约 3 秒"),
     dict(name="送料·官方场景(SO-101 env)",
          cmd=[PY, "src/env_cell.py", "--run", "--no-video"],
          check=check_env_cell, slow=True, hint="约 5 秒"),

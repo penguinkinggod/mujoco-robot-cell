@@ -28,6 +28,12 @@ HOLD_STEPS = 400
 LIFT_MM = 30.0
 LIFT_STEPS = 500
 POST_LIFT_HOLD_STEPS = 260
+LIFT_CORRECTION_MAX_PASSES = 4
+LIFT_CORRECTION_STEPS = 500
+LIFT_CORRECTION_GAIN = 0.8
+LIFT_CORRECTION_MAX_STEP_MM = 8.0
+LIFT_CORRECTION_MAX_TOTAL_MM = 12.0
+LIFT_TARGET_TOLERANCE_MM = 0.5
 
 
 def _geom_name(model, geom_id):
@@ -152,11 +158,8 @@ def _disable_end_cradles(model):
 def _move_with_axis_hold(model, data, arm, shaft_body, pad_target,
                          target_axis, axis_local, jaw_act, grip_target,
                          steps):
-    site_target = np.asarray(pad_target, dtype=float) - arm.pad_offset()
-    q_start = np.asarray(
-        [data.qpos[address] for address in arm.qadr], dtype=float)
-    q_goal, ik_position_error, ik_axis_error = arm.ik_axis(
-        site_target, target_axis, axis_local, q_init=q_start, iters=500)
+    requested_pad_target = np.asarray(pad_target, dtype=float).copy()
+    commanded_pad_target = requested_pad_target.copy()
     pad_start = arm.pad_center().copy()
     shaft_start = _shaft_position(data, shaft_body)
     axis_start = _shaft_axis(data, shaft_body)
@@ -166,6 +169,7 @@ def _move_with_axis_hold(model, data, arm, shaft_body, pad_target,
     max_relative_axis_change_deg = 0.0
     contact_samples = []
     contact_pairs = {}
+    correction_trace = []
 
     def step_with_target(q_target):
         for index, value in enumerate(q_target):
@@ -174,11 +178,9 @@ def _move_with_axis_hold(model, data, arm, shaft_body, pad_target,
         data.ctrl[jaw_act] = machining.CHUCK_OPEN_CTRL
         mujoco.mj_step(model, data)
 
-    for step_index in range(steps):
-        fraction = (step_index + 1) / float(steps)
-        smooth = fraction * fraction * (3.0 - 2.0 * fraction)
-        q_target = q_start + smooth * (q_goal - q_start)
-        step_with_target(q_target)
+    def sample_step():
+        nonlocal max_relative_translation_mm
+        nonlocal max_relative_axis_change_deg
         offset_now, axis_tool_now = _relative_pose(
             model, data, arm, shaft_body)
         max_relative_translation_mm = max(
@@ -191,19 +193,75 @@ def _move_with_axis_hold(model, data, arm, shaft_body, pad_target,
         _accumulate_contact_pairs(
             contact_pairs, _shaft_contact_pairs(model, data))
 
-    for _ in range(POST_LIFT_HOLD_STEPS):
-        step_with_target(q_goal)
-        offset_now, axis_tool_now = _relative_pose(
-            model, data, arm, shaft_body)
-        max_relative_translation_mm = max(
-            max_relative_translation_mm,
-            float(np.linalg.norm(offset_now - offset_start) * 1000.0))
-        max_relative_axis_change_deg = max(
-            max_relative_axis_change_deg,
-            _axis_delta_deg(axis_tool_start, axis_tool_now))
-        contact_samples.append(_jaw_shaft_contacts(model, data))
-        _accumulate_contact_pairs(
-            contact_pairs, _shaft_contact_pairs(model, data))
+    for pass_index in range(LIFT_CORRECTION_MAX_PASSES + 1):
+        mujoco.mj_forward(model, data)
+        q_start = np.asarray(
+            [data.qpos[address] for address in arm.qadr], dtype=float)
+        site_target = commanded_pad_target - arm.pad_offset()
+        q_goal, ik_position_error, ik_axis_error = arm.ik_axis(
+            site_target, target_axis, axis_local,
+            q_init=q_start, iters=500)
+        pass_steps = steps if pass_index == 0 else LIFT_CORRECTION_STEPS
+        for step_index in range(pass_steps):
+            fraction = (step_index + 1) / float(pass_steps)
+            smooth = fraction * fraction * (3.0 - 2.0 * fraction)
+            q_target = q_start + smooth * (q_goal - q_start)
+            step_with_target(q_target)
+            sample_step()
+
+        pad_after_motion = arm.pad_center().copy()
+        motion_error = requested_pad_target - pad_after_motion
+        for _ in range(POST_LIFT_HOLD_STEPS):
+            step_with_target(q_goal)
+            sample_step()
+
+        actual_pad = arm.pad_center().copy()
+        error = requested_pad_target - actual_pad
+        error_mm = float(np.linalg.norm(error) * 1000.0)
+        correction_trace.append({
+            "pass": pass_index,
+            "commanded_pad_target_m": [
+                float(value) for value in commanded_pad_target],
+            "ik_position_residual_mm": float(ik_position_error * 1000.0),
+            "ik_axis_residual_deg": float(math.degrees(ik_axis_error)),
+            "actual_pad_position_after_motion_m": [
+                float(value) for value in pad_after_motion],
+            "motion_end_error_vector_mm": [
+                float(value * 1000.0) for value in motion_error],
+            "motion_end_error_norm_mm": float(
+                np.linalg.norm(motion_error) * 1000.0),
+            "actual_pad_position_after_hold_m": [
+                float(value) for value in actual_pad],
+            "hold_end_error_vector_mm": [
+                float(value * 1000.0) for value in error],
+            "hold_end_error_norm_mm": error_mm,
+            "actual_pad_position_m": [
+                float(value) for value in actual_pad],
+            "remaining_error_vector_mm": [
+                float(value * 1000.0) for value in error],
+            "remaining_error_norm_mm": error_mm,
+        })
+        if error_mm <= LIFT_TARGET_TOLERANCE_MM:
+            break
+        if pass_index >= LIFT_CORRECTION_MAX_PASSES:
+            break
+
+        correction = LIFT_CORRECTION_GAIN * error
+        correction_norm = float(np.linalg.norm(correction))
+        if correction_norm > LIFT_CORRECTION_MAX_STEP_MM / 1000.0:
+            correction *= (
+                (LIFT_CORRECTION_MAX_STEP_MM / 1000.0)
+                / correction_norm)
+        next_target = commanded_pad_target + correction
+        total_correction = next_target - requested_pad_target
+        total_norm = float(np.linalg.norm(total_correction))
+        max_total = LIFT_CORRECTION_MAX_TOTAL_MM / 1000.0
+        if total_norm > max_total:
+            next_target = requested_pad_target + total_correction * (
+                max_total / total_norm)
+        if np.linalg.norm(next_target - commanded_pad_target) < 1e-9:
+            break
+        commanded_pad_target = next_target
 
     pad_end = arm.pad_center().copy()
     shaft_end = _shaft_position(data, shaft_body)
@@ -214,10 +272,28 @@ def _move_with_axis_hold(model, data, arm, shaft_body, pad_target,
         float(np.dot(shaft_delta, pad_delta) / pad_delta_sq)
         if pad_delta_sq > 1e-12 else None)
     axis_end = _shaft_axis(data, shaft_body)
+    final_target_error = requested_pad_target - pad_end
     return {
         "requested_pad_lift_mm": float(LIFT_MM),
-        "ik_position_residual_mm": float(ik_position_error * 1000.0),
-        "ik_axis_residual_deg": float(math.degrees(ik_axis_error)),
+        "requested_pad_target_m": [
+            float(value) for value in requested_pad_target],
+        "final_commanded_pad_target_m": [
+            float(value) for value in commanded_pad_target],
+        "actual_pad_target_error_vector_mm": [
+            float(value * 1000.0) for value in final_target_error],
+        "actual_pad_target_error_norm_mm": float(
+            np.linalg.norm(final_target_error) * 1000.0),
+        "target_reached_within_tolerance": bool(
+            np.linalg.norm(final_target_error) * 1000.0
+            <= LIFT_TARGET_TOLERANCE_MM),
+        "target_tolerance_mm": float(LIFT_TARGET_TOLERANCE_MM),
+        "correction_config": {
+            "max_correction_passes": int(LIFT_CORRECTION_MAX_PASSES),
+            "gain": float(LIFT_CORRECTION_GAIN),
+            "max_step_mm": float(LIFT_CORRECTION_MAX_STEP_MM),
+            "max_total_mm": float(LIFT_CORRECTION_MAX_TOTAL_MM),
+        },
+        "correction_trace": correction_trace,
         "actual_pad_displacement_mm": [
             float(value * 1000.0) for value in pad_delta],
         "actual_shaft_displacement_mm": [
