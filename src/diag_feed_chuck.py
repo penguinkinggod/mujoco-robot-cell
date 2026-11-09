@@ -2777,7 +2777,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     # physically shifted to GRIP_STATION inside the gripper, so the contact
     # patch is on the tail while the approach pose stays unchanged.
     print("=" * 74)
-    print("机械臂送料到卡盘（合并场景；搬运段为运动学锁，见文件头）")
+    carry_mode = "运动学锁参考" if carry_lock else "物理接触无锁"
+    print("机械臂送料到卡盘（合并场景；搬运模式：%s）" % carry_mode)
     print("=" * 74)
     print("  工件起点      : %s" % np.round(home, 4))
     print("  卡盘轴线      : %s" % np.round(axis, 4))
@@ -2907,7 +2908,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     record_stage("grasp_complete")
     state["grasp_axis_target"] = None
     state["grasp_axis_active"] = False
-    print("  shaft_in_grip = %s mm（搬运锁的相对偏移）"
+    print("  shaft_in_grip = %s mm（按抓取规划位姿计算的夹爪-工件相对偏移）"
           % np.round(state["offset"] * 1000, 2))
     # 落座：抓起后先把料抬离台面几毫米再静置，让它在 V 槽里坐到底。
     # 【已否掉，实测无效】料"落座"的真相不是沿斜面滑，而是 V 槽被料重撑开
@@ -3713,6 +3714,37 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         print("FEED_METRIC_MACHINING stock_ecc_mm=%.2f allow_mm=%.1f"
               % (stock, STOCK_ALLOW_MM))
     print("FEED_METRIC %s" % ("PASS" if ok else "FAIL"))
+    print("结果翻译：")
+    print("  coax_mm：最终棒料中心离卡盘主轴轴线 %.2f mm（越小越居中）。"
+          % final_coax)
+    print("  tilt_deg：最终棒料轴线与卡盘轴线相差 %.1f°。"
+          % final_tilt)
+    print("  contacts：棒料与卡盘爪之间统计到 %d 个接触点，不是爪的数量。"
+          % contacts)
+    print("  slip_mm：机器人退出后，棒料在卡盘内静置时的滑移量 %.2f mm。"
+          % slip)
+    print("  pull_mm：单独施加 20 N 轴向拉力时，棒料移动 %.2f mm。"
+          % pull)
+    print("  jaw_force_N：三爪接触法向力汇总 %.1f N，仅作观测，不单独决定通过。"
+          % force)
+    print("  grasp_tilt_deg：夹住棒料那一刻的角度差 %.1f°，不是最终倾角。"
+          % grasp_tilt)
+    carry_cn = "物理接触搬运（未使用运动学锁）" if not carry_lock else \
+        "运动学锁搬运（参考模式）"
+    print("  carry：%s。" % carry_cn)
+    print("  physics_after_clamp：%s。"
+          % ("卡盘夹紧后继续物理仿真" if not state["lock_active"]
+             else "卡盘夹紧后仍处于运动学锁定"))
+    if swing is not None:
+        print("  clamp_swing_mm：夹紧交接期间棒料 z 方向峰谷位移 %.2f mm；"
+              "guard=%.1f mm 是项目护栏，不是精度目标。"
+              % (swing, CLAMP_SWING_LIMIT))
+    if stock is not None:
+        print("  stock_ecc_mm：棒料相对主轴轴线的最大径向偏心 %.2f mm；"
+              "allow=%.1f mm 是本项目假设的单边余量，只做几何检查。"
+              % (stock, STOCK_ALLOW_MM))
+    print("  PASS/FAIL：只说明本次输入在当前仿真判据下的结果，"
+          "不代表所有工况或真实机械臂表现。")
     if not ok:
         print("  未通过判据：同轴≤%.1fmm 倾斜≤%.1fdeg 接触≥%d "
               "下沉≤%.1fmm 20N拉≤%.1fmm 交接甩料≤%.1fmm 余量偏心≤%.1fmm"

@@ -26,6 +26,11 @@ DEFAULT_OUTPUT = ROOT / "_build" / "floating-grasp" / "case.json"
 NOMINAL_AXIS = np.array([1.0, 0.0, 0.0])
 IK_POSITION_LIMIT_M = 0.010
 IK_AXIS_LIMIT_RAD = math.radians(10.0)
+GRASP_MIN_PAD_CONTACTS = 2
+GRASP_RELATIVE_POSITION_LIMIT_M = 0.002
+GRASP_RELATIVE_AXIS_LIMIT_RAD = math.radians(5.0)
+GRASP_LIFT_DISTANCE_M = 0.030
+GRASP_HOLD_STEPS = 150
 
 
 def pose_quaternion_world_xyz(rpy_deg):
@@ -114,6 +119,90 @@ def _pose_snapshot(model, data, shaft_body, shaft_joint):
         "position_m": [float(value) for value in position],
         "quaternion_wxyz": [float(value) for value in quat],
         "shaft_axis_world_unit": [float(value) for value in axis],
+    }
+
+
+def _gripper_relative_pose(model, data, arm, shaft_body):
+    """Workpiece centre and axis expressed in the gripper site frame."""
+    site_rotation = data.site_xmat[arm.site].reshape(3, 3)
+    shaft_position = data.xpos[shaft_body].copy()
+    shaft_axis = data.xmat[shaft_body].reshape(3, 3)[:, 2].copy()
+    shaft_axis /= max(float(np.linalg.norm(shaft_axis)), 1e-12)
+    return {
+        "center_local_m": [
+            float(x) for x in
+            site_rotation.T @ (shaft_position - arm.pad_center(data))],
+        "axis_local_unit": [
+            float(x) for x in site_rotation.T @ shaft_axis],
+    }
+
+
+def _relative_pose_change(reference, current):
+    reference_center = np.asarray(reference["center_local_m"], dtype=float)
+    current_center = np.asarray(current["center_local_m"], dtype=float)
+    reference_axis = np.asarray(reference["axis_local_unit"], dtype=float)
+    current_axis = np.asarray(current["axis_local_unit"], dtype=float)
+    axis_dot = float(np.clip(
+        abs(np.dot(reference_axis, current_axis)), 0.0, 1.0))
+    return {
+        "center_drift_m": float(np.linalg.norm(
+            current_center - reference_center)),
+        "axis_drift_rad": math.acos(axis_dot),
+    }
+
+
+def _contacted_pad_sides(pairs):
+    pad_names = {pair[1] for pair in pairs}
+    sides = set()
+    if any(name.startswith("fixed_jaw_pad_v") for name in pad_names):
+        sides.add("fixed")
+    if any(name.startswith("moving_jaw_pad_v") for name in pad_names):
+        sides.add("moving")
+    return sides
+
+
+def _evaluate_grasp(close_pad_contact_count, close_pad_sides,
+                    hold_pad_contact_count, hold_pad_sides,
+                    hold_opposing_contact_steps, hold_sample_count,
+                    workpiece_lift_m, max_center_drift_m,
+                    max_axis_drift_rad, lift_executed):
+    """Evaluate grasp retention without treating pre-contact motion as failure."""
+    checks = {
+        "opposing_jaw_contact": (
+            close_pad_contact_count >= GRASP_MIN_PAD_CONTACTS
+            and close_pad_sides == {"fixed", "moving"}),
+        "lift_executed": bool(lift_executed),
+        "contact_retained_during_hold": (
+            hold_pad_contact_count >= GRASP_MIN_PAD_CONTACTS
+            and hold_pad_sides == {"fixed", "moving"}
+            and hold_sample_count > 0
+            and hold_opposing_contact_steps == hold_sample_count),
+        "minimum_workpiece_lift": (
+            workpiece_lift_m >= GRASP_LIFT_DISTANCE_M * 0.8),
+        "relative_center_stable": (
+            max_center_drift_m <= GRASP_RELATIVE_POSITION_LIMIT_M),
+        "relative_axis_stable": (
+            max_axis_drift_rad <= GRASP_RELATIVE_AXIS_LIMIT_RAD),
+    }
+    reasons = [name for name, passed in checks.items() if not passed]
+    if not checks["opposing_jaw_contact"]:
+        outcome = "no_opposing_jaw_contact"
+    elif not checks["lift_executed"]:
+        outcome = "lift_not_executed"
+    elif not checks["contact_retained_during_hold"]:
+        outcome = "contact_lost_during_lift"
+    elif not checks["minimum_workpiece_lift"]:
+        outcome = "insufficient_lift"
+    elif not (checks["relative_center_stable"]
+              and checks["relative_axis_stable"]):
+        outcome = "workpiece_slipped_relative_to_gripper"
+    else:
+        outcome = "grasp_hold_pass_gravity_compensated"
+    return {
+        "checks": checks,
+        "failure_reasons": reasons,
+        "passed": all(checks.values()),
+        "outcome": outcome,
     }
 
 
@@ -230,13 +319,18 @@ def _solve_pad_center(model, data, arm, target_center, target_axis,
     return q, float(position_error), float(axis_error)
 
 
-def _move_joints(model, data, arm, q_goal, grip, steps):
+def _move_joints(model, data, arm, q_goal, grip, steps,
+                 relative_pose_reference=None, shaft_body=None):
     q_start = np.array([data.qpos[qadr] for qadr in arm.qadr])
     shaft_ids = _shaft_geom_ids(model)
     pad_ids = set(arm.pads)
     pad_contact_max = 0
+    pad_contact_min = None
+    opposing_contact_steps = 0
     first_workpiece_contact = None
     first_pad_contact = None
+    max_relative_center_drift_m = 0.0
+    max_relative_axis_drift_rad = 0.0
     for index in range(steps):
         fraction = (index + 1) / float(steps)
         blend = fraction * fraction * (3.0 - 2.0 * fraction)
@@ -245,9 +339,14 @@ def _move_joints(model, data, arm, q_goal, grip, steps):
             data.ctrl[qadr] = value
         data.ctrl[arm.grip_act] = grip
         mujoco.mj_step(model, data)
-        pad_count, _, contacts = _workpiece_contact_snapshot(
+        pad_count, pad_pairs, contacts = _workpiece_contact_snapshot(
             model, data, shaft_ids, pad_ids)
         pad_contact_max = max(pad_contact_max, pad_count)
+        pad_contact_min = (
+            pad_count if pad_contact_min is None
+            else min(pad_contact_min, pad_count))
+        if _contacted_pad_sides(pad_pairs) == {"fixed", "moving"}:
+            opposing_contact_steps += 1
         if contacts and first_workpiece_contact is None:
             first_workpiece_contact = {
                 "step_in_phase": index + 1,
@@ -262,10 +361,25 @@ def _move_joints(model, data, arm, q_goal, grip, steps):
                 "sim_time_s": float(data.time),
                 "contacts": pad_contacts,
             }
+        if relative_pose_reference is not None:
+            relative_pose = _gripper_relative_pose(
+                model, data, arm, shaft_body)
+            change = _relative_pose_change(
+                relative_pose_reference, relative_pose)
+            max_relative_center_drift_m = max(
+                max_relative_center_drift_m, change["center_drift_m"])
+            max_relative_axis_drift_rad = max(
+                max_relative_axis_drift_rad, change["axis_drift_rad"])
     return {
         "pad_contact_max": pad_contact_max,
+        "pad_contact_min": (
+            0 if pad_contact_min is None else pad_contact_min),
+        "opposing_contact_steps": opposing_contact_steps,
+        "sample_count": steps,
         "first_workpiece_contact": first_workpiece_contact,
         "first_pad_contact": first_pad_contact,
+        "max_relative_center_drift_m": max_relative_center_drift_m,
+        "max_relative_axis_drift_rad": max_relative_axis_drift_rad,
     }
 
 
@@ -347,6 +461,22 @@ def run_case(position_mm=(260.0, -130.0, 150.0),
             "gravity_m_s2": [float(x) for x in model.opt.gravity],
             "fixture_present": False,
             "workpiece_is_free_body": True,
+        },
+        "acceptance_criteria": {
+            "preclose_workpiece_motion_is_failure": False,
+            "minimum_pad_contacts": GRASP_MIN_PAD_CONTACTS,
+            "required_jaw_sides": ["fixed", "moving"],
+            "target_lift_mm": GRASP_LIFT_DISTANCE_M * 1000.0,
+            "minimum_lift_mm": GRASP_LIFT_DISTANCE_M * 1000.0 * 0.8,
+            "maximum_relative_center_drift_mm": (
+                GRASP_RELATIVE_POSITION_LIMIT_M * 1000.0),
+            "maximum_relative_axis_drift_deg": math.degrees(
+                GRASP_RELATIVE_AXIS_LIMIT_RAD),
+            "hold_steps": GRASP_HOLD_STEPS,
+            "required_opposing_contact_fraction_during_hold": 1.0,
+            "hold_duration_s": (
+                GRASP_HOLD_STEPS * float(model.opt.timestep)),
+            "threshold_status": "provisional_project_test_limits",
         },
         "inputs": {
             "position_mm": [float(x) for x in position_mm],
@@ -477,7 +607,10 @@ def run_case(position_mm=(260.0, -130.0, 150.0),
     axis_dot = float(np.clip(
         abs(np.dot(initial_axis, before_close_axis)), -1.0, 1.0))
     axis_change_before_close_deg = math.degrees(math.acos(axis_dot))
-    close_contacts, _ = _shaft_contact_counts(model, data, arm)
+    close_contacts, close_pairs = _shaft_contact_counts(model, data, arm)
+    close_pad_sides = _contacted_pad_sides(close_pairs)
+    close_relative_pose = _gripper_relative_pose(
+        model, data, arm, shaft_body)
     any_pad_contact = max(
         approach_movement["pad_contact_max"],
         descend_movement["pad_contact_max"],
@@ -485,36 +618,86 @@ def run_case(position_mm=(260.0, -130.0, 150.0),
 
     lift_position_error = None
     lift_axis_error = None
-    if any_pad_contact:
+    lift_executed = False
+    lift_movement = None
+    hold_movement = None
+    hold_contacts = 0
+    hold_pairs = []
+    hold_opposing_contact_steps = 0
+    hold_sample_count = 0
+    max_relative_center_drift_m = 0.0
+    max_relative_axis_drift_rad = 0.0
+    gripper_lift_projection_m = 0.0
+    if close_pad_sides == {"fixed", "moving"}:
         lift_direction = np.array([0.0, 0.0, 1.0])
-        lift_center = position_m + lift_direction * 0.030
+        close_pad_center = arm.pad_center(data).copy()
+        lift_center = close_pad_center + lift_direction * GRASP_LIFT_DISTANCE_M
+        close_axis = np.asarray(
+            close_pose["shaft_axis_world_unit"], dtype=float)
         lift_q, lift_pos_error, lift_axis_error = _solve_pad_center(
-            model, data, arm, lift_center, shaft_axis,
+            model, data, arm, lift_center, close_axis,
             axis_local, closed_pad_offset_local,
             np.array([data.qpos[qadr] for qadr in arm.qadr]))
         lift_position_error = lift_pos_error
-        if (lift_pos_error <= IK_POSITION_LIMIT_M
-                and lift_axis_error <= IK_AXIS_LIMIT_RAD):
+        if (lift_pos_error <= IK_POSITION_LIMIT_M):
+            lift_executed = True
             lift_movement = _move_joints(
-                model, data, arm, lift_q, feed.V_GRIP_CLOSE, move_steps)
+                model, data, arm, lift_q, feed.V_GRIP_CLOSE, move_steps,
+                relative_pose_reference=close_relative_pose,
+                shaft_body=shaft_body)
             record_movement_contact(lift_movement)
             record_stage("lift_probe", lift_movement)
+            lift_pad_center = arm.pad_center(data).copy()
+            gripper_lift_projection_m = float(
+                (lift_pad_center - close_pad_center)[2])
             result["ik"]["lift_position_residual_mm"] = (
                 lift_pos_error * 1000.0)
             result["ik"]["lift_axis_residual_deg"] = math.degrees(
                 lift_axis_error)
+            hold_q = np.array([data.qpos[qadr] for qadr in arm.qadr])
+            hold_movement = _move_joints(
+                model, data, arm, hold_q, feed.V_GRIP_CLOSE,
+                GRASP_HOLD_STEPS,
+                relative_pose_reference=close_relative_pose,
+                shaft_body=shaft_body)
+            record_movement_contact(hold_movement)
+            record_stage("hold", hold_movement)
+            hold_contacts, hold_pairs = _shaft_contact_counts(
+                model, data, arm)
+            hold_opposing_contact_steps = (
+                hold_movement["opposing_contact_steps"])
+            hold_sample_count = hold_movement["sample_count"]
+            max_relative_center_drift_m = max(
+                lift_movement["max_relative_center_drift_m"],
+                hold_movement["max_relative_center_drift_m"])
+            max_relative_axis_drift_rad = max(
+                lift_movement["max_relative_axis_drift_rad"],
+                hold_movement["max_relative_axis_drift_rad"])
 
     final_pose = _pose_snapshot(model, data, shaft_body, shaft_joint)
     final_position = np.asarray(final_pose["position_m"])
     lift_delta = final_position - close_position
     lift_projection_mm = float(lift_delta[2] * 1000.0)
     final_contacts, _ = _shaft_contact_counts(model, data, arm)
+    final_pad_sides = _contacted_pad_sides(
+        _shaft_contact_counts(model, data, arm)[1])
+    grasp_evaluation = _evaluate_grasp(
+        close_contacts, close_pad_sides,
+        hold_contacts, _contacted_pad_sides(hold_pairs),
+        hold_opposing_contact_steps, hold_sample_count,
+        lift_projection_mm / 1000.0,
+        max_relative_center_drift_m, max_relative_axis_drift_rad,
+        lift_executed)
     result["execution_status"] = "completed"
     before_close_position = np.asarray(before_close["position_m"])
     result["observations"] = {
         "first_workpiece_contact": first_workpiece_contact,
         "first_v_jaw_contact": first_pad_contact,
         "pad_contact_after_close": close_contacts,
+        "pad_sides_after_close": sorted(close_pad_sides),
+        "pad_contact_after_hold": hold_contacts,
+        "pad_sides_after_hold": sorted(_contacted_pad_sides(hold_pairs)),
+        "pad_sides_at_end": sorted(final_pad_sides),
         "pad_contact_max_during_top_approach": (
             top_movement["pad_contact_max"]),
         "pad_contact_max_during_approach": (
@@ -523,6 +706,21 @@ def run_case(position_mm=(260.0, -130.0, 150.0),
             descend_movement["pad_contact_max"]),
         "pad_contact_max_during_close": (
             close_movement["pad_contact_max"]),
+        "pad_contact_max_during_lift": (
+            0 if lift_movement is None
+            else lift_movement["pad_contact_max"]),
+        "pad_contact_max_during_hold": (
+            0 if hold_movement is None
+            else hold_movement["pad_contact_max"]),
+        "pad_contact_min_during_hold": (
+            0 if hold_movement is None
+            else hold_movement["pad_contact_min"]),
+        "opposing_pad_contact_steps_during_hold": (
+            hold_opposing_contact_steps),
+        "hold_sample_count": hold_sample_count,
+        "opposing_pad_contact_fraction_during_hold": (
+            0.0 if hold_sample_count == 0
+            else hold_opposing_contact_steps / hold_sample_count),
         "pad_contact_at_end": final_contacts,
         "workpiece_displacement_before_close_mm": float(
             np.linalg.norm(before_close_position - position_m) * 1000.0),
@@ -530,29 +728,32 @@ def run_case(position_mm=(260.0, -130.0, 150.0),
             axis_change_before_close_deg),
         "workpiece_displacement_during_close_mm": float(
             np.linalg.norm(close_position - before_close_position) * 1000.0),
-        "workpiece_motion_along_world_z_mm": lift_projection_mm,
+        "workpiece_lift_during_probe_mm": lift_projection_mm,
+        "gripper_lift_during_probe_mm": (
+            gripper_lift_projection_m * 1000.0),
+        "maximum_workpiece_center_drift_relative_to_gripper_during_lift_hold_mm": (
+            max_relative_center_drift_m * 1000.0),
+        "maximum_workpiece_axis_drift_relative_to_gripper_during_lift_hold_deg": (
+            math.degrees(max_relative_axis_drift_rad)),
         "pad_contact_detected": any_pad_contact > 0,
+        "lift_probe_executed": lift_executed,
         "lift_ik_position_residual_mm": (
             None if lift_position_error is None
             else lift_position_error * 1000.0),
         "lift_ik_axis_residual_deg": (
             None if lift_axis_error is None
             else math.degrees(lift_axis_error)),
-        "object_followed_lift_probe": (
-            close_contacts > 0 and final_contacts > 0
-            and lift_projection_mm >= 5.0),
-        "outcome": (
-            "preclose_pose_changed"
-            if (np.linalg.norm(before_close_position - position_m) > 0.002
-                or axis_change_before_close_deg > 5.0)
-            else "contact_and_lift_motion_observed"
-            if (close_contacts > 0 and final_contacts > 0
-                and lift_projection_mm >= 5.0)
-            else "contact_without_lift_motion"
-            if any_pad_contact else "no_pad_contact"),
+        "grasp_passed": grasp_evaluation["passed"],
+        "grasp_checks": grasp_evaluation["checks"],
+        "grasp_failure_reasons": grasp_evaluation["failure_reasons"],
+        "grasp_outcome": grasp_evaluation["outcome"],
+        "transfer_readiness": "not_evaluated_no_chuck_in_scene",
+        "preclose_motion_interpretation": (
+            "recorded_but_not_a_grasp_failure_by_itself"),
         "interpretation": (
-            "Contact and lift observations are diagnostic only. Gravity "
-            "is compensated, so this does not prove a gravity-loaded hold.")
+            "Grasp hold is evaluated in a gravity-compensated diagnostic "
+            "scene. Passing does not prove a gravity-loaded hold or "
+            "readiness for chuck transfer.")
     }
     return result
 
