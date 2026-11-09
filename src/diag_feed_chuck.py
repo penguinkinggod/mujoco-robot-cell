@@ -258,12 +258,26 @@ _REPRODUCIBLE_ENV_KEYS = {
     "FEED_ARM_LEAD", "FEED_ARM_DAMP", "FEED_FLOAT_DAMP",
     "FEED_CONVERGE", "FEED_CONVERGE_TOL", "FEED_BORE_PROBE",
     "FEED_GRIP_CLOSE", "FEED_DIAG_NO_RETREAT", "SMOOTH",
-    "FEED_TRACE_RELATIVE_MOTION",
+    "FEED_TRACE_RELATIVE_MOTION", "FEED_CARRY_V_CRUISE",
+    "FEED_V_JAW_LENGTH_MM",
     "SO101_KP", "SO101_KV", "SM_JAW_BORE_Q", "FEED_DEBUG",
     "FEED_CLAMP_TRACE", "FEED_SEAT_TRACE",
     "FEED_V_CONTACT_SOLREF_TIME",
 }
 _SOURCE_IDENTITY = None
+
+
+def _positive_finite_env_float(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return float(default)
+    try:
+        value = float(raw)
+    except ValueError as error:
+        raise ValueError("%s must be a positive finite number" % name) from error
+    if not np.isfinite(value) or value <= 0.0:
+        raise ValueError("%s must be a positive finite number" % name)
+    return value
 
 
 def _capture_environment_overrides(environ=None):
@@ -1098,7 +1112,8 @@ def _add_cradle(spec):
 # shallower the better: 8 mm -> 16.6 deg / 2.3 mm, 16 mm -> 53.6 deg / 3.9 mm.
 V_DEPTH = 0.008          # slot depth (m); swept 8..20 mm, 8 is best so far
 V_BAR = 0.004            # blade thickness
-V_LEN = 0.024            # slot length along the workpiece axis
+V_LEN = (_positive_finite_env_float("FEED_V_JAW_LENGTH_MM", 24.0)
+         / 1000.0)  # slot length along the workpiece axis
 V_QREF = 0.10            # gripper qpos the slot frame is measured at
 # The V slot has to be cut along the rod axis, so the jaw closing axis must
 # be perpendicular to it.
@@ -2313,6 +2328,9 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                      "arm_kp_scale": float(ARM_KP_SCALE),
                      "arm_move_lead": float(ARM_MOVE_LEAD),
                      "arm_move_damping": float(ARM_MOVE_DAMP),
+                     "carry_v_cruise_m_s": float(
+                         _positive_finite_env_float(
+                             "FEED_CARRY_V_CRUISE", 0.55)),
                      "float_damping": float(FLOAT_DAMP),
                      "converge_steps": int(CONVERGE_STEPS),
                      "converge_tolerance": float(CONVERGE_TOL),
@@ -3681,7 +3699,9 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         # move3，每个都是一次 rest -> rest，等于四次完整起停。
         err = move_path([pad_target(t) for _n, t, _ns in carry]
                         + [pad_target(feed_goal)],
-                        grip_close, carry_lock, label="搬运")
+                        grip_close, carry_lock, label="搬运",
+                        v_cruise=_positive_finite_env_float(
+                            "FEED_CARRY_V_CRUISE", 0.55))
         print("  搬运     四段路点 -> 一条连续轨迹  IK残差=%5.1f mm "
               "同轴=%6.2f mm 轴向偏=%4.1f deg 倾斜=%4.1f deg"
               % (err * 1000, coax(), axdev(),

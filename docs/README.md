@@ -23,7 +23,8 @@
 | 想复跑接触参数四档对照 | `python -X utf8 src/diag_contact_sensitivity.py`，解释见 [P5.3 接触审计](p5.3-contact-overlap-audit-2026-11-09.md) |
 | 想看 nominal 三次复跑与相对夹爪位移定义 | [P5.5 基线复核](p5.5-nominal-baseline-2026-11-09.md) |
 | 想看 `8.15 mm` 在搬运中怎样形成 | [P5.6 逐步追踪](p5.6-relative-motion-trace-2026-11-09.md) |
-| 想看当前下一步 | [P5.7：区分相对位移成因](../CURRENT.md) |
+| 想看这段位移对路径和接触设置是否敏感 | [P5.7 单因素对照](p5.7-relative-motion-causes-2026-11-09.md) |
+| 想看当前下一步 | [P6.1：定义 SW→MC 与机器人共用案例](../CURRENT.md) |
 | 想看代码和脚本放哪 | [代码地图](code-map.md) |
 | 想查每个送料指标怎么测、阈值能不能改 | [机械臂送料指标字典](metric-dictionary.md) |
 | 想看 Git、GitHub、commit 怎么用 | [版本与提交](git-and-commits.md) |

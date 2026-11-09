@@ -11,6 +11,9 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import diag_feed_chuck as feed
 from src.diag_contact_sensitivity import summarize_result
+from src.diag_relative_motion_sensitivity import (
+    summarize_result as summarize_relative_motion_result,
+)
 
 
 def _pair(solref_time_s, depth_mm, overlap_steps, contact_steps):
@@ -153,6 +156,111 @@ class ContactSensitivityTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "positive finite"):
             feed._apply_v_contact_solref_time(model, 0.0)
+
+    def test_positive_finite_environment_float(self):
+        with mock.patch.dict("os.environ", {"TEST_FEED_VALUE": "0.275"}):
+            self.assertEqual(
+                0.275, feed._positive_finite_env_float(
+                    "TEST_FEED_VALUE", 0.55))
+        with mock.patch.dict("os.environ", {"TEST_FEED_VALUE": "nan"}):
+            with self.assertRaisesRegex(ValueError, "positive finite"):
+                feed._positive_finite_env_float(
+                    "TEST_FEED_VALUE", 0.55)
+
+    def test_relative_motion_summary_checks_requested_factor(self):
+        result = {
+            "schema_version": 13,
+            "execution_status": "completed",
+            "control_mode": {
+                "carry": "unlocked_physics",
+                "planning_mode": "M1",
+            },
+            "inputs": {"initial_settle_steps": 600},
+            "config": {
+                "v_jaw": True,
+                "lift": True,
+                "carry_lock": False,
+                "initial_offset_mm": [0.0, 0.0, 0.0],
+                "initial_yaw_world_z_deg": 0.0,
+                "planning_mode": "M1",
+            },
+            "environment_overrides": {
+                "FEED_CARRY_V_CRUISE": "0.275",
+            },
+            "effective_parameters": {
+                "controller": {"carry_v_cruise_m_s": 0.275},
+                "gripper": {"v_length_mm": 24.0},
+            },
+            "gripper_relative_workpiece_motion": {
+                "status": "observed",
+                "time_history_enabled": True,
+                "phases": {
+                    "搬运": {"max_relative_axis_change_deg": 0.8},
+                },
+                "time_history": [
+                    {
+                        "sim_time_s": 1.0,
+                        "phase_group": "搬运",
+                        "translation_change_from_carry_start_mm": 1.0,
+                        "translation_change_from_carry_start_tool_mm": [
+                            1.0, 0.0, 0.0],
+                        "translation_change_since_previous_step_mm": 0.1,
+                        "shaft_contact_pairs": [],
+                    },
+                    {
+                        "sim_time_s": 1.2,
+                        "phase_group": "搬运",
+                        "translation_change_from_carry_start_mm": 2.0,
+                        "translation_change_from_carry_start_tool_mm": [
+                            2.0, 0.0, 0.0],
+                        "translation_change_since_previous_step_mm": 0.2,
+                        "shaft_contact_pairs": [
+                            {
+                                "category": "robot_workpiece",
+                                "geoms": [
+                                    "moving_jaw_pad_v2", "shaft_geom"],
+                                "contact_count": 2,
+                                "normal_force_sum_N": 18.0,
+                                "minimum_distance_mm": -0.4,
+                            },
+                        ],
+                    },
+                    {
+                        "sim_time_s": 2.0,
+                        "phase_group": "进给",
+                        "translation_change_from_carry_start_mm": 1.5,
+                        "translation_change_from_carry_start_tool_mm": [
+                            1.5, 0.0, 0.0],
+                        "translation_change_since_previous_step_mm": 0.1,
+                        "shaft_contact_pairs": [],
+                    },
+                ],
+            },
+            "metrics": {
+                "coax_mm": 0.55,
+                "tilt_deg": 1.5,
+                "stock_ecc_mm": 1.42,
+                "contacts": 30,
+            },
+            "overall_pass": True,
+        }
+        row = summarize_relative_motion_result(
+            result, "slow_carry", "carry_speed", 0.275,
+            "case.json", "case.log")
+        self.assertEqual(2.0, row["carry_peak_mm"])
+        self.assertEqual(1.2, row["carry_peak_time_s"])
+        self.assertAlmostEqual(0.2, row["carry_duration_s"])
+        self.assertEqual(2, row["peak_vjaw_contacts"])
+        self.assertEqual(-0.4, row["peak_vjaw_min_distance_mm"])
+        self.assertEqual(18.0, row["peak_vjaw_normal_force_sum_N"])
+        self.assertEqual(1.5, row["feed_peak_mm"])
+
+        result["effective_parameters"]["controller"][
+            "carry_v_cruise_m_s"] = 0.55
+        with self.assertRaisesRegex(ValueError, "carry speed"):
+            summarize_relative_motion_result(
+                result, "slow_carry", "carry_speed", 0.275,
+                "case.json", "case.log")
 
 
 if __name__ == "__main__":

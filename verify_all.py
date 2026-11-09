@@ -49,6 +49,7 @@ CORE_FILES = [
     "src/diag_feed_chuck.py",
     "src/diag_feed_insert_sweep.py",
     "src/diag_contact_sensitivity.py",
+    "src/diag_relative_motion_sensitivity.py",
     "tests/test_feed_failure_detection.py",
     "tests/test_feed_insert_sweep.py",
 ]
