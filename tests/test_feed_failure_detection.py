@@ -95,7 +95,7 @@ class PlanningModeIsolationTests(unittest.TestCase):
 
 
 def assert_reproducibility_fields(test_case, result):
-    test_case.assertEqual(10, result["schema_version"])
+    test_case.assertEqual(11, result["schema_version"])
     test_case.assertEqual(1, result["metric_schema_version"])
     test_case.assertEqual("feed-criteria-v1", result["criterion_set_id"])
     test_case.assertTrue(result["case_id"])
@@ -105,6 +105,7 @@ def assert_reproducibility_fields(test_case, result):
     test_case.assertIn("checkpoints", result)
     test_case.assertIn("contact_diagnostics", result)
     test_case.assertIn("applied_load_diagnostics", result)
+    test_case.assertIn("penetration_diagnostics", result)
     test_case.assertIn("initial_stability", result)
     test_case.assertTrue(
         result["contact_diagnostics"]["sampled_every_physics_step"])
@@ -488,6 +489,39 @@ class RobotMachineContactTests(unittest.TestCase):
                 [0.0, 0.0, 0.0], sample["xfrc_applied_force_N"])
             self.assertEqual(
                 [0.0, 0.0, 0.0], sample["xfrc_applied_torque_Nm"])
+        penetration = result["penetration_diagnostics"]
+        minimum_contact = penetration["minimum_contact"]
+        self.assertIsNotNone(minimum_contact)
+        self.assertLess(minimum_contact["distance_m"], 0.0)
+        self.assertTrue(minimum_contact["time_s"] > 0.0)
+        self.assertTrue(minimum_contact["contact_position_world_m"])
+        self.assertIn("normal_force_N", minimum_contact)
+        self.assertEqual(
+            2,
+            len(minimum_contact["contact_geometry_parameters"]))
+        self.assertIn(
+            "solref",
+            minimum_contact["contact_geometry_parameters"][0])
+        self.assertIn(
+            "contact_position_local_m", minimum_contact["other_geom"])
+        self.assertIn("other_geom", minimum_contact)
+        carry_penetration = penetration["by_phase"]["搬运"][
+            "shaft_geom|moving_jaw_pad_v2"]
+        self.assertGreater(carry_penetration["contact_steps"], 0)
+        self.assertGreater(carry_penetration["overlap_steps"], 0)
+        self.assertGreater(
+            carry_penetration["max_penetration_mm"], 0.0)
+        self.assertEqual(
+            [0.02, 1.0],
+            carry_penetration["contact_geometry_parameters"][0]["solref"])
+        self.assertLess(
+            carry_penetration["first_contact_time_s"],
+            carry_penetration["last_contact_time_s"])
+        self.assertAlmostEqual(
+            carry_penetration["contact_steps"]
+            * penetration["sample_interval_s"],
+            carry_penetration["sampled_contact_duration_s"],
+        )
         contact_scopes = result["contact_diagnostics"]["scopes"]
         feed_contacts = contact_scopes["feed"]["overall"]
         self.assertGreater(feed_contacts["samples"], 10000)

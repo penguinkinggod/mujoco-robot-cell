@@ -19,6 +19,7 @@
 | 想把项目做成论文 | [论文路线图](paper-roadmap.md) |
 | 想看现在正在改什么、下一步做什么 | [现场记录](../CURRENT.md) |
 | 想看项目已经跨过哪些阶段 | [项目里程碑](milestones.md) |
+| 想看棒料与 V 爪接触重叠的时空审计 | [P5.3 接触审计](p5.3-contact-overlap-audit-2026-11-09.md) |
 | 想看代码和脚本放哪 | [代码地图](code-map.md) |
 | 想查每个送料指标怎么测、阈值能不能改 | [机械臂送料指标字典](metric-dictionary.md) |
 | 想看 Git、GitHub、commit 怎么用 | [版本与提交](git-and-commits.md) |

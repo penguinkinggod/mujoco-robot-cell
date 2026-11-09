@@ -99,7 +99,7 @@ from demo_08_pick_and_load import (
 )
 
 
-RESULT_SCHEMA_VERSION = 10
+RESULT_SCHEMA_VERSION = 11
 METRIC_SCHEMA_VERSION = 1
 CRITERION_SET_ID = "feed-criteria-v1"
 PLANNING_MODES = ("M0", "M1", "M2")
@@ -702,6 +702,8 @@ def _diagnostic_result_fields(state):
             "contact_diagnostics", {"scopes": {}}),
         "applied_load_diagnostics": state.get(
             "applied_load_diagnostics", {"scopes": {}}),
+        "penetration_diagnostics": state.get(
+            "penetration_diagnostics", {}),
         "initial_stability": state.get("initial_stability"),
         "diagnostic_scope_definitions": {
             "feed": "送料、夹紧、松爪、退出和解锁静置；不含 20 N 拉拔测试",
@@ -1713,17 +1715,36 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         print("  托架退回    间隙 %.2f mm 同轴=%.2f mm 接触=%d"
               % (BUSHING_GAP * 1000, coax(), sleeve_state()[0]))
 
-    # 穿透记录。接触点的 dist < 0 就是几何互相插进去多少 —— 这是判
-    # 「有没有穿模」唯一可信的数字，肉眼在窗口里看到的深浅取决于机位。
+    # Negative contact distance indicates overlap between the collision shapes.
     PEN = {"min": 0.0, "label": "", "pair": ""}
+    penetration_sample_times = {}
 
     _cf6 = np.zeros(6)
+
+    def contact_geom_parameters(geom_id):
+        return {
+            "name": (
+                mujoco.mj_id2name(
+                    model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or "?"),
+            "type_id": int(model.geom_type[geom_id]),
+            "size_m": [
+                float(value) for value in model.geom_size[geom_id]],
+            "solref": [
+                float(value) for value in model.geom_solref[geom_id]],
+            "solimp": [
+                float(value) for value in model.geom_solimp[geom_id]],
+            "margin_m": float(model.geom_margin[geom_id]),
+            "gap_m": float(model.geom_gap[geom_id]),
+            "friction": [
+                float(value) for value in model.geom_friction[geom_id]],
+        }
 
     def track_pen(label):
         ensure_finite_state(label)
         _fmax = 0.0
         machine_contacts = []
         shaft_contacts = 0
+        shaft_pair_samples = {}
         for i in range(data.ncon):
             c = data.contact[i]
             n1 = mujoco.mj_id2name(
@@ -1741,14 +1762,127 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 continue
             mujoco.mj_contactForce(model, data, i, _cf6)
             _fmax = max(_fmax, abs(float(_cf6[0])))
+            pair_key = "%s|%s" % (n1, n2)
+            pair_sample = shaft_pair_samples.setdefault(pair_key, {
+                "geoms": [n1, n2],
+                "geom_ids": [int(c.geom1), int(c.geom2)],
+                "contact_count": 0,
+                "min_distance_m": float(c.dist),
+            })
+            pair_sample["contact_count"] += 1
+            pair_sample["min_distance_m"] = min(
+                pair_sample["min_distance_m"], float(c.dist))
             if c.dist < PEN["min"]:
-                n1 = mujoco.mj_id2name(
-                    model, mujoco.mjtObj.mjOBJ_GEOM, c.geom1) or "?"
-                n2 = mujoco.mj_id2name(
-                    model, mujoco.mjtObj.mjOBJ_GEOM, c.geom2) or "?"
                 PEN["min"] = float(c.dist)
                 PEN["label"] = label
-                PEN["pair"] = "%s|%s" % (n1, n2)
+                PEN["pair"] = pair_key
+                shaft_geom = (
+                    c.geom1 if c.geom1 in shaft_geoms else c.geom2)
+                other_geom = (
+                    c.geom2 if c.geom1 in shaft_geoms else c.geom1)
+                other_body = int(model.geom_bodyid[other_geom])
+                other_rotation = data.geom_xmat[other_geom].reshape(3, 3)
+                shaft_rotation = data.geom_xmat[shaft_geom].reshape(3, 3)
+                other_quaternion = np.zeros(4, dtype=float)
+                mujoco.mju_mat2Quat(
+                    other_quaternion,
+                    np.ascontiguousarray(other_rotation).reshape(-1))
+                state["penetration_diagnostics"]["minimum_contact"] = {
+                    "distance_m": float(c.dist),
+                    "time_s": float(data.time),
+                    "phase": label,
+                    "geoms": [n1, n2],
+                    "contact_geometry_parameters": [
+                        contact_geom_parameters(int(c.geom1)),
+                        contact_geom_parameters(int(c.geom2)),
+                    ],
+                    "contact_position_world_m": [
+                        float(value) for value in c.pos],
+                    "contact_normal_world_unit": [
+                        float(value) for value in c.frame[:3]],
+                    "normal_force_N": abs(float(_cf6[0])),
+                    "shaft_position_world_m": [
+                        float(value) for value in data.xpos[shaft_body]],
+                    "shaft_quaternion_wxyz": [
+                        float(value) for value in data.xquat[shaft_body]],
+                    "contact_position_shaft_geom_local_m": [
+                        float(value) for value in
+                        shaft_rotation.T
+                        @ (c.pos - data.geom_xpos[shaft_geom])],
+                    "other_geom": {
+                        "type_id": int(model.geom_type[other_geom]),
+                        "size_m": [
+                            float(value)
+                            for value in model.geom_size[other_geom]],
+                        "position_world_m": [
+                            float(value)
+                            for value in data.geom_xpos[other_geom]],
+                        "contact_position_local_m": [
+                            float(value) for value in
+                            other_rotation.T
+                            @ (c.pos - data.geom_xpos[other_geom])],
+                        "quaternion_wxyz": [
+                            float(value) for value in other_quaternion],
+                        "body": (
+                            mujoco.mj_id2name(
+                                model, mujoco.mjtObj.mjOBJ_BODY, other_body)
+                            or "?"),
+                    },
+                }
+        phase_pairs = state["penetration_diagnostics"][
+            "by_phase"].setdefault(label, {})
+        for pair_key, pair_sample in shaft_pair_samples.items():
+            pair_summary = phase_pairs.setdefault(pair_key, {
+                "geoms": pair_sample["geoms"],
+                "contact_geometry_parameters": [
+                    contact_geom_parameters(geom_id)
+                    for geom_id in pair_sample["geom_ids"]],
+                "contact_steps": 0,
+                "overlap_steps": 0,
+                "overlap_gt_0_2mm_steps": 0,
+                "overlap_gt_1mm_steps": 0,
+                "max_contacts_per_step": 0,
+                "max_penetration_mm": 0.0,
+                "minimum_contact_distance_m": 0.0,
+                "first_contact_time_s": None,
+                "last_contact_time_s": None,
+                "observed_contact_span_s": 0.0,
+                "sampled_contact_duration_s": 0.0,
+                "time_of_minimum_s": None,
+            })
+            pair_summary["max_contacts_per_step"] = max(
+                pair_summary["max_contacts_per_step"],
+                pair_sample["contact_count"])
+            if (pair_sample["min_distance_m"]
+                    < pair_summary["minimum_contact_distance_m"]):
+                pair_summary["minimum_contact_distance_m"] = (
+                    pair_sample["min_distance_m"])
+                pair_summary["time_of_minimum_s"] = float(data.time)
+            if pair_sample["min_distance_m"] < 0.0:
+                depth_mm = -pair_sample["min_distance_m"] * 1000.0
+                pair_summary["max_penetration_mm"] = max(
+                    pair_summary["max_penetration_mm"], depth_mm)
+            sample_key = (label, pair_key)
+            last_sample_time = penetration_sample_times.get(sample_key)
+            if (last_sample_time is None
+                    or abs(last_sample_time - float(data.time)) > 1e-12):
+                pair_summary["contact_steps"] += 1
+                if pair_summary["first_contact_time_s"] is None:
+                    pair_summary["first_contact_time_s"] = float(data.time)
+                pair_summary["last_contact_time_s"] = float(data.time)
+                pair_summary["observed_contact_span_s"] = (
+                    pair_summary["last_contact_time_s"]
+                    - pair_summary["first_contact_time_s"])
+                pair_summary["sampled_contact_duration_s"] = (
+                    pair_summary["contact_steps"]
+                    * float(model.opt.timestep))
+                if pair_sample["min_distance_m"] < 0.0:
+                    pair_summary["overlap_steps"] += 1
+                if pair_sample["min_distance_m"] < -0.0002:
+                    pair_summary["overlap_gt_0_2mm_steps"] += 1
+                if pair_sample["min_distance_m"] < -0.001:
+                    pair_summary["overlap_gt_1mm_steps"] += 1
+                penetration_sample_times[sample_key] = float(data.time)
         state["robot_machine_contact_max"] = max(
             state["robot_machine_contact_max"], len(machine_contacts))
         state["shaft_contact_max"] = max(state["shaft_contact_max"],
@@ -1951,6 +2085,14 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                  "sampled_every_physics_step": True,
                  "sample_interval_s": float(model.opt.timestep),
                  "scopes": {},
+             },
+             "penetration_diagnostics": {
+                 "sampling_method": (
+                     "shaft contacts inspected by track_pen after each "
+                     "simulated action step"),
+                 "sample_interval_s": float(model.opt.timestep),
+                 "by_phase": {},
+                 "minimum_contact": None,
              },
              "initial_stability": None,
              "ik_residuals_mm": {}, "versions": _versions_snapshot(),

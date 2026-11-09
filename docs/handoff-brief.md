@@ -23,13 +23,13 @@ P5.1 已定义名义来料：约 0.1973 kg 的 Ø20 × 80 mm 钢棒由两端静�
 
 P5.2 已完成：最后 100 步的端点最大位移为 0.000000751 mm，左右托架各 100/100 步接触，真实重力开启、工件 gravcomp=0、没有外加力/力矩；按项目暂定 0.20 mm 预算，动作前稳定性 PASS。JSON 的 nominal 起始位置已改为 reset 后送料模型的实际位置；同一完整 nominal 按现有送料判据 PASS。详细数字和命令见 [P5.2 验收报告](p5.2-pre-motion-stability-2026-11-09.md)。
 
-下一卡 P5.3：同一 JSON 还记录搬运期间 `shaft_geom|moving_jaw_pad_v2` 的最小 contact distance 为 -2.991 mm，而 `FEED_METRIC PASS` 没有检查这项。先定位并解释该重叠，不要直接调夹具或轨迹；之后再拆分接近推料、夹持保持、搬运滑移和卡盘接管判据。
+P5.3 接触审计已完成首轮：[报告](p5.3-contact-overlap-audit-2026-11-09.md)。nominal 中移动 V 爪和棒料在搬运 684/684 步均有负 contact distance，最深 `-2.991 mm`，发生于 `7.114 s`、V 爪碰撞体轴向边缘。接触时间常数敏感性明显，但未校准；不应把一次调硬试验当作物理修复。下一步把接触参数小范围对照做成可复现，再完成接近推料、夹持保持、搬运滑移和卡盘接管判据及受控失败。
 
 研究规划上，G0/G1 可与机械验证并行：联系一位愿意讨论研究问题的老师，建立相关工作与创新差异矩阵。不要因论文规划而抢先跑大矩阵或训练模型。
 
 ## 复现入口
 
-项目根目录：D:\codex\projects\robot-sim-first-step。P5.1 完整工况见 [来料状态定义](p5.1-incoming-condition-2026-11-09.md)，P5.2 参数、命令和 JSON 结果见 [稳定性验收](p5.2-pre-motion-stability-2026-11-09.md)。P5.2 定向单测 32/32 通过；完整回归结果以仓库现场状态页为准。
+项目根目录：D:\codex\projects\robot-sim-first-step。P5.1 完整工况见 [来料状态定义](p5.1-incoming-condition-2026-11-09.md)，P5.2 参数、命令和 JSON 结果见 [稳定性验收](p5.2-pre-motion-stability-2026-11-09.md)，P5.3 接触审计见 [接触重叠报告](p5.3-contact-overlap-audit-2026-11-09.md)。定向单测和完整回归以仓库现场状态页为准。
 
 ## 重要区分
 
