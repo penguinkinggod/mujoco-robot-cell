@@ -146,6 +146,30 @@ def _normalise_axis(axis):
     return axis / max(float(np.linalg.norm(axis)), 1e-12)
 
 
+def _pose_in_tool_frame(tool_rotation, object_position, tool_position,
+                        object_axis):
+    rotation = np.asarray(tool_rotation, dtype=float).reshape(3, 3)
+    offset_tool = rotation.T @ (
+        np.asarray(object_position, dtype=float)
+        - np.asarray(tool_position, dtype=float))
+    axis_tool = _normalise_axis(
+        rotation.T @ np.asarray(object_axis, dtype=float))
+    return offset_tool, axis_tool
+
+
+def _relative_pose_change(reference_offset_tool, reference_axis_tool,
+                          current_offset_tool, current_axis_tool):
+    translation_delta = (
+        np.asarray(current_offset_tool, dtype=float)
+        - np.asarray(reference_offset_tool, dtype=float))
+    axis_dot = abs(float(np.dot(
+        _normalise_axis(reference_axis_tool),
+        _normalise_axis(current_axis_tool))))
+    axis_change_deg = float(np.degrees(np.arccos(
+        np.clip(axis_dot, -1.0, 1.0))))
+    return translation_delta, axis_change_deg
+
+
 def _pose_axis_from_quaternion(quaternion_wxyz):
     rotation = np.zeros(9)
     mujoco.mju_quat2Mat(rotation, np.asarray(quaternion_wxyz, dtype=float))
@@ -2422,23 +2446,20 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         relative_motion = state["gripper_relative_workpiece_motion"]
         if relative_motion["active"]:
             site_rotation = data.site_xmat[arm.site].reshape(3, 3)
-            current_offset_local = site_rotation.T @ (
-                shaft() - arm.pad_center())
+            current_offset_local, current_axis_local = _pose_in_tool_frame(
+                site_rotation, shaft(), arm.pad_center(), rod_axis())
             reference_offset_local = np.asarray(
                 relative_motion["reference_pose"][
                     "center_offset_tool_m"],
                 dtype=float)
-            translation_delta = (
-                current_offset_local - reference_offset_local)
-            translation_mm = float(
-                np.linalg.norm(translation_delta) * 1000.0)
-            current_axis_local = site_rotation.T @ rod_axis()
             reference_axis_local = np.asarray(
                 relative_motion["reference_pose"]["axis_tool_unit"],
                 dtype=float)
-            axis_change_deg = float(np.degrees(np.arccos(np.clip(
-                abs(float(np.dot(current_axis_local, reference_axis_local))),
-                -1.0, 1.0))))
+            translation_delta, axis_change_deg = _relative_pose_change(
+                reference_offset_local, reference_axis_local,
+                current_offset_local, current_axis_local)
+            translation_mm = float(
+                np.linalg.norm(translation_delta) * 1000.0)
             phase_group = (
                 "进给" if phase == "进给" or phase.startswith("进给#")
                 else "搬运")
@@ -3526,14 +3547,14 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     relative_motion = state["gripper_relative_workpiece_motion"]
     if v_jaw and not carry_lock:
         site_rotation = data.site_xmat[arm.site].reshape(3, 3)
+        center_offset_tool, axis_tool = _pose_in_tool_frame(
+            site_rotation, shaft(), arm.pad_center(), rod_axis())
         relative_motion["reference_pose"] = {
             "stage": "carry_start_after_grasp_settle",
             "sim_time_s": float(data.time),
             "center_offset_tool_m": [
-                float(value) for value in site_rotation.T
-                @ (shaft() - arm.pad_center())],
-            "axis_tool_unit": [
-                float(value) for value in site_rotation.T @ rod_axis()],
+                float(value) for value in center_offset_tool],
+            "axis_tool_unit": [float(value) for value in axis_tool],
         }
         relative_motion["active"] = True
         relative_motion["status"] = "observing"

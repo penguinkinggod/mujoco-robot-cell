@@ -43,6 +43,64 @@ class WorldYawConventionTests(unittest.TestCase):
             feed._resolve_initial_yaw_deg(5.0, -5.0)
 
 
+class ToolFrameMotionTests(unittest.TestCase):
+    def test_rigid_tool_rotation_is_not_reported_as_slip(self):
+        angle = np.radians(73.0)
+        rotation = np.array([
+            [np.cos(angle), -np.sin(angle), 0.0],
+            [np.sin(angle), np.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        offset_tool = np.array([0.012, -0.021, 0.034])
+        axis_tool = feed._normalise_axis([1.0, 0.2, -0.1])
+        tool_start = np.array([0.2, -0.1, 0.05])
+        tool_end = np.array([-0.3, 0.4, 0.8])
+
+        reference_offset, reference_axis = feed._pose_in_tool_frame(
+            np.eye(3), tool_start + offset_tool, tool_start, axis_tool)
+        current_offset, current_axis = feed._pose_in_tool_frame(
+            rotation,
+            tool_end + rotation @ offset_tool,
+            tool_end,
+            rotation @ axis_tool,
+        )
+        translation_delta, axis_change_deg = feed._relative_pose_change(
+            reference_offset, reference_axis, current_offset, current_axis)
+
+        np.testing.assert_allclose(offset_tool, reference_offset, atol=1e-12)
+        np.testing.assert_allclose(offset_tool, current_offset, atol=1e-12)
+        np.testing.assert_allclose(
+            np.zeros(3), translation_delta, atol=1e-12)
+        self.assertAlmostEqual(0.0, axis_change_deg, places=5)
+
+    def test_local_translation_change_is_measured_in_tool_coordinates(self):
+        angle = np.radians(41.0)
+        rotation = np.array([
+            [np.cos(angle), -np.sin(angle), 0.0],
+            [np.sin(angle), np.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        tool_origin = np.array([0.2, 0.1, -0.4])
+        offset_tool = np.array([0.01, 0.02, -0.03])
+        expected_slip_tool = np.array([0.0, 0.004, 0.0])
+        axis_tool = np.array([1.0, 0.0, 0.0])
+        reference_offset, reference_axis = feed._pose_in_tool_frame(
+            np.eye(3), offset_tool, np.zeros(3), axis_tool)
+        current_offset, current_axis = feed._pose_in_tool_frame(
+            rotation,
+            tool_origin + rotation @ (offset_tool + expected_slip_tool),
+            tool_origin,
+            rotation @ axis_tool,
+        )
+        translation_delta, axis_change_deg = feed._relative_pose_change(
+            reference_offset, reference_axis, current_offset, current_axis)
+
+        np.testing.assert_allclose(
+            expected_slip_tool, translation_delta, atol=1e-12)
+        self.assertAlmostEqual(4.0, np.linalg.norm(translation_delta) * 1000)
+        self.assertAlmostEqual(0.0, axis_change_deg, places=5)
+
+
 class PlanningModeIsolationTests(unittest.TestCase):
     def setUp(self):
         self.true_pose = {
