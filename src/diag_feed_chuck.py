@@ -2,16 +2,20 @@
 
 STATUS 2026-11-05: PASS. Wired into verify_all.py CHECKS.
 
-SCOPE: ONE EXPLICIT SIMPLIFICATION -- do NOT read this as full physics
----------------------------------------------------------------------
-The CARRY is KINEMATIC. From the centring stage until the chuck has
-clamped, every step writes the shaft qpos/quat back to
-(world pin / site, SHAFT_Q0) and zeroes qvel. This ASSUMES the gripper
-has perfect form closure. It does NOT prove the real gripper can hold the
-shaft -- two flat pads on a D20 rod touch along one line, so the rod
-pivots about it. The lock is released BEFORE any load test, and
-FEED_METRIC reports that fact so nobody can quietly extend it through the
-pull-out and fake a pass.
+SCOPE: TWO EXPLICIT CARRY MODES -- do NOT read either as full validation
+-----------------------------------------------------------------------
+The historical/default reference mode is KINEMATIC: from the centring
+stage until the chuck has clamped, every step writes the shaft qpos/quat
+back to (world pin / site, SHAFT_Q0) and zeroes qvel. This ASSUMES the
+gripper has perfect form closure and does NOT prove that the real gripper
+can hold the shaft.
+
+The current primary V-jaw run uses ``--v-jaw --lift --no-lock``. In that
+mode the carry is PHYSICAL CONTACT: the shaft is not pinned by the script,
+and the V-jaw/contact model carries the load until chuck hand-over. It is
+still only a MuJoCo result with uncalibrated contact parameters, so it does
+not prove real-device gripping safety. The result JSON records the mode so
+the two scopes cannot be silently mixed.
 
 The workpiece is a PLAIN CYLINDER (no milled flat, no slot platform).
 That is a deliberate choice, not an omission -- see HANDOFF section 16 for
@@ -1666,7 +1670,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
          initial_offset_mm=(0.0, 0.0, 0.0), initial_roll_deg=None,
          random_seed=None, initial_yaw_deg=None, planning_mode="M1",
          m2_error_mm=(0.0, 0.0, 0.0), m2_error_yaw_deg=0.0,
-         initial_settle_steps=DEFAULT_INITIAL_SETTLE_STEPS):
+         initial_settle_steps=DEFAULT_INITIAL_SETTLE_STEPS,
+         stop_after_grasp=False):
     """Run the feed sequence.
 
     frame_hook(tag, model, data) is an OPTIONAL visualisation tap.
@@ -1680,6 +1685,10 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     carry_lock=False drops the kinematic lock during the carry segment and
     lets the grasp carry the load on its own. Default True keeps the
     numbers that verify_all.py asserts.
+
+    stop_after_grasp is a diagnostic-only cut point. When enabled, run the
+    normal settle/approach/grasp sequence, record grasp_complete, then return
+    before any carry or chuck motion. The default full-feed path is unchanged.
     """
     if type(initial_settle_steps) is not int or initial_settle_steps < 0:
         raise ValueError("initial_settle_steps must be a nonnegative integer")
@@ -3558,11 +3567,17 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
               "侧向进入": "③ 侧向进入｜沿 V 槽开口",
               "下降": "④ 下降｜pad 到轴心",
               "夹紧": "⑤ 夹紧｜真实接触抓取"}[name])
-    # 夹爪是斜坡闭合（GRIP_RAMP 步），"夹紧"那段 320 步走完时它还没合到
-    # 位。一抬臂，工件就从 V 槽里滑出去：实测全物理路径同轴 250 mm、倾斜
-    # 133 deg、接触 0，就是这里漏了一段保持。先让爪子合完再搬。
-    if GRIP_RAMP > 320:
-        settle(GRIP_RAMP - 320 + 80, SM.CHUCK_OPEN_CTRL, grip_close)
+    # Do not infer ramp progress from the nominal 320-step grasp move: move3()
+    # can skip its motion loop when the target is already within tolerance.
+    # Finish from the actual ramp counter before declaring grasp_complete.
+    if GRIP_RAMP > 0:
+        ramp_target = state.get("grip_tgt")
+        ramp_steps = int(state.get("grip_k", 0))
+        remaining = (max(0, GRIP_RAMP - ramp_steps)
+                     if ramp_target is not None
+                     and abs(float(ramp_target) - grip_close) <= 1e-9
+                     else GRIP_RAMP)
+        settle(remaining + 80, SM.CHUCK_OPEN_CTRL, grip_close)
     state["grasp_contact_count"] = grip_state()[0]
     if v_jaw and not carry_lock and state["grasp_contact_count"] == 0:
         state["gripper_relative_workpiece_motion"]["status"] = (
@@ -3626,6 +3641,28 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         write_result_json(result)
         return 1
     record_stage("grasp_complete")
+    if stop_after_grasp:
+        return {
+            "diagnostic_scope": "stop_after_grasp",
+            "execution_status": "grasp_complete",
+            "grasp_contact_count": int(state["grasp_contact_count"]),
+            "grasp_tilt_deg": float(grasp_tilt),
+            "requested_grip_close": float(grip_close),
+            "gripper_ctrl_at_grasp_complete": float(
+                data.ctrl[arm.grip_act]),
+            "gripper_ramp_target_at_grasp_complete": float(
+                state.get("grip_tgt", grip_close)),
+            "gripper_ramp_step_at_grasp_complete": int(
+                state.get("grip_k", 0)),
+            "shaft_position_m": [
+                float(value) for value in shaft()],
+            "shaft_axis_world_unit": [
+                float(value) for value in rod_axis()],
+            "pad_center_m": [
+                float(value) for value in arm.pad_center()],
+            "sim_time_s": float(data.time),
+            "carry_lock": bool(carry_lock),
+        }
     state["grasp_axis_target"] = None
     state["grasp_axis_active"] = False
     print("  shaft_in_grip = %s mm（按抓取规划位姿计算的夹爪-工件相对偏移）"
