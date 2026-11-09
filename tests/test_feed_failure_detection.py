@@ -153,7 +153,7 @@ class PlanningModeIsolationTests(unittest.TestCase):
 
 
 def assert_reproducibility_fields(test_case, result):
-    test_case.assertEqual(12, result["schema_version"])
+    test_case.assertEqual(13, result["schema_version"])
     test_case.assertIn("pickup_motion_diagnostics", result)
     test_case.assertIn("gripper_relative_workpiece_motion", result)
     test_case.assertEqual(1, result["metric_schema_version"])
@@ -481,8 +481,11 @@ class RobotMachineContactTests(unittest.TestCase):
             result_path = Path(temp_dir) / "contact_loads.json"
             previous_path = os.environ.get("FEED_RESULT_JSON")
             previous_case_id = os.environ.get("FEED_CASE_ID")
+            previous_trace = os.environ.get(
+                "FEED_TRACE_RELATIVE_MOTION")
             os.environ["FEED_RESULT_JSON"] = str(result_path)
             os.environ["FEED_CASE_ID"] = "test-contact-load-records"
+            os.environ["FEED_TRACE_RELATIVE_MOTION"] = "1"
             try:
                 with contextlib.redirect_stdout(io.StringIO()):
                     exit_code = feed.main(
@@ -496,6 +499,10 @@ class RobotMachineContactTests(unittest.TestCase):
                     os.environ.pop("FEED_CASE_ID", None)
                 else:
                     os.environ["FEED_CASE_ID"] = previous_case_id
+                if previous_trace is None:
+                    os.environ.pop("FEED_TRACE_RELATIVE_MOTION", None)
+                else:
+                    os.environ["FEED_TRACE_RELATIVE_MOTION"] = previous_trace
             result = json.loads(result_path.read_text(encoding="utf-8"))
 
         self.assertEqual(0, exit_code)
@@ -525,6 +532,27 @@ class RobotMachineContactTests(unittest.TestCase):
         self.assertEqual(
             "diagnostic_only_no_pass_fail_threshold",
             relative_motion["criterion"])
+        history = relative_motion["time_history"]
+        self.assertTrue(relative_motion["time_history_enabled"])
+        self.assertGreater(len(history), 1000)
+        self.assertEqual(
+            sorted(row["sim_time_s"] for row in history),
+            [row["sim_time_s"] for row in history])
+        self.assertEqual(
+            {"搬运", "进给"},
+            {row["phase_group"] for row in history})
+        self.assertAlmostEqual(
+            relative_motion["overall"]["max_translation_slip_mm"],
+            max(row["translation_change_from_carry_start_mm"]
+                for row in history),
+            places=9)
+        self.assertTrue(all(
+            len(row["gripper_site_quaternion_wxyz"]) == 4
+            and len(row["translation_change_from_carry_start_tool_mm"]) == 3
+            for row in history))
+        self.assertTrue(any(
+            pair["category"] == "robot_workpiece"
+            for row in history for pair in row["shaft_contact_pairs"]))
         self.assertEqual(
             0.0,
             result["inputs"]["requested_initial_pose"]["yaw_world_z_deg"])
@@ -677,6 +705,11 @@ class FeedFailureStatusTests(unittest.TestCase):
         self.assertEqual(
             "aborted_before_carry",
             result["gripper_relative_workpiece_motion"]["status"])
+        self.assertFalse(result["gripper_relative_workpiece_motion"][
+            "time_history_enabled"])
+        self.assertEqual(
+            [],
+            result["gripper_relative_workpiece_motion"]["time_history"])
         self.assertEqual(
             0,
             result["gripper_relative_workpiece_motion"]["overall"]["samples"])

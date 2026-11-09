@@ -92,8 +92,8 @@ def _peak_force(result, pair_fragment, category):
 
 def summarize_result(result, solref_time_s, result_path):
     """Validate one result and flatten its relevant contact metrics."""
-    if not isinstance(result, dict) or result.get("schema_version") != 12:
-        raise ValueError("expected a schema v12 result JSON")
+    if not isinstance(result, dict) or result.get("schema_version") != 13:
+        raise ValueError("expected a schema v13 result JSON")
     if result.get("execution_status") != "completed":
         raise ValueError(
             "case did not complete: %s" % result.get("execution_status"))

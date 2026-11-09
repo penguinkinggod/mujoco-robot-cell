@@ -16,7 +16,7 @@ def make_result(case_id, status="completed", passed=True):
     hard_pass = passed
     quality_pass = passed if status == "completed" else None
     result = {
-        "schema_version": 12,
+        "schema_version": 13,
         "case_id": case_id,
         "execution_status": status,
         "evaluation_scope": "primary_physics_feed",
@@ -111,7 +111,7 @@ class FeedInsertSweepTests(unittest.TestCase):
 
         self.assertEqual("PASS", row["status"])
         self.assertEqual(0, row["exit_code"])
-        self.assertEqual(12, row["schema_version"])
+        self.assertEqual(13, row["schema_version"])
         self.assertEqual("sweep-test-case", row["case_id"])
         self.assertEqual(str(json_path), row["json_path"])
         self.assertEqual(0.64, row["coax_mm"])

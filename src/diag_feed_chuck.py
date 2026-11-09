@@ -99,7 +99,7 @@ from demo_08_pick_and_load import (
 )
 
 
-RESULT_SCHEMA_VERSION = 12
+RESULT_SCHEMA_VERSION = 13
 METRIC_SCHEMA_VERSION = 1
 CRITERION_SET_ID = "feed-criteria-v1"
 PLANNING_MODES = ("M0", "M1", "M2")
@@ -258,6 +258,7 @@ _REPRODUCIBLE_ENV_KEYS = {
     "FEED_ARM_LEAD", "FEED_ARM_DAMP", "FEED_FLOAT_DAMP",
     "FEED_CONVERGE", "FEED_CONVERGE_TOL", "FEED_BORE_PROBE",
     "FEED_GRIP_CLOSE", "FEED_DIAG_NO_RETREAT", "SMOOTH",
+    "FEED_TRACE_RELATIVE_MOTION",
     "SO101_KP", "SO101_KV", "SM_JAW_BORE_Q", "FEED_DEBUG",
     "FEED_CLAMP_TRACE", "FEED_SEAT_TRACE",
     "FEED_V_CONTACT_SOLREF_TIME",
@@ -2182,6 +2183,11 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                  "status": "not_captured",
                  "reference_pose": None,
                  "active": False,
+                 "time_history_enabled": (
+                     os.environ.get("FEED_TRACE_RELATIVE_MOTION") == "1"),
+                 "time_history_sample_interval_s": (
+                     float(model.opt.timestep)),
+                 "time_history": [],
                  "observation_start_stage": None,
                  "observation_end_stage": None,
                  "overall": {
@@ -2446,8 +2452,12 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         relative_motion = state["gripper_relative_workpiece_motion"]
         if relative_motion["active"]:
             site_rotation = data.site_xmat[arm.site].reshape(3, 3)
+            site_position = data.site_xpos[arm.site].copy()
+            pad_position = arm.pad_center()
+            shaft_position = shaft()
+            shaft_axis = rod_axis()
             current_offset_local, current_axis_local = _pose_in_tool_frame(
-                site_rotation, shaft(), arm.pad_center(), rod_axis())
+                site_rotation, shaft_position, pad_position, shaft_axis)
             reference_offset_local = np.asarray(
                 relative_motion["reference_pose"][
                     "center_offset_tool_m"],
@@ -2472,6 +2482,12 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                     "max_relative_axis_change_deg": 0.0,
                     "time_of_max_translation_slip_s": None,
                 })
+            previous_translation = relative_motion.get(
+                "_previous_translation_delta_tool_m")
+            step_delta_m = (
+                np.zeros(3, dtype=float) if previous_translation is None
+                else translation_delta - np.asarray(
+                    previous_translation, dtype=float))
             for summary in (relative_motion["overall"], phase_row):
                 summary["samples"] += 1
                 if translation_mm > summary["max_translation_slip_mm"]:
@@ -2484,12 +2500,92 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 summary["max_relative_axis_change_deg"] = max(
                     summary["max_relative_axis_change_deg"],
                     axis_change_deg)
+            relative_motion["_previous_translation_delta_tool_m"] = [
+                float(value) for value in translation_delta]
+
+            if relative_motion["time_history_enabled"]:
+                shaft_contact_pairs = {}
+                for contact_id in range(data.ncon):
+                    contact = data.contact[contact_id]
+                    if (contact.geom1 not in contact_geom_sets["workpiece"]
+                            and contact.geom2 not in
+                            contact_geom_sets["workpiece"]):
+                        continue
+                    geom_names = sorted(
+                        mujoco.mj_id2name(
+                            model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or "?"
+                        for geom_id in (contact.geom1, contact.geom2))
+                    category = _contact_category(
+                        contact.geom1, contact.geom2, contact_geom_sets)
+                    pair_key = "%s|%s|%s" % (
+                        category, geom_names[0], geom_names[1])
+                    pair = shaft_contact_pairs.setdefault(pair_key, {
+                        "category": category,
+                        "geoms": geom_names,
+                        "contact_count": 0,
+                        "normal_force_sum_N": 0.0,
+                        "minimum_distance_mm": float("inf"),
+                    })
+                    mujoco.mj_contactForce(
+                        model, data, contact_id, _cf6)
+                    pair["contact_count"] += 1
+                    pair["normal_force_sum_N"] += abs(float(_cf6[0]))
+                    pair["minimum_distance_mm"] = min(
+                        pair["minimum_distance_mm"],
+                        float(contact.dist) * 1000.0)
+
+                site_quaternion = np.zeros(4, dtype=float)
+                mujoco.mju_mat2Quat(
+                    site_quaternion,
+                    np.ascontiguousarray(site_rotation).reshape(-1))
+                relative_motion["time_history"].append({
+                    "sim_time_s": float(data.time),
+                    "phase": phase,
+                    "phase_group": phase_group,
+                    "shaft_center_world_m": [
+                        float(value) for value in shaft_position],
+                    "shaft_axis_world_unit": [
+                        float(value) for value in shaft_axis],
+                    "pad_center_world_m": [
+                        float(value) for value in pad_position],
+                    "gripper_site_position_world_m": [
+                        float(value) for value in site_position],
+                    "gripper_site_quaternion_wxyz": [
+                        float(value) for value in site_quaternion],
+                    "shaft_center_offset_tool_mm": [
+                        float(value * 1000.0)
+                        for value in current_offset_local],
+                    "translation_change_from_carry_start_tool_mm": [
+                        float(value * 1000.0)
+                        for value in translation_delta],
+                    "translation_change_from_carry_start_mm": (
+                        translation_mm),
+                    "translation_change_since_previous_step_tool_mm": [
+                        float(value * 1000.0) for value in step_delta_m],
+                    "translation_change_since_previous_step_mm": float(
+                        np.linalg.norm(step_delta_m) * 1000.0),
+                    "relative_axis_change_from_carry_start_deg": (
+                        axis_change_deg),
+                    "gripper_command": float(data.ctrl[arm.grip_act]),
+                    "shaft_contact_pairs": [
+                        {
+                            **pair,
+                            "minimum_distance_mm": float(
+                                pair["minimum_distance_mm"]),
+                        }
+                        for _key, pair in sorted(
+                            shaft_contact_pairs.items())
+                    ],
+                })
         return contact_snapshot, load_snapshot
 
     def write_result_json(result):
         json_path = os.environ.get("FEED_RESULT_JSON")
         if not json_path:
             return
+        relative_motion = result.get(
+            "gripper_relative_workpiece_motion", {})
+        relative_motion.pop("_previous_translation_delta_tool_m", None)
         result.update(_case_metadata(state, model))
         path = os.path.abspath(json_path)
         directory = os.path.dirname(path)
