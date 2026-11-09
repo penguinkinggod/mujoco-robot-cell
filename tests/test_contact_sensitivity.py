@@ -28,7 +28,7 @@ def _pair(solref_time_s, depth_mm, overlap_steps, contact_steps):
 class ContactSensitivityTests(unittest.TestCase):
     def _result(self, solref_time_s=0.005):
         return {
-            "schema_version": 11,
+            "schema_version": 12,
             "case_id": "test-solref",
             "execution_status": "completed",
             "control_mode": {

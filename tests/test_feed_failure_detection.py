@@ -95,7 +95,9 @@ class PlanningModeIsolationTests(unittest.TestCase):
 
 
 def assert_reproducibility_fields(test_case, result):
-    test_case.assertEqual(11, result["schema_version"])
+    test_case.assertEqual(12, result["schema_version"])
+    test_case.assertIn("pickup_motion_diagnostics", result)
+    test_case.assertIn("gripper_relative_workpiece_motion", result)
     test_case.assertEqual(1, result["metric_schema_version"])
     test_case.assertEqual("feed-criteria-v1", result["criterion_set_id"])
     test_case.assertTrue(result["case_id"])
@@ -440,7 +442,31 @@ class RobotMachineContactTests(unittest.TestCase):
 
         self.assertEqual(0, exit_code)
         self.assertTrue(result["overall_pass"])
+        self.assertEqual("physical_success", result["outcome_class"])
+        self.assertEqual([], result["hard_failures"])
+        self.assertEqual([], result["quality_failures"])
         assert_reproducibility_fields(self, result)
+        pickup_motion = result["pickup_motion_diagnostics"]
+        self.assertEqual("observed", pickup_motion["status"])
+        self.assertGreater(pickup_motion["overall"]["samples"], 0)
+        self.assertGreaterEqual(
+            pickup_motion["overall"]["max_center_displacement_mm"], 0.0)
+        self.assertEqual(
+            "diagnostic_only_no_pass_fail_threshold",
+            pickup_motion["criterion"])
+        relative_motion = result["gripper_relative_workpiece_motion"]
+        self.assertEqual("observed", relative_motion["status"])
+        self.assertFalse(relative_motion["active"])
+        self.assertEqual(
+            "feed_complete", relative_motion["observation_end_stage"])
+        self.assertGreater(relative_motion["overall"]["samples"], 0)
+        self.assertGreaterEqual(
+            relative_motion["overall"]["max_translation_slip_mm"], 0.0)
+        self.assertIn("搬运", relative_motion["phases"])
+        self.assertIn("进给", relative_motion["phases"])
+        self.assertEqual(
+            "diagnostic_only_no_pass_fail_threshold",
+            relative_motion["criterion"])
         self.assertEqual(
             0.0,
             result["inputs"]["requested_initial_pose"]["yaw_world_z_deg"])
@@ -576,7 +602,8 @@ class FeedFailureStatusTests(unittest.TestCase):
             v_jaw=True,
             lift=True,
             carry_lock=False,
-            initial_offset_mm=(0.0, 50.0, 0.0),
+            planning_mode="M2",
+            m2_error_mm=(0.0, 30.0, 0.0),
         )
         self.assertEqual(1, exit_code)
         assert_reproducibility_fields(self, result)
@@ -585,9 +612,52 @@ class FeedFailureStatusTests(unittest.TestCase):
         self.assertEqual("no_v_jaw_contact", result["abort_reason"])
         self.assertEqual(["grasp_empty"], result["hard_failures"])
         self.assertEqual(0, result["metrics"]["grasp_contact_count"])
+        self.assertTrue(result["initial_stability"]["stability_pass"])
+        self.assertEqual(
+            [0.0, 30.0, 0.0],
+            result["inputs"]["grasp_target_pose"]["m2_error_used_mm"])
+        self.assertEqual(
+            "aborted_before_carry",
+            result["gripper_relative_workpiece_motion"]["status"])
+        self.assertEqual(
+            0,
+            result["gripper_relative_workpiece_motion"]["overall"]["samples"])
+        self.assertNotIn(
+            "feed_complete", [row["stage"] for row in result["stages"]])
+        self.assertNotIn("chuck_clamped", [
+            row["checkpoint_id"] for row in result["checkpoints"]])
         self.assertTrue(result["trial_data_valid"])
         self.assertTrue(result["include_in_primary_trial_stats"])
         self.assertEqual("aborted", result["outcome_class"])
+
+    def test_controlled_quality_failure_is_not_mislabeled_as_abort(self):
+        previous_solref = os.environ.get("FEED_V_CONTACT_SOLREF_TIME")
+        os.environ["FEED_V_CONTACT_SOLREF_TIME"] = "0.005"
+        try:
+            exit_code, result = self._run_feed(
+                "test-quality-fail-solref-005",
+                v_jaw=True,
+                lift=True,
+                carry_lock=False,
+            )
+        finally:
+            if previous_solref is None:
+                os.environ.pop("FEED_V_CONTACT_SOLREF_TIME", None)
+            else:
+                os.environ["FEED_V_CONTACT_SOLREF_TIME"] = previous_solref
+
+        self.assertEqual(1, exit_code)
+        assert_reproducibility_fields(self, result)
+        self.assertEqual("completed", result["execution_status"])
+        self.assertTrue(result["hard_pass"])
+        self.assertFalse(result["quality_pass"])
+        self.assertFalse(result["overall_pass"])
+        self.assertEqual(["stock_eccentricity"], result["quality_failures"])
+        self.assertEqual([], result["hard_failures"])
+        self.assertEqual("quality_fail", result["outcome_class"])
+        self.assertGreater(result["metrics"]["stock_ecc_mm"], 2.0)
+        assert_feed_checkpoints(
+            self, result, ("completed",) * 6)
 
     def test_zero_initial_settle_records_the_perturbed_grasp_start_pose(self):
         _exit_code, result = self._run_feed(

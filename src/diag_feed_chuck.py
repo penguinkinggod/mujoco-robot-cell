@@ -99,7 +99,7 @@ from demo_08_pick_and_load import (
 )
 
 
-RESULT_SCHEMA_VERSION = 11
+RESULT_SCHEMA_VERSION = 12
 METRIC_SCHEMA_VERSION = 1
 CRITERION_SET_ID = "feed-criteria-v1"
 PLANNING_MODES = ("M0", "M1", "M2")
@@ -705,6 +705,10 @@ def _diagnostic_result_fields(state):
             "applied_load_diagnostics", {"scopes": {}}),
         "penetration_diagnostics": state.get(
             "penetration_diagnostics", {}),
+        "pickup_motion_diagnostics": state.get(
+            "pickup_motion_diagnostics", {}),
+        "gripper_relative_workpiece_motion": state.get(
+            "gripper_relative_workpiece_motion", {}),
         "initial_stability": state.get("initial_stability"),
         "diagnostic_scope_definitions": {
             "feed": "送料、夹紧、松爪、退出和解锁静置；不含 20 N 拉拔测试",
@@ -2133,6 +2137,39 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                  "by_phase": {},
                  "minimum_contact": None,
              },
+             "pickup_motion_diagnostics": {
+                 "status": "awaiting_initial_pose",
+                 "reference_pose": None,
+                 "measurement_scope": [
+                     "接近", "侧向进入", "下降", "夹紧"],
+                 "overall": {
+                     "samples": 0,
+                     "robot_workpiece_contact_samples": 0,
+                     "peak_robot_workpiece_contacts_per_step": 0,
+                     "peak_robot_workpiece_normal_force_sum_N": 0.0,
+                     "max_center_displacement_mm": 0.0,
+                     "center_displacement_vector_at_max_mm": [0.0, 0.0, 0.0],
+                     "max_shaft_axis_change_deg": 0.0,
+                 },
+                 "phases": {},
+                 "criterion": "diagnostic_only_no_pass_fail_threshold",
+             },
+             "gripper_relative_workpiece_motion": {
+                 "status": "not_captured",
+                 "reference_pose": None,
+                 "active": False,
+                 "observation_start_stage": None,
+                 "observation_end_stage": None,
+                 "overall": {
+                     "samples": 0,
+                     "max_translation_slip_mm": 0.0,
+                     "translation_slip_vector_tool_mm_at_max": [
+                         0.0, 0.0, 0.0],
+                     "max_relative_axis_change_deg": 0.0,
+                 },
+                 "phases": {},
+                 "criterion": "diagnostic_only_no_pass_fail_threshold",
+             },
              "initial_stability": None,
              "ik_residuals_mm": {}, "versions": _versions_snapshot(),
              "actual_initial_pose": None,
@@ -2314,17 +2351,118 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
 
     def record_diagnostic_frame(phase=None):
         """Capture one post-step contact/load frame into compact rollups."""
+        phase = phase or state.get("label") or "simulation"
         contact_snapshot = _contact_frame_snapshot(
             model, data, contact_geom_sets)
         load_snapshot = _applied_load_snapshot(model, data)
         _update_diagnostic_rollups(
             state,
             state.get("diagnostic_scope", "feed"),
-            phase or state.get("label") or "simulation",
+            phase,
             float(data.time),
             contact_snapshot,
             load_snapshot,
         )
+
+        pickup = state["pickup_motion_diagnostics"]
+        pickup_group = next(
+            (name for name in pickup["measurement_scope"]
+             if phase == name or phase.startswith(name + "#")),
+            None,
+        )
+        if pickup_group is not None and state["actual_initial_pose"]:
+            current_position = shaft()
+            reference_position = np.asarray(
+                pickup["reference_pose"]["position_m"], dtype=float)
+            current_axis = rod_axis()
+            reference_axis = np.asarray(
+                pickup["reference_pose"]["shaft_axis_world_unit"],
+                dtype=float)
+            center_delta = current_position - reference_position
+            center_displacement_mm = float(
+                np.linalg.norm(center_delta) * 1000.0)
+            axis_change_deg = float(np.degrees(np.arccos(np.clip(
+                abs(float(np.dot(current_axis, reference_axis))),
+                -1.0, 1.0))))
+            robot_workpiece = contact_snapshot["counts_by_category"][
+                "robot_workpiece"]
+            robot_workpiece_force = (
+                contact_snapshot["normal_force_sum_by_category_N"][
+                    "robot_workpiece"])
+            phase_row = pickup["phases"].setdefault(pickup_group, {
+                "samples": 0,
+                "robot_workpiece_contact_samples": 0,
+                "peak_robot_workpiece_contacts_per_step": 0,
+                "peak_robot_workpiece_normal_force_sum_N": 0.0,
+                "max_center_displacement_mm": 0.0,
+                "center_displacement_vector_at_max_mm": [
+                    0.0, 0.0, 0.0],
+                "max_shaft_axis_change_deg": 0.0,
+            })
+            for summary in (pickup["overall"], phase_row):
+                summary["samples"] += 1
+                summary["robot_workpiece_contact_samples"] += int(
+                    robot_workpiece > 0)
+                summary["peak_robot_workpiece_contacts_per_step"] = max(
+                    summary["peak_robot_workpiece_contacts_per_step"],
+                    robot_workpiece)
+                summary["peak_robot_workpiece_normal_force_sum_N"] = max(
+                    summary["peak_robot_workpiece_normal_force_sum_N"],
+                    robot_workpiece_force)
+                if (center_displacement_mm
+                        > summary["max_center_displacement_mm"]):
+                    summary["max_center_displacement_mm"] = (
+                        center_displacement_mm)
+                    summary["center_displacement_vector_at_max_mm"] = [
+                        float(value * 1000.0) for value in center_delta]
+                summary["max_shaft_axis_change_deg"] = max(
+                    summary["max_shaft_axis_change_deg"], axis_change_deg)
+            pickup["status"] = "observed"
+
+        relative_motion = state["gripper_relative_workpiece_motion"]
+        if relative_motion["active"]:
+            site_rotation = data.site_xmat[arm.site].reshape(3, 3)
+            current_offset_local = site_rotation.T @ (
+                shaft() - arm.pad_center())
+            reference_offset_local = np.asarray(
+                relative_motion["reference_pose"][
+                    "center_offset_tool_m"],
+                dtype=float)
+            translation_delta = (
+                current_offset_local - reference_offset_local)
+            translation_mm = float(
+                np.linalg.norm(translation_delta) * 1000.0)
+            current_axis_local = site_rotation.T @ rod_axis()
+            reference_axis_local = np.asarray(
+                relative_motion["reference_pose"]["axis_tool_unit"],
+                dtype=float)
+            axis_change_deg = float(np.degrees(np.arccos(np.clip(
+                abs(float(np.dot(current_axis_local, reference_axis_local))),
+                -1.0, 1.0))))
+            phase_group = (
+                "进给" if phase == "进给" or phase.startswith("进给#")
+                else "搬运")
+            phase_row = relative_motion["phases"].setdefault(
+                phase_group, {
+                    "samples": 0,
+                    "max_translation_slip_mm": 0.0,
+                    "translation_slip_vector_tool_mm_at_max": [
+                        0.0, 0.0, 0.0],
+                    "max_relative_axis_change_deg": 0.0,
+                    "time_of_max_translation_slip_s": None,
+                })
+            for summary in (relative_motion["overall"], phase_row):
+                summary["samples"] += 1
+                if translation_mm > summary["max_translation_slip_mm"]:
+                    summary["max_translation_slip_mm"] = translation_mm
+                    summary["translation_slip_vector_tool_mm_at_max"] = [
+                        float(value * 1000.0)
+                        for value in translation_delta]
+                    summary["time_of_max_translation_slip_s"] = float(
+                        data.time)
+                summary["max_relative_axis_change_deg"] = max(
+                    summary["max_relative_axis_change_deg"],
+                    axis_change_deg)
         return contact_snapshot, load_snapshot
 
     def write_result_json(result):
@@ -3149,6 +3287,9 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     tick("① 起始｜卡盘张开，工件在台面")
     home = shaft()
     state["actual_initial_pose"] = shaft_pose_snapshot()
+    state["pickup_motion_diagnostics"]["reference_pose"] = (
+        state["actual_initial_pose"])
+    state["pickup_motion_diagnostics"]["status"] = "observing"
     if lift:
         nominal_position = NOMINAL_SETTLED_POSITION_M.copy()
     else:
@@ -3289,6 +3430,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         settle(GRIP_RAMP - 320 + 80, SM.CHUCK_OPEN_CTRL, grip_close)
     state["grasp_contact_count"] = grip_state()[0]
     if v_jaw and not carry_lock and state["grasp_contact_count"] == 0:
+        state["gripper_relative_workpiece_motion"]["status"] = (
+            "aborted_before_carry")
         record_stage("grasp_abort")
         print("FEED_ABORT stage=grasp reason=no_v_jaw_contact; "
               "搬运和卡盘闭合已取消")
@@ -3380,6 +3523,24 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     # calibrated approach is over; from here the wrist must counter-rotate
     # so the rod never tips 80 deg during the long traverse.
     state["axis_hold"] = not carry_lock
+    relative_motion = state["gripper_relative_workpiece_motion"]
+    if v_jaw and not carry_lock:
+        site_rotation = data.site_xmat[arm.site].reshape(3, 3)
+        relative_motion["reference_pose"] = {
+            "stage": "carry_start_after_grasp_settle",
+            "sim_time_s": float(data.time),
+            "center_offset_tool_m": [
+                float(value) for value in site_rotation.T
+                @ (shaft() - arm.pad_center())],
+            "axis_tool_unit": [
+                float(value) for value in site_rotation.T @ rod_axis()],
+        }
+        relative_motion["active"] = True
+        relative_motion["status"] = "observing"
+        relative_motion["observation_start_stage"] = (
+            "carry_start_after_grasp_settle")
+    else:
+        relative_motion["status"] = "not_applicable_for_carry_mode"
 
     # ---------------- carry: 先对轴，再直线进给 ----------------
     # 工艺顺序（真实车床上下料就是这么走的）：
@@ -3462,6 +3623,12 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
           % (station_x, (jaw_front - station_x) * 1000, machine_hits))
     state["ik_residuals_mm"]["feed"] = float(err * 1000)
     record_stage("feed_complete", checkpoint_id="feed_complete")
+    relative_motion["active"] = False
+    relative_motion["observation_end_stage"] = "feed_complete"
+    if relative_motion["status"] == "observing":
+        relative_motion["status"] = (
+            "observed" if relative_motion["overall"]["samples"] > 0
+            else "insufficient_samples")
     tick("⑨ 直线进给｜沿 +x 插入")
 
     # ---------------- clamp: align friction solver with the chuck scene ----
@@ -4156,6 +4323,19 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         print("FEED_METRIC_MACHINING stock_ecc_mm=%.2f allow_mm=%.1f"
               % (stock, STOCK_ALLOW_MM))
     print("FEED_METRIC %s" % ("PASS" if ok else "FAIL"))
+    pickup_motion = state["pickup_motion_diagnostics"]
+    if pickup_motion["status"] == "observed":
+        print("阶段诊断：抓取接近期间，工件中心最多移动 %.3f mm，"
+              "轴线最多变化 %.3f°（仅观察，不单独判 PASS/FAIL）。"
+              % (pickup_motion["overall"]["max_center_displacement_mm"],
+                 pickup_motion["overall"]["max_shaft_axis_change_deg"]))
+    relative_motion = state["gripper_relative_workpiece_motion"]
+    if relative_motion["status"] == "observed":
+        print("阶段诊断：夹爪搬运/进给期间，工件相对夹爪中心最多滑移 "
+              "%.3f mm，轴线最多变化 %.3f°（仅观察，尚无独立门槛）。"
+              % (relative_motion["overall"]["max_translation_slip_mm"],
+                 relative_motion["overall"][
+                     "max_relative_axis_change_deg"]))
     print("结果翻译：")
     print("  coax_mm：最终棒料中心离卡盘主轴轴线 %.2f mm（越小越居中）。"
           % final_coax)
