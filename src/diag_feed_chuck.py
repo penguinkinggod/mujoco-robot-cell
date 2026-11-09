@@ -3443,7 +3443,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         tick({"接近": "② 接近｜到槽口外侧",
               "侧向进入": "③ 侧向进入｜沿 V 槽开口",
               "下降": "④ 下降｜pad 到轴心",
-              "夹紧": "⑤ 夹紧｜真实抓取（轴会歪）"}[name])
+              "夹紧": "⑤ 夹紧｜真实接触抓取"}[name])
     # 夹爪是斜坡闭合（GRIP_RAMP 步），"夹紧"那段 320 步走完时它还没合到
     # 位。一抬臂，工件就从 V 槽里滑出去：实测全物理路径同轴 250 mm、倾斜
     # 133 deg、接触 0，就是这里漏了一段保持。先让爪子合完再搬。
@@ -4161,7 +4161,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     print("  解锁静置     轴=%s 同轴=%5.2f mm 轴向偏=%5.1f deg 接触=%d "
           "导套=%d/%.1fN"
           % (np.round(shaft(), 4), coax(), axdev(), jaw_state()[0], bn, bf))
-    tick("⑪ 解锁｜交还真实物理")
+    tick("⑪ 撤销临时支撑｜自由物理静置")
     record_stage("after_unlock_settle", checkpoint_id="unlock_settled")
 
     # The full-physics path has already released and retreated in one move.
@@ -4199,7 +4199,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             tick()
     pull = abs(shaft()[0] - x0) * 1000
     record_stage("after_20N_pull_test")
-    tick("⑬ 20 N 拉拔｜夹得住")
+    tick("⑬ 20 N 拉拔｜位移 %.2f mm" % pull)
     print("  重力下沉  %.2f mm      20 N 拉  %.2f mm" % (slip, pull))
     print()
 

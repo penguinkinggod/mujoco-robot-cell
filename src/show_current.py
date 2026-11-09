@@ -1,11 +1,11 @@
 """show_current.py -- 把「现在仿真的样子」变成能直接看的图 / 动图 / 网页。
 
 运行（在 D:\\codex\\projects\\robot-sim-first-step 下）：
-    D:\\robot-env\\Scripts\\python.exe show_current.py
+    .venv\\Scripts\\python.exe src\\show_current.py
 
 产物（全部写在本目录）：
     now_views.png     合并场景六视图（起始 / 装夹完成，各 3 个机位）
-    now_stages.png    送料全流程 12 个关键帧
+    now_stages.png    送料全流程关键帧
     now_feed.gif      送料全流程动画
     now_gallery.html  点开即看的图册（含当次实测指标）
 
@@ -69,7 +69,7 @@ CAM_PART = make_cam(list(F.SHAFT_POS), 0.28, 30, -20)
 VIEW_START = [
     ("总览｜机械臂 + 车床", CAM_MAIN),
     ("卡盘端面｜三爪张开待装", CAM_CHUCK),
-    ("工件特写｜Φ20 D 轴在台面", CAM_PART),
+    ("来料特写｜Φ20 × 80 mm 圆柱", CAM_PART),
 ]
 VIEW_END = [
     ("总览｜机械臂已退出", CAM_MAIN),
@@ -108,6 +108,18 @@ def parse_metric(text):
         values = {k: float(v) for k, v in
                   re.findall(r"(\w+)=(\d+(?:\.\d+)?)", m.group(1))}
     status = "PASS" if "FEED_METRIC PASS" in text else "FAIL"
+    relative = re.search(
+        r"夹爪搬运/进给期间，工件相对夹爪中心最多滑移 "
+        r"([\d.]+) mm，轴线最多变化 ([\d.]+)°", text)
+    if relative:
+        values["carry_relative_mm"] = float(relative.group(1))
+        values["carry_relative_axis_deg"] = float(relative.group(2))
+    pickup = re.search(
+        r"抓取接近期间，工件中心最多移动 ([\d.]+) mm，"
+        r"轴线最多变化 ([\d.]+)°", text)
+    if pickup:
+        values["pickup_displacement_mm"] = float(pickup.group(1))
+        values["pickup_axis_change_deg"] = float(pickup.group(2))
     return values, status
 
 
@@ -161,9 +173,13 @@ def save_gallery(metric, status, n_frames, n_stages):
         ("同轴度", num("coax_mm", " mm"), "轴心 vs 卡盘轴线"),
         ("倾斜", num("tilt_deg", "°", 1), "相对原始轴向"),
         ("卡爪接触点", num("contacts", "", 0), "三爪合计"),
-        ("三爪法向力", num("jaw_force_N", " N", 1), "夹紧力"),
+        ("三爪法向力", num("jaw_force_N", " N", 1), "仿真接触力合计"),
         ("重力下沉", num("slip_mm", " mm"), "静置 800 步"),
         ("20 N 拉拔", num("pull_mm", " mm"), "轴向拉动 700 步"),
+        ("搬运相对平移", num("carry_relative_mm", " mm", 3),
+         "诊断值，无单独门槛"),
+        ("接近工件位移", num("pickup_displacement_mm", " mm", 3),
+         "诊断值，无单独门槛"),
     ]
     card_html = "\n".join(
         '<div class="m"><div class="mk">%s</div><div class="mv">%s</div>'
@@ -209,7 +225,7 @@ footer{color:#8a94a3;font-size:12px;text-align:center;margin-top:28px}
 @media(max-width:720px){.metrics{grid-template-columns:repeat(2,1fr)}}
 </style></head><body><div class="wrap">
 <header><h1>现在的样子</h1>
-<p class="sub">SO-101 机械臂抓 Φ20 D 轴 → 送进二轴车三爪卡盘 → 夹紧 → 退出 ·
+<p class="sub">SO-101 机械臂抓取 Φ20 × 80 mm 圆柱 → 送进三爪卡盘 → 夹紧 → 退出 ·
  生成于 __STAMP__ · __FRAMES__ 帧动图 / __STAGES__ 个关键帧</p>
 <span class="badge __STATUSCLS__">__STATUS__</span></header>
 
@@ -222,32 +238,30 @@ footer{color:#8a94a3;font-size:12px;text-align:center;margin-top:28px}
 
 <section class="card"><h2>② 场景长什么样</h2>
 <img src="now_views.png" alt="合并场景三视图">
-<p class="cap">上排是起始状态（总览 / 卡盘端面三爪张开 / 台面上的 D 轴），
+<p class="cap">上排是起始状态（总览 / 卡盘端面三爪张开 / 静态 V 托架上的圆柱），
 下排是装夹完成状态（总览 / 卡盘端面三爪夹住轴 / 侧视轴伸进卡盘）。
 三爪按 120° 分布，长边朝径向，由单丝杠 + 2 条关节联动约束驱动。</p></section>
 
-<section class="card"><h2>③ 送料 12 个关键帧</h2>
+<section class="card"><h2>③ 送料关键帧</h2>
 <img src="now_stages.png" alt="送料关键帧">
-<p class="cap">注意第 04 帧「真实抓取」里轴是歪的（约 41.5°），第 05 帧起搬运段接管为运动学锁；
-第 10 帧解锁，之后所有载荷测试都在真实物理下进行。</p></section>
+<p class="cap">关键帧来自同一条送料轨迹，包含来料、接近、抓取、搬运、卡盘夹紧和机械臂退出。</p></section>
 
-<section class="card warn"><h2>⚠ 别把画面当成「全物理通过」</h2>
+<section class="card warn"><h2>结果边界</h2>
 <ul>
-<li><b>搬运段是运动学锁</b>：从对中到夹紧，每步把轴位姿写回夹爪中心，等于假设夹爪完美形封闭。
-真实夹爪抓持姿态还没修好，轴在抓取阶段仍会歪约 41.5°。</li>
-<li><b>D 形铣扁是粗糙碰撞代理</b>：box 角点凸出 Φ20 包络约 3.1 mm，只用来阻止圆柱滚转，形状精度按你的要求留到后面优化。</li>
-<li>锁在所有负载测试前解除，<code>physics_after_clamp=1</code> 由 verify_all.py 强制断言，防止把锁延长到拉拔阶段造假。</li>
+<li>搬运阶段使用工件与夹爪的物理接触，没有运动学锁；但接触参数尚未用实物标定。</li>
+<li>本次搬运相对夹爪位移约 8.152 mm。现有端点送料判据仍 PASS，但这项过程位移没有独立验收阈值，所以不能据此宣称“抓稳”。</li>
+<li>当前来料是静态 V 托架上的 Φ20 × 80 mm 光圆柱，不是运动输送带，也不是任意姿态来料。结果仅对记录的仿真模型和参数成立。</li>
 </ul></section>
 
 <section class="card"><h2>想自己转着看：桌面图标 / 命令</h2>
 <p class="cap"><b>最省事：双击桌面上的「机器人仿真 3D 窗口」</b>，会弹出一个和 SolidWorks 一样的可交互 3D 窗口。
 按住鼠标左键转视角、滚轮缩放，右侧面板能开接触点 / 力 / 坐标系显示。</p>
 <p class="cap">也可以在 <code>D:\\codex\\projects\\robot-sim-first-step</code> 里粘下面任意一条：</p>
-<pre>D:\\robot-env\\Scripts\\python.exe show_live.py           :: 起始态，可拖着转
-D:\\robot-env\\Scripts\\python.exe show_live.py --feed    :: 实时播放送料全过程
-D:\\robot-env\\Scripts\\python.exe show_live.py --clamped :: 直接看装夹完成态
-D:\\robot-env\\Scripts\\python.exe show_current.py        :: 重新生成本页的图 / 动图
-D:\\robot-env\\Scripts\\python.exe verify_all.py          :: 复跑 7/7 回归</pre>
+<pre>.venv\\Scripts\\python.exe src\\show_live.py           :: 起始态，可拖着转
+.venv\\Scripts\\python.exe src\\show_live.py --feed    :: 实时播放送料全过程
+.venv\\Scripts\\python.exe src\\show_live.py --clamped :: 直接看装夹完成态
+.venv\\Scripts\\python.exe src\\show_current.py        :: 重新生成本页的图 / 动图
+.venv\\Scripts\\python.exe verify_all.py               :: 复跑项目回归</pre>
 </section>
 
 <footer>画面与指标同源：diag_feed_chuck.main(frame_hook=...) · 视觉配置不改物理</footer>
