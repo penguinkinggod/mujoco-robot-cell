@@ -262,11 +262,13 @@ _REPRODUCIBLE_ENV_KEYS = {
     "FEED_ARM_LEAD", "FEED_ARM_DAMP", "FEED_FLOAT_DAMP",
     "FEED_CONVERGE", "FEED_CONVERGE_TOL", "FEED_BORE_PROBE",
     "FEED_GRIP_CLOSE", "FEED_DIAG_NO_RETREAT", "SMOOTH",
-    "FEED_TRACE_RELATIVE_MOTION", "FEED_CARRY_V_CRUISE",
+    "FEED_TRACE_RELATIVE_MOTION", "FEED_TRACE_PICKUP_MOTION",
+    "FEED_CARRY_V_CRUISE",
     "FEED_V_JAW_LENGTH_MM",
     "SO101_KP", "SO101_KV", "SM_JAW_BORE_Q", "FEED_DEBUG",
     "FEED_CLAMP_TRACE", "FEED_SEAT_TRACE",
     "FEED_V_CONTACT_SOLREF_TIME",
+    "FEED_WORKPIECE_LIFT_MM", "FEED_PICKUP_REFINEMENT",
 }
 _SOURCE_IDENTITY = None
 
@@ -980,10 +982,10 @@ RETREAT_AXIAL = os.environ.get("FEED_RETREAT_AXIAL", "1") == "1"
 # 进给到位后把料轴调平（见 level_rod()）。默认开：不调平时料"尾端翘起"
 # 约 1.2°，80 mm 料两端高差 1.7 mm，肉眼一眼看得出来。
 LEVEL_ROD = os.environ.get("FEED_LEVEL_ROD", "0") == "1"
-# 进给轴目标的前倾补偿（度）。舵机软，目标是水平时实际会低约 1°，80 mm
-# 料两端差 1.7 mm，肉眼就是"尾端翘着"。把 IK 目标轴预先抬高同样的角度，
-# 末端实际才落平。只改机器人目标姿态，不给料加外力。
-AXIS_LEAD_DEG = float(os.environ.get("FEED_AXIS_LEAD_DEG", "1.0"))
+# 进给轴目标的前倾补偿（度）。P5.8.6 在 nominal 和五个固定 M2 样本中
+# 配对比较 1/2 度后，2 度的进给前有符号 pitch 更接近水平且五例均通过。
+# 这是当前仿真模型的目标前馈，不是通用机械臂标定，也不给棒料施加调平力。
+AXIS_LEAD_DEG = float(os.environ.get("FEED_AXIS_LEAD_DEG", "2.0"))
 _AXIS_TGT = np.array([np.cos(np.radians(AXIS_LEAD_DEG)), 0.0,
                       np.sin(np.radians(AXIS_LEAD_DEG))])
 # 落座：抓起后先抬离台面 SEAT_TAP，静置让料在 V 槽里坐到底。
@@ -1137,7 +1139,8 @@ V_WRIST = -0.95
 # Closing harder is what an operator does; -0.10 measured 22.9 N on the chuck
 # jaws and 0.07 mm of 20 N pull-out.
 V_GRIP_CLOSE = -0.10
-LIFT_DZ = 0.030          # workpiece raised off the table
+LIFT_DZ = _positive_finite_env_float(
+    "FEED_WORKPIECE_LIFT_MM", 30.0) / 1000.0
 CRADLE_HALF_X = 0.005    # cradle half-width along the workpiece axis
 CRADLE_BAR = 0.005
 # Cradle depth is INDEPENDENT of jaw depth: the cradle only has to locate the
@@ -1533,6 +1536,9 @@ FEED_ITERS = int(os.environ.get("FEED_ITERS", 3))   # 进给闭环修正轮数
 FEED_GAIN = float(os.environ.get("FEED_GAIN", 0.8))  # 闭环修正增益
 FEED_STEPS = int(os.environ.get("FEED_STEPS", 600))  # 进给每轮步数（1.2 s，慢到不激起工件摆动）
 MIN_FIX_STEPS = 150      # 闭环修正轮的最短时长（0.30 s）：再短伺服落不了地
+PICKUP_MAX_CORRECTIONS = 2
+PICKUP_REFINEMENT = os.environ.get(
+    "FEED_PICKUP_REFINEMENT", "1") == "1"
 
 # ---- 送料场景专用伺服阻尼（文献 B：hunting 是欠阻尼，先加阻尼）----
 # 全局 ARM_SERVO_KV 必须保持 2.6，否则 demo_09 搬运到槽上方 xy 误差会从
@@ -2189,6 +2195,12 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
              "pickup_motion_diagnostics": {
                  "status": "awaiting_initial_pose",
                  "reference_pose": None,
+                 "motion_refinement": [],
+                 "joint_time_history_enabled": (
+                     os.environ.get("FEED_TRACE_PICKUP_MOTION") == "1"),
+                 "joint_time_history_sample_interval_s": (
+                     float(model.opt.timestep)),
+                 "joint_time_history": [],
                  "measurement_scope": [
                      "接近", "侧向进入", "下降", "夹紧"],
                  "overall": {
@@ -2329,6 +2341,16 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                      "feed_gain": float(FEED_GAIN),
                      "feed_steps_per_iteration": int(FEED_STEPS),
                      "minimum_fix_steps": int(MIN_FIX_STEPS),
+                     "pickup_refinement_enabled": bool(
+                         PICKUP_REFINEMENT),
+                     "pickup_max_corrections": int(
+                         PICKUP_MAX_CORRECTIONS),
+                     "pickup_motion_strategy": (
+                         "full_stage_first_pass_then_bounded_corrections"
+                         if PICKUP_REFINEMENT else "legacy"),
+                     "pickup_joint_time_history_enabled": bool(
+                         os.environ.get(
+                             "FEED_TRACE_PICKUP_MOTION") == "1"),
                      "feed_arm_kv": float(FEED_ARM_KV),
                      "arm_gravity_compensation": bool(ARM_GCOMP),
                      "arm_gravity_compensation_gain": float(
@@ -2703,6 +2725,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             "shaft_position_m": [float(x) for x in p],
             "shaft_axis": [float(x) for x in axis_now],
             "shaft_axis_error_deg": axdev(),
+            "shaft_pitch_signed_deg": rod_pitch(),
             "coax_mm": coax(),
             "stock_ecc_mm": stock_ecc(),
             "gripper_site_position_m": [
@@ -2794,6 +2817,33 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             data.qpos[sq:sq + 3] = arm.pad_center() - state["offset"]
         data.qpos[sq + 3:sq + 7] = SHAFT_Q0
         data.qvel[sv:sv + 6] = 0.0
+
+    def record_pickup_joint_frame(sample_phase):
+        diagnostics = state["pickup_motion_diagnostics"]
+        if not diagnostics["joint_time_history_enabled"]:
+            return
+        label = str(state.get("label") or "")
+        stage = next(
+            (name for name in ("接近", "侧向进入")
+             if label == name or label.startswith(name + "#")),
+            None,
+        )
+        if stage is None:
+            return
+        diagnostics["joint_time_history"].append({
+            "sim_time_s": float(data.time),
+            "stage": stage,
+            "move_label": label,
+            "sample_phase": sample_phase,
+            "tool_position_world_m": [
+                float(value) for value in data.site_xpos[arm.site]],
+            "joint_position_rad": [
+                float(data.qpos[adr]) for adr in arm.qadr],
+            "joint_velocity_rad_s": [
+                float(data.qvel[adr]) for adr in arm.dadr],
+            "joint_acceleration_rad_s2": [
+                float(data.qacc[adr]) for adr in arm.dadr],
+        })
 
     def move(target, ns, grip, locked, jaw_ctrl, axis_hold=None,
              grip_end=None, s0=0.0, s1=1.0, settle_steps=None):
@@ -2919,6 +2969,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             data.ctrl[arm.grip_act] = grip_cmd(gcmd)
             data.ctrl[jaw_act] = jaw_ctrl
             step_sim()
+            record_pickup_joint_frame("trajectory")
             state.setdefault("traj", []).append(
                 data.site_xpos[arm.site].copy())
             state.setdefault("traj_t", []).append(float(data.time))
@@ -2952,6 +3003,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             data.ctrl[arm.grip_act] = grip_cmd(final_grip)
             data.ctrl[jaw_act] = jaw_ctrl
             step_sim()
+            record_pickup_joint_frame("settle")
             state.setdefault("traj", []).append(
                 data.site_xpos[arm.site].copy())
             state.setdefault("traj_t", []).append(float(data.time))
@@ -2988,12 +3040,17 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         # segments are both smoother and more accurate.
         hold_done = (state["axis_hold"] and state["offset"] is not None)
         move_steps = ns if hold_done else max(90, ns // 3)
+        pickup_refinement = (
+            PICKUP_REFINEMENT and label in ("接近", "侧向进入"))
         if hold_done and iters == 8:
             # Full-length minimum-jerk corrections, not chopped point-to-point
             # retries. Measured error halves each pass (51 -> 17 -> 8 -> 2 mm).
             # The final feed gets one extra pass because its position decides
             # whether all six chuck contacts survive the gripper release.
             iters = 4 if label == "进给" else 3
+        pass_limit = (
+            min(iters, PICKUP_MAX_CORRECTIONS + 1)
+            if pickup_refinement else iters)
 
         # Apply the grip command BEFORE the convergence check.
         # "夹紧" targets the same point as the preceding "下降", so err was
@@ -3001,7 +3058,16 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         # GRIP_CLOSE into ctrl: the fingers stayed at 0.500 (open), the pads
         # sat 19-23 mm off the axis, and the shaft never left the table.
         # Measured before this fix: ncon had zero pad-shaft contacts.
-        for _ in range(30 if hold_done else GRIP_SETTLE):
+        same_grip_target = (
+            state.get("grip_tgt") is not None
+            and abs(float(state["grip_tgt"]) - float(grip)) <= 1e-9
+            and abs(float(data.ctrl[arm.grip_act]) - float(grip)) <= 1e-6)
+        skip_redundant_grip_prep = (
+            pickup_refinement and same_grip_target)
+        grip_prep_steps = (
+            30 if hold_done else
+            0 if skip_redundant_grip_prep else GRIP_SETTLE)
+        for _ in range(grip_prep_steps):
             data.ctrl[arm.grip_act] = grip_cmd(grip)
             data.ctrl[jaw_act] = jaw_ctrl
             step_sim()
@@ -3026,36 +3092,61 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         gmeas = goal if probe_goal is None else np.asarray(probe_goal, float)
         err = float(np.linalg.norm(meas() - gmeas))
         trace = [err]
+        initial_err = err
+        motion_steps = []
+        executed_settle_steps = []
         tol = 0.001 if label == "进给" else 0.003
         # 第一轮的行程就是「整段距离」，后面每一轮只差几毫米。
-        # 2026-11-06 实测（FEED_DEBUG=1）：进给 55.2 -> 12.4 -> 5.7 -> 2.0 -> 0.7 mm，
-        # 四轮各给 500 步。第一轮 2.53 m/s 冲过去，后三轮拿同样的时间搬
-        # 12/6/2 mm，末端速度不到 0.01 m/s —— 窗口里就是「跳一下，然后
-        # 长时间几乎不动，再跳一下」。按剩余距离缩时，修正轮变成一次
-        # 短促的小动作，整段看起来是一条连续轨迹。
-        dist0 = max(err, 1e-4)
-        for k in range(iters):
+        # Pick approach/side-entry uses one full-duration first move and only
+        # two bounded, short corrections. Other phases retain their existing
+        # correction schedule and timing.
+        for k in range(pass_limit):
             if err < tol:
                 break
-            # 时间律共享之后，每轮的行程必须配同样的时长，否则「缩短的
-            # 修正轮」会用更短的时间走同样的 s 区间，末端速度反而更高。
-            # 收敛轮的位移小、速度自然低，看起来是减速收车，不再是一顿
-            # 一顿。
-            steps_k = move_steps
-            # 多轮闭环共享一条时间律，轮间不停车。原来只在 axis_hold
-            # 时这么做，其余段每轮各跑一条 0->1 的五次曲线，速度每轮
-            # 归零一次 —— 进给 3 轮就是 3 次急停急起。五次曲线的导数
-            # 只在 t=0/1 处为零，按 [k/iters,(k+1)/iters] 切分后轮间
-            # 速度是连续的。
-            kw = {"s0": k / iters, "s1": (k + 1) / iters}
+            if pickup_refinement:
+                if k == 0:
+                    steps_k = ns
+                else:
+                    error_fraction = min(
+                        1.0, err / max(initial_err, tol))
+                    steps_k = min(
+                        ns,
+                        max(MIN_FIX_STEPS,
+                            int(round(ns * error_fraction))),
+                    )
+                # Each IK correction is a new measured target, so it is a
+                # separate start-to-stop segment, not a shared global curve.
+                kw = {"s0": 0.0, "s1": 1.0}
+            else:
+                # Other stages retain their existing shared minimum-jerk law.
+                steps_k = move_steps
+                kw = {"s0": k / iters, "s1": (k + 1) / iters}
             state["label"] = "%s#%d" % (label, k + 1)
-            kw["settle_steps"] = 90 if k == iters - 1 else 60
+            kw["settle_steps"] = 90 if k == pass_limit - 1 else 60
             move(tgt, steps_k, grip, locked, jaw_ctrl, **kw)
+            motion_steps.append(int(steps_k))
+            executed_settle_steps.append(int(kw["settle_steps"]))
             err = float(np.linalg.norm(meas() - gmeas))
             trace.append(err)
             # 0.8 damping: full step overshoots once the load unloads
             tgt = tgt + FEED_GAIN * (gmeas - meas())
         state.setdefault("ik_residuals_mm", {})[label] = float(err * 1000)
+        if pickup_refinement:
+            state["pickup_motion_diagnostics"][
+                "motion_refinement"].append({
+                    "stage": label,
+                    "strategy": (
+                        "full_stage_first_pass_then_bounded_corrections"),
+                    "initial_target_error_mm": float(initial_err * 1000),
+                    "error_after_each_move_mm": [
+                        float(value * 1000) for value in trace[1:]],
+                    "move_count": len(motion_steps),
+                    "correction_count": max(0, len(motion_steps) - 1),
+                    "move_steps": motion_steps,
+                    "settle_steps": executed_settle_steps,
+                    "final_target_error_mm": float(err * 1000),
+                    "target_tolerance_mm": float(tol * 1000),
+                })
         if DEBUG_MOVE:
             # 正负号变化 = 闭环在目标两侧来回；单调下降 = 只是慢。
             sign_flips = sum(

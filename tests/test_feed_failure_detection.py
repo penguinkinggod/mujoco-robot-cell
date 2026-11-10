@@ -250,6 +250,9 @@ class ExperimentEnvironmentCaptureTests(unittest.TestCase):
             "SO101_KP": "70",
             "SMOOTH": "0",
             "GRIP_RAMP": "400",
+            "FEED_PICKUP_REFINEMENT": "1",
+            "FEED_TRACE_PICKUP_MOTION": "1",
+            "FEED_WORKPIECE_LIFT_MM": "40",
             "UNRELATED_SETTING": "ignored",
         })
         self.assertEqual({
@@ -258,6 +261,9 @@ class ExperimentEnvironmentCaptureTests(unittest.TestCase):
             "SO101_KP": "70",
             "SMOOTH": "0",
             "GRIP_RAMP": "400",
+            "FEED_PICKUP_REFINEMENT": "1",
+            "FEED_TRACE_PICKUP_MOTION": "1",
+            "FEED_WORKPIECE_LIFT_MM": "40",
         }, captured)
 
     def test_retreat_diagnostics_distinguish_skipped_actions(self):
@@ -513,6 +519,34 @@ class RobotMachineContactTests(unittest.TestCase):
         assert_reproducibility_fields(self, result)
         pickup_motion = result["pickup_motion_diagnostics"]
         self.assertEqual("observed", pickup_motion["status"])
+        self.assertEqual(
+            "full_stage_first_pass_then_bounded_corrections",
+            result["effective_parameters"]["controller"][
+                "pickup_motion_strategy"])
+        self.assertTrue(
+            result["effective_parameters"]["controller"][
+                "pickup_refinement_enabled"])
+        self.assertEqual(
+            ["接近", "侧向进入"],
+            [row["stage"] for row in pickup_motion["motion_refinement"]])
+        self.assertTrue(all(
+            row["correction_count"] <= 2
+            and row["final_target_error_mm"] <= row["target_tolerance_mm"]
+            for row in pickup_motion["motion_refinement"]))
+        self.assertEqual(
+            2.0, result["effective_parameters"]["feed"]["axis_lead_deg"])
+        self.assertEqual(
+            30.0,
+            result["effective_parameters"]["gripper"]["workpiece_lift_mm"])
+        self.assertEqual(-0.10, result["control_mode"]["grip_close_command"])
+        feed_stage = next(
+            row for row in result["stages"]
+            if row["stage"] == "feed_complete")
+        axis = feed_stage["shaft_axis"]
+        expected_pitch = np.degrees(np.arctan2(
+            axis[2], max(1e-9, abs(axis[0]))))
+        self.assertAlmostEqual(
+            expected_pitch, feed_stage["shaft_pitch_signed_deg"], places=8)
         self.assertGreater(pickup_motion["overall"]["samples"], 0)
         self.assertGreaterEqual(
             pickup_motion["overall"]["max_center_displacement_mm"], 0.0)
@@ -723,7 +757,14 @@ class FeedFailureStatusTests(unittest.TestCase):
 
     def test_controlled_quality_failure_is_not_mislabeled_as_abort(self):
         previous_solref = os.environ.get("FEED_V_CONTACT_SOLREF_TIME")
+        previous_axis_lead = feed.AXIS_LEAD_DEG
+        previous_axis_target = feed._AXIS_TGT.copy()
+        previous_pickup_refinement = feed.PICKUP_REFINEMENT
         os.environ["FEED_V_CONTACT_SOLREF_TIME"] = "0.005"
+        feed.AXIS_LEAD_DEG = 1.0
+        feed._AXIS_TGT = np.array([
+            np.cos(np.radians(1.0)), 0.0, np.sin(np.radians(1.0))])
+        feed.PICKUP_REFINEMENT = False
         try:
             exit_code, result = self._run_feed(
                 "test-quality-fail-solref-005",
@@ -736,6 +777,9 @@ class FeedFailureStatusTests(unittest.TestCase):
                 os.environ.pop("FEED_V_CONTACT_SOLREF_TIME", None)
             else:
                 os.environ["FEED_V_CONTACT_SOLREF_TIME"] = previous_solref
+            feed.AXIS_LEAD_DEG = previous_axis_lead
+            feed._AXIS_TGT = previous_axis_target
+            feed.PICKUP_REFINEMENT = previous_pickup_refinement
 
         self.assertEqual(1, exit_code)
         assert_reproducibility_fields(self, result)
@@ -774,6 +818,78 @@ class FeedFailureStatusTests(unittest.TestCase):
             actual["shaft_axis_world_unit"],
             atol=1e-9,
         )
+
+    def test_m1_grasp_target_tracks_a_supported_10mm_height_change(self):
+        previous_lift = feed.LIFT_DZ
+        previous_env = os.environ.get("FEED_WORKPIECE_LIFT_MM")
+        feed.LIFT_DZ = 0.040
+        os.environ["FEED_WORKPIECE_LIFT_MM"] = "40"
+        try:
+            exit_code, result = self._run_feed(
+                "test-m1-height-plus-10mm",
+                v_jaw=True,
+                lift=True,
+                carry_lock=False,
+                planning_mode="M1",
+            )
+        finally:
+            feed.LIFT_DZ = previous_lift
+            if previous_env is None:
+                os.environ.pop("FEED_WORKPIECE_LIFT_MM", None)
+            else:
+                os.environ["FEED_WORKPIECE_LIFT_MM"] = previous_env
+
+        self.assertEqual(0, exit_code)
+        self.assertTrue(result["overall_pass"])
+        self.assertEqual(40.0, result["effective_parameters"]["gripper"][
+            "workpiece_lift_mm"])
+        actual_z = result["actual_initial_pose"]["position_m"][2]
+        target_z = result["inputs"]["grasp_target_pose"][
+            "workpiece_center_m"][2]
+        self.assertAlmostEqual(0.010, actual_z - 0.039812104, places=6)
+        self.assertAlmostEqual(actual_z, target_z, places=9)
+        self.assertEqual(
+            "settled_true_workpiece_center",
+            result["inputs"]["grasp_target_pose"]["position_source"])
+
+    def test_pickup_joint_trace_is_optional_and_captures_arm_motion(self):
+        previous_trace = os.environ.get("FEED_TRACE_PICKUP_MOTION")
+        os.environ["FEED_TRACE_PICKUP_MOTION"] = "1"
+        try:
+            exit_code, result = self._run_feed(
+                "test-pickup-joint-trace",
+                v_jaw=True,
+                lift=True,
+                carry_lock=False,
+                planning_mode="M1",
+            )
+        finally:
+            if previous_trace is None:
+                os.environ.pop("FEED_TRACE_PICKUP_MOTION", None)
+            else:
+                os.environ["FEED_TRACE_PICKUP_MOTION"] = previous_trace
+
+        self.assertEqual(0, exit_code)
+        trace = result["pickup_motion_diagnostics"]
+        self.assertTrue(trace["joint_time_history_enabled"])
+        self.assertEqual(0.002, trace["joint_time_history_sample_interval_s"])
+        rows = trace["joint_time_history"]
+        self.assertGreater(len(rows), 1000)
+        self.assertEqual({"接近", "侧向进入"},
+                         {row["stage"] for row in rows})
+        self.assertTrue(all(
+            len(row["joint_position_rad"]) == 5
+            and len(row["joint_velocity_rad_s"]) == 5
+            and len(row["joint_acceleration_rad_s2"]) == 5
+            and len(row["tool_position_world_m"]) == 3
+            for row in rows))
+        move_labels = {row["move_label"] for row in rows}
+        for move_label in move_labels:
+            times = [row["sim_time_s"] for row in rows
+                     if row["move_label"] == move_label]
+            self.assertTrue(all(
+                abs(delta - 0.002) < 1e-9
+                for delta in np.diff(times)))
 
     def test_initial_settle_steps_must_be_a_nonnegative_integer(self):
         for value in (-1, 1.5, True):
