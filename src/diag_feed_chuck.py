@@ -104,7 +104,7 @@ from demo_08_pick_and_load import (
 )
 
 
-RESULT_SCHEMA_VERSION = 14
+RESULT_SCHEMA_VERSION = 15
 METRIC_SCHEMA_VERSION = 1
 CRITERION_SET_ID = "feed-criteria-v1"
 PLANNING_MODES = ("M0", "M1", "M2")
@@ -2895,7 +2895,9 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         data.qpos[sq + 3:sq + 7] = SHAFT_Q0
         data.qvel[sv:sv + 6] = 0.0
 
-    def record_pickup_joint_frame(sample_phase):
+    pickup_reference_data = {"data": None}
+
+    def record_pickup_joint_frame(sample_phase, q_reference, qd_reference):
         diagnostics = state["pickup_motion_diagnostics"]
         if not diagnostics["joint_time_history_enabled"]:
             return
@@ -2907,6 +2909,33 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         )
         if stage is None:
             return
+        q_reference = np.asarray(q_reference, dtype=float)
+        qd_reference = np.asarray(qd_reference, dtype=float)
+        q_actual = np.asarray(
+            [data.qpos[adr] for adr in arm.qadr], dtype=float)
+        q_control = np.asarray(
+            [data.ctrl[adr] for adr in arm.qadr], dtype=float)
+        if pickup_reference_data["data"] is None:
+            pickup_reference_data["data"] = mujoco.MjData(model)
+        reference_data = pickup_reference_data["data"]
+        reference_data.qpos[:] = data.qpos
+        for adr, value in zip(arm.qadr, q_reference):
+            reference_data.qpos[adr] = value
+        mujoco.mj_forward(model, reference_data)
+        reference_position = reference_data.site_xpos[arm.site].copy()
+        reference_quaternion = np.zeros(4)
+        actual_quaternion = np.zeros(4)
+        mujoco.mju_mat2Quat(
+            reference_quaternion,
+            np.ascontiguousarray(
+                reference_data.site_xmat[arm.site]).reshape(-1))
+        mujoco.mju_mat2Quat(
+            actual_quaternion,
+            np.ascontiguousarray(data.site_xmat[arm.site]).reshape(-1))
+        quaternion_dot = min(
+            1.0, abs(float(np.dot(reference_quaternion, actual_quaternion))))
+        orientation_error_deg = float(np.degrees(
+            2.0 * np.arccos(quaternion_dot)))
         diagnostics["joint_time_history"].append({
             "sim_time_s": float(data.time),
             "stage": stage,
@@ -2914,8 +2943,25 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             "sample_phase": sample_phase,
             "tool_position_world_m": [
                 float(value) for value in data.site_xpos[arm.site]],
-            "joint_position_rad": [
-                float(data.qpos[adr]) for adr in arm.qadr],
+            "tool_reference_position_world_m": [
+                float(value) for value in reference_position],
+            "tool_reference_quaternion_wxyz": [
+                float(value) for value in reference_quaternion],
+            "tool_actual_quaternion_wxyz": [
+                float(value) for value in actual_quaternion],
+            "tool_position_tracking_error_mm": float(
+                np.linalg.norm(data.site_xpos[arm.site]
+                               - reference_position) * 1000.0),
+            "tool_orientation_tracking_error_deg": orientation_error_deg,
+            "joint_reference_position_rad": [
+                float(value) for value in q_reference],
+            "joint_reference_velocity_rad_s": [
+                float(value) for value in qd_reference],
+            "joint_control_position_rad": [
+                float(value) for value in q_control],
+            "joint_position_rad": [float(value) for value in q_actual],
+            "joint_tracking_error_rad": [
+                float(value) for value in q_actual - q_reference],
             "joint_velocity_rad_s": [
                 float(data.qvel[adr]) for adr in arm.dadr],
             "joint_acceleration_rad_s2": [
@@ -3022,20 +3068,20 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 # 三次样条让 v 和 a 都连续，时间律本来就是 quintic，
                 # 两者乘起来才是一条真正光滑的轨迹。
                 q = np.array([_spl[j](s) for j in range(len(arm.qadr))])
+            _dt = float(model.opt.timestep)
+            t2 = min(s1, s0 + (s1 - s0) * (i + 2) / ns)
+            s2 = min(1.0, max(0.0, (_smooth(t2) - S0) / span))
+            if q_path is None:
+                q2 = q_start + s2 * (q_goal - q_start)
+            else:
+                q2 = np.array([_spl[j](s2)
+                               for j in range(len(arm.qadr))])
+            qd_reference = (q2 - q) / _dt
             if ARM_MOVE_LEAD or ARM_MOVE_DAMP:
                 # 参考速度由下一时刻的同一条样条求出，和 move_path() 的
                 # 前馈一致。速度前馈抵掉纯 PD 匀速段 (kv/kp)*qdot 的滞后；
                 # 速度误差阻尼把「实际跟不上参考」时的超调拉回来。
-                _dt = float(model.opt.timestep)
-                t2 = min(s1, s0 + (s1 - s0) * (i + 2) / ns)
-                s2 = min(1.0, max(0.0, (_smooth(t2) - S0) / span))
-                if q_path is None:
-                    q2 = q_start + s2 * (q_goal - q_start)
-                else:
-                    q2 = np.array([_spl[j](s2)
-                                   for j in range(len(arm.qadr))])
-                qd = (q2 - q) / _dt
-                for a, v, w in zip(arm.qadr, q, qd):
+                for a, v, w in zip(arm.qadr, q, qd_reference):
                     data.ctrl[a] = (v + ARM_MOVE_LEAD * w
                                     - ARM_MOVE_DAMP
                                     * (float(data.qvel[a]) - w))
@@ -3046,7 +3092,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             data.ctrl[arm.grip_act] = grip_cmd(gcmd)
             data.ctrl[jaw_act] = jaw_ctrl
             step_sim()
-            record_pickup_joint_frame("trajectory")
+            record_pickup_joint_frame(
+                "trajectory", q, qd_reference)
             state.setdefault("traj", []).append(
                 data.site_xpos[arm.site].copy())
             state.setdefault("traj_t", []).append(float(data.time))
@@ -3080,7 +3127,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             data.ctrl[arm.grip_act] = grip_cmd(final_grip)
             data.ctrl[jaw_act] = jaw_ctrl
             step_sim()
-            record_pickup_joint_frame("settle")
+            record_pickup_joint_frame(
+                "settle", q_goal, np.zeros_like(q_goal))
             state.setdefault("traj", []).append(
                 data.site_xpos[arm.site].copy())
             state.setdefault("traj_t", []).append(float(data.time))

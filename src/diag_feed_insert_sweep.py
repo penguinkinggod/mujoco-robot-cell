@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FEED_SCRIPT = ROOT / "src" / "diag_feed_chuck.py"
 DEFAULT_OUTPUT = ROOT / "_build" / "feed_insert_sweep.csv"
 DEFAULT_INSERTS_MM = (5, 6, 7, 8, 9, 10, 15, 20, 25, 30)
-EXPECTED_SCHEMA_VERSION = 14
+SUPPORTED_SCHEMA_VERSIONS = (14, 15)
 EXPECTED_INITIAL_SETTLE_STEPS = 600
 EXPECTED_INITIAL_STABILITY_WINDOW_STEPS = 100
 CASE_TIMEOUT_SECONDS = 600
@@ -129,10 +129,10 @@ def _result_error(result, case_id, expected_mode=None,
         return "result JSON root must be an object"
     schema_version = result.get("schema_version")
     if (type(schema_version) is not int
-            or schema_version != EXPECTED_SCHEMA_VERSION):
+            or schema_version not in SUPPORTED_SCHEMA_VERSIONS):
         return (
-            "unsupported schema_version: %r (expected %d)"
-            % (schema_version, EXPECTED_SCHEMA_VERSION)
+            "unsupported schema_version: %r (expected one of %s)"
+            % (schema_version, SUPPORTED_SCHEMA_VERSIONS)
         )
     if result.get("case_id") != case_id:
         return "case_id mismatch: expected %s, got %r" % (
@@ -382,7 +382,7 @@ def run_case(insert_mm, json_path, case_id=None, dy_mm=0.0, dz_mm=0.0,
         status = (
             "unsupported_schema"
             if (type(schema_version) is not int
-                    or schema_version != EXPECTED_SCHEMA_VERSION)
+                    or schema_version not in SUPPORTED_SCHEMA_VERSIONS)
             else "invalid_result"
         )
         return _set_error(row, status, invalid_reason, output)

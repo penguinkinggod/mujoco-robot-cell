@@ -99,8 +99,8 @@ class ContactSensitivityTests(unittest.TestCase):
         }
 
     def test_summarizes_vjaw_and_chuck_separately(self):
-        row = summarize_result(
-            self._result(), 0.005, "case.json")
+        result = self._result()
+        row = summarize_result(result, 0.005, "case.json")
 
         self.assertEqual("PASS", row["status"])
         self.assertEqual(
@@ -112,6 +112,11 @@ class ContactSensitivityTests(unittest.TestCase):
         self.assertEqual("三爪稳定", row["chuck_phase"])
         self.assertEqual(0.81, row["chuck_max_penetration_mm"])
         self.assertEqual(14.2, row["chuck_peak_normal_force_N"])
+
+        result["schema_version"] = 15
+        self.assertEqual(
+            "PASS", summarize_result(
+                result, 0.005, "case-v15.json")["status"])
 
     def test_rejects_mismatched_contact_parameter(self):
         result = self._result()
@@ -254,6 +259,12 @@ class ContactSensitivityTests(unittest.TestCase):
         self.assertEqual(-0.4, row["peak_vjaw_min_distance_mm"])
         self.assertEqual(18.0, row["peak_vjaw_normal_force_sum_N"])
         self.assertEqual(1.5, row["feed_peak_mm"])
+
+        result["schema_version"] = 15
+        row = summarize_relative_motion_result(
+            result, "slow_carry", "carry_speed", 0.275,
+            "case-v15.json", "case-v15.log")
+        self.assertEqual(2.0, row["carry_peak_mm"])
 
         result["effective_parameters"]["controller"][
             "carry_v_cruise_m_s"] = 0.55

@@ -153,7 +153,7 @@ class PlanningModeIsolationTests(unittest.TestCase):
 
 
 def assert_reproducibility_fields(test_case, result):
-    test_case.assertEqual(14, result["schema_version"])
+    test_case.assertEqual(15, result["schema_version"])
     test_case.assertIn("pickup_motion_diagnostics", result)
     test_case.assertIn("gripper_relative_workpiece_motion", result)
     test_case.assertEqual(1, result["metric_schema_version"])
@@ -884,7 +884,16 @@ class FeedFailureStatusTests(unittest.TestCase):
             len(row["joint_position_rad"]) == 5
             and len(row["joint_velocity_rad_s"]) == 5
             and len(row["joint_acceleration_rad_s2"]) == 5
+            and len(row["joint_reference_position_rad"]) == 5
+            and len(row["joint_reference_velocity_rad_s"]) == 5
+            and len(row["joint_control_position_rad"]) == 5
+            and len(row["joint_tracking_error_rad"]) == 5
             and len(row["tool_position_world_m"]) == 3
+            and len(row["tool_reference_position_world_m"]) == 3
+            and len(row["tool_reference_quaternion_wxyz"]) == 4
+            and len(row["tool_actual_quaternion_wxyz"]) == 4
+            and row["tool_position_tracking_error_mm"] >= 0.0
+            and row["tool_orientation_tracking_error_deg"] >= 0.0
             for row in rows))
         move_labels = {row["move_label"] for row in rows}
         for move_label in move_labels:
