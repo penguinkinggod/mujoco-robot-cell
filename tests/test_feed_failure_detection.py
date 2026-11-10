@@ -153,7 +153,7 @@ class PlanningModeIsolationTests(unittest.TestCase):
 
 
 def assert_reproducibility_fields(test_case, result):
-    test_case.assertEqual(16, result["schema_version"])
+    test_case.assertEqual(18, result["schema_version"])
     test_case.assertIn("pickup_motion_diagnostics", result)
     test_case.assertIn("gripper_relative_workpiece_motion", result)
     test_case.assertIn("clamp_handover_diagnostics", result)
@@ -161,7 +161,8 @@ def assert_reproducibility_fields(test_case, result):
     test_case.assertEqual("feed-criteria-v1", result["criterion_set_id"])
     test_case.assertTrue(result["case_id"])
     test_case.assertIn(result["execution_status"],
-                       ("completed", "aborted", "error"))
+                       ("completed", "completed_observation",
+                        "aborted", "error"))
     test_case.assertIn("stages", result)
     test_case.assertIn("checkpoints", result)
     test_case.assertIn("contact_diagnostics", result)
@@ -719,6 +720,182 @@ class FeedFailureStatusTests(unittest.TestCase):
                     os.environ["FEED_CASE_ID"] = previous_case_id
             result = json.loads(result_path.read_text(encoding="utf-8"))
         return exit_code, result
+
+    def test_robot_release_can_start_after_triple_chuck_contact(self):
+        keys = (
+            "FEED_TRACE_CLAMP_HANDOVER",
+            "FEED_RELEASE_AFTER_TRIPLE_CONTACT",
+        )
+        previous = {key: os.environ.get(key) for key in keys}
+        os.environ["FEED_TRACE_CLAMP_HANDOVER"] = "1"
+        os.environ["FEED_RELEASE_AFTER_TRIPLE_CONTACT"] = "1"
+        try:
+            exit_code, result = self._run_feed(
+                "test-release-after-triple-contact",
+                v_jaw=True,
+                lift=True,
+                carry_lock=False,
+                planning_mode="M1",
+                initial_settle_steps=600,
+                random_seed=0,
+            )
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.assertIn(exit_code, (0, 1))
+        assert_reproducibility_fields(self, result)
+        release = result["clamp_handover_diagnostics"]["release_control"]
+        self.assertTrue(release["enabled"])
+        self.assertEqual(
+            "after_all_three_chuck_jaws_contact", release["mode"])
+        self.assertEqual(
+            "release_completed_and_final_separation_observed",
+            release["status"])
+        self.assertIsNotNone(release["trigger_time_s"])
+        self.assertTrue(all(
+            count > 0 for count in release["trigger_jaw_contact_points"]))
+        self.assertIsNotNone(release["release_complete_time_s"])
+        self.assertIsNotNone(
+            release["robot_v_jaw_separation_confirmed_time_s"])
+        self.assertTrue(
+            release["robot_v_jaw_contact_reappeared_after_zero_window"])
+        self.assertGreater(
+            release["release_complete_time_s"], release["trigger_time_s"])
+        self.assertEqual(
+            "1",
+            result["environment_overrides"][
+                "FEED_RELEASE_AFTER_TRIPLE_CONTACT"])
+
+    def test_pre_chuck_gripper_release_is_traced_without_workpiece_load(self):
+        keys = (
+            "FEED_TRACE_CLAMP_HANDOVER",
+            "FEED_DIAG_PRECHUCK_GRIP_MODE",
+            "FEED_CLAMP_LIFT",
+            "FEED_BUSHING_ALWAYS",
+            "FEED_HANDOVER_FIRST",
+            "FEED_PRECLAMP",
+            "FEED_RELEASE_AFTER_TRIPLE_CONTACT",
+        )
+        previous = {key: os.environ.get(key) for key in keys}
+        os.environ["FEED_TRACE_CLAMP_HANDOVER"] = "1"
+        os.environ["FEED_DIAG_PRECHUCK_GRIP_MODE"] = "release"
+        os.environ["FEED_CLAMP_LIFT"] = "0"
+        os.environ["FEED_BUSHING_ALWAYS"] = "0"
+        os.environ["FEED_HANDOVER_FIRST"] = "0"
+        os.environ["FEED_PRECLAMP"] = "0"
+        os.environ.pop("FEED_RELEASE_AFTER_TRIPLE_CONTACT", None)
+        try:
+            exit_code, result = self._run_feed(
+                "test-pre-chuck-gripper-release",
+                v_jaw=True,
+                lift=True,
+                carry_lock=False,
+                planning_mode="M1",
+                initial_settle_steps=600,
+                random_seed=0,
+            )
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.assertIn(exit_code, (0, 1))
+        assert_reproducibility_fields(self, result)
+        self.assertEqual("completed_observation", result["execution_status"])
+        self.assertEqual("diagnostic_observation", result["outcome_class"])
+        self.assertIsNone(result["overall_pass"])
+        handover = result["clamp_handover_diagnostics"]
+        pre_chuck = handover["pre_chuck_grip"]
+        self.assertTrue(pre_chuck["enabled"])
+        self.assertEqual("release", pre_chuck["mode"])
+        self.assertEqual("completed", pre_chuck["status"])
+        self.assertEqual(360, pre_chuck["samples"])
+        self.assertLessEqual(
+            pre_chuck["workpiece_external_force_peak_N"], 1e-9)
+        observation = result["diagnostic_observation"]
+        self.assertEqual(0.5, observation["gripper_command_end"])
+        self.assertGreater(
+            observation["robot_v_jaw_contact_points_end"], 0)
+        self.assertGreater(
+            observation["robot_v_jaw_normal_force_sum_end_N"], 0.0)
+        self.assertGreater(observation["bushing_contact_points_end"], 0)
+        self.assertEqual(0, observation["cradle_contact_points_end"])
+        self.assertEqual("recorded", handover["status"])
+        self.assertIsNotNone(pre_chuck["bushing_close_time_s"])
+        self.assertLessEqual(
+            pre_chuck["bushing_close_time_s"],
+            pre_chuck["action_start_time_s"])
+        release_rows = [
+            row for row in handover["time_history"]
+            if row["phase"] == "卡盘前原地松爪"
+        ]
+        self.assertEqual(360, len(release_rows))
+        self.assertGreater(
+            handover["phases"]["卡盘前原地松爪"][
+                "workpiece_fixture_contact_samples"], 0)
+        self.assertFalse(
+            result["diagnostic_observation"]["chuck_closed"])
+        self.assertEqual(0, result["diagnostic_observation"][
+            "chuck_contact_samples"])
+        self.assertIsNone(result["metrics"]["pull_mm"])
+        self.assertEqual(
+            "pre_chuck_grip_release", result["config"]["diagnostic_mode"])
+
+    def test_pre_chuck_gripper_hold_keeps_chuck_open(self):
+        keys = (
+            "FEED_TRACE_CLAMP_HANDOVER",
+            "FEED_DIAG_PRECHUCK_GRIP_MODE",
+            "FEED_CLAMP_LIFT",
+            "FEED_BUSHING_ALWAYS",
+            "FEED_HANDOVER_FIRST",
+            "FEED_PRECLAMP",
+            "FEED_RELEASE_AFTER_TRIPLE_CONTACT",
+        )
+        previous = {key: os.environ.get(key) for key in keys}
+        os.environ["FEED_TRACE_CLAMP_HANDOVER"] = "1"
+        os.environ["FEED_DIAG_PRECHUCK_GRIP_MODE"] = "hold"
+        os.environ["FEED_CLAMP_LIFT"] = "0"
+        os.environ["FEED_BUSHING_ALWAYS"] = "0"
+        os.environ["FEED_HANDOVER_FIRST"] = "0"
+        os.environ["FEED_PRECLAMP"] = "0"
+        os.environ.pop("FEED_RELEASE_AFTER_TRIPLE_CONTACT", None)
+        try:
+            exit_code, result = self._run_feed(
+                "test-pre-chuck-gripper-hold",
+                v_jaw=True,
+                lift=True,
+                carry_lock=False,
+                planning_mode="M1",
+                initial_settle_steps=600,
+                random_seed=0,
+            )
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.assertIn(exit_code, (0, 1))
+        assert_reproducibility_fields(self, result)
+        self.assertEqual("completed_observation", result["execution_status"])
+        observation = result["diagnostic_observation"]
+        self.assertEqual("hold", observation["mode"])
+        self.assertEqual(360, observation["samples"])
+        self.assertAlmostEqual(-0.1, observation["gripper_command_end"])
+        self.assertGreater(
+            observation["robot_v_jaw_contact_points_end"], 0)
+        self.assertEqual(0.0, observation["workpiece_external_force_peak_N"])
+        self.assertFalse(observation["chuck_closed"])
+        self.assertEqual(0, observation["chuck_contact_samples"])
+        self.assertEqual(
+            "recorded", result["clamp_handover_diagnostics"]["status"])
 
     def test_empty_grasp_aborts_and_is_counted_as_attempt(self):
         exit_code, result = self._run_feed(

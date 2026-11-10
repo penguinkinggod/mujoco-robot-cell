@@ -137,6 +137,24 @@ class FeedInsertSweepTests(unittest.TestCase):
         self.assertEqual("PASS", row["status"])
         self.assertEqual(16, row["schema_version"])
 
+    def test_schema_v17_is_accepted(self):
+        result = make_result("sweep-test-case")
+        result["schema_version"] = 17
+
+        row, _ = self._run_case(result)
+
+        self.assertEqual("PASS", row["status"])
+        self.assertEqual(17, row["schema_version"])
+
+    def test_schema_v18_is_accepted(self):
+        result = make_result("sweep-test-case")
+        result["schema_version"] = 18
+
+        row, _ = self._run_case(result)
+
+        self.assertEqual("PASS", row["status"])
+        self.assertEqual(18, row["schema_version"])
+
     def test_result_planning_mode_and_m2_error_must_match_request(self):
         result = make_result("sweep-test-case")
         result["control_mode"]["planning_mode"] = "M2"

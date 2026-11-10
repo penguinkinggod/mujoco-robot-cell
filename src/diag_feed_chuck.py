@@ -104,7 +104,7 @@ from demo_08_pick_and_load import (
 )
 
 
-RESULT_SCHEMA_VERSION = 16
+RESULT_SCHEMA_VERSION = 18
 METRIC_SCHEMA_VERSION = 1
 CRITERION_SET_ID = "feed-criteria-v1"
 PLANNING_MODES = ("M0", "M1", "M2")
@@ -264,7 +264,8 @@ _REPRODUCIBLE_ENV_KEYS = {
     "FEED_CONVERGE", "FEED_CONVERGE_TOL", "FEED_BORE_PROBE",
     "FEED_GRIP_CLOSE", "FEED_DIAG_NO_RETREAT", "SMOOTH",
     "FEED_TRACE_RELATIVE_MOTION", "FEED_TRACE_PICKUP_MOTION",
-    "FEED_TRACE_CLAMP_HANDOVER",
+    "FEED_TRACE_CLAMP_HANDOVER", "FEED_RELEASE_AFTER_TRIPLE_CONTACT",
+    "FEED_DIAG_PRECHUCK_GRIP_MODE",
     "FEED_CARRY_V_CRUISE",
     "FEED_V_JAW_LENGTH_MM",
     "SO101_KP", "SO101_KV", "SM_JAW_BORE_Q", "FEED_DEBUG",
@@ -407,12 +408,15 @@ def _finite_sim_state(qpos, qvel, ctrl, qacc, qfrc_applied,
 def _case_classification(execution_status, evaluation_scope, hard_pass,
                          quality_pass, overall_pass):
     """Separate trial usability and evaluation scope from measured outcome."""
-    trial_data_valid = execution_status in ("completed", "aborted")
+    trial_data_valid = execution_status in (
+        "completed", "aborted", "completed_observation")
     primary_trial = evaluation_scope == "primary_physics_feed"
     if execution_status == "error":
         outcome_class = "runtime_error"
     elif execution_status == "aborted":
         outcome_class = "aborted"
+    elif execution_status == "completed_observation":
+        outcome_class = "diagnostic_observation"
     elif not primary_trial:
         prefix = ("reference" if evaluation_scope
                   == "kinematic_lock_reference" else "diagnostic")
@@ -1833,13 +1837,49 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     # 定案交接（实体导套 + 先松爪 + 渐变卸载）只给「真实交接的全物理
     # V 槽路径」。历史基线 / 官方 env 场景是独立对照，保持旧行为。
     tuned = bool(bushing_ids) and v_jaw and lift and not carry_lock
+    release_after_triple_contact = (
+        os.environ.get("FEED_RELEASE_AFTER_TRIPLE_CONTACT") == "1")
+    pre_chuck_grip_mode = os.environ.get(
+        "FEED_DIAG_PRECHUCK_GRIP_MODE", "off").strip().lower()
+    if pre_chuck_grip_mode not in ("off", "hold", "release"):
+        raise ValueError(
+            "FEED_DIAG_PRECHUCK_GRIP_MODE must be off, hold, or release")
+    if pre_chuck_grip_mode != "off" and (
+            not tuned or HANDOVER_FIRST or PRECLAMP
+            or release_after_triple_contact):
+        raise ValueError(
+            "FEED_DIAG_PRECHUCK_GRIP_MODE requires the tuned physical "
+            "V-jaw feed with default handover, no preclamp, and no "
+            "post-contact release diagnostic")
+    if pre_chuck_grip_mode != "off" and (
+            CLAMP_LIFT != 0.0 or BUSHING_ALWAYS):
+        raise ValueError(
+            "FEED_DIAG_PRECHUCK_GRIP_MODE requires "
+            "FEED_CLAMP_LIFT=0 and FEED_BUSHING_ALWAYS=0")
+    if (pre_chuck_grip_mode != "off"
+            and os.environ.get("FEED_TRACE_CLAMP_HANDOVER") != "1"):
+        raise ValueError(
+            "FEED_DIAG_PRECHUCK_GRIP_MODE requires "
+            "FEED_TRACE_CLAMP_HANDOVER=1")
+    if release_after_triple_contact and (
+            not tuned or HANDOVER_FIRST or PRECLAMP):
+        raise ValueError(
+            "FEED_RELEASE_AFTER_TRIPLE_CONTACT requires the tuned physical "
+            "V-jaw feed with default handover and no preclamp")
+    if (release_after_triple_contact
+            and os.environ.get("FEED_TRACE_CLAMP_HANDOVER") != "1"):
+        raise ValueError(
+            "FEED_RELEASE_AFTER_TRIPLE_CONTACT requires "
+            "FEED_TRACE_CLAMP_HANDOVER=1")
     # 新交接行为（去托力、锚定、托架）只给真实交接路径；历史基线与官方
     # env 场景保持旧行为，作为独立对照。
     _lift = CLAMP_LIFT if tuned else 1.0
     no_retreat_diagnostic = (
         os.environ.get("FEED_DIAG_NO_RETREAT") == "1")
     diagnostic_mode = (
-        "stationary_after_release" if no_retreat_diagnostic
+        "pre_chuck_grip_%s" % pre_chuck_grip_mode
+        if pre_chuck_grip_mode != "off"
+        else "stationary_after_release" if no_retreat_diagnostic
         else "no_axial_retreat" if not RETREAT_AXIAL else "standard")
     primary_protocol = (
         tuned and machine_solid and diagnostic_mode == "standard")
@@ -2155,9 +2195,11 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         return contacts, force
 
     clamp_handover_phases = {
+        "卡盘前保持夹持", "卡盘前原地松爪",
         "先松夹爪", "端面就位", "低压预夹", "端面顶正",
         "三爪拧紧", "三爪稳定", "卸载托力", "原地松爪",
-        "原地松爪后等待", "轴向退出", "侧向撤离",
+        "三爪接触后松爪", "原地松爪后等待",
+        "提前松爪后保持", "轴向退出", "侧向撤离",
     }
     clamp_handover_trace_enabled = (
         os.environ.get("FEED_TRACE_CLAMP_HANDOVER") == "1")
@@ -2175,6 +2217,24 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         }
         for index in range(3)
     }
+    def chuck_jaw_contact_counts():
+        counts = [0, 0, 0]
+        for contact_id in range(data.ncon):
+            contact = data.contact[contact_id]
+            geom_pair = (int(contact.geom1), int(contact.geom2))
+            if not any(geom_id in shaft_geoms for geom_id in geom_pair):
+                continue
+            other_geom_id = next(
+                (geom_id for geom_id in geom_pair
+                 if geom_id not in shaft_geoms), None)
+            if other_geom_id is None:
+                continue
+            for jaw_index, jaw_geom_ids in chuck_jaw_geom_ids.items():
+                if other_geom_id in jaw_geom_ids:
+                    counts[jaw_index] += 1
+                    break
+        return counts
+
     robot_v_jaw_geom_ids = {
         geom_id for geom_id in robot_geom_ids
         if (mujoco.mj_id2name(
@@ -2202,6 +2262,10 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             "robot_workpiece_peak_normal_force_sum_N": 0.0,
             "workpiece_fixture_contact_samples": 0,
             "workpiece_fixture_peak_normal_force_sum_N": 0.0,
+            "workpiece_bushing_contact_samples": 0,
+            "workpiece_bushing_peak_normal_force_sum_N": 0.0,
+            "workpiece_cradle_contact_samples": 0,
+            "workpiece_cradle_peak_normal_force_sum_N": 0.0,
             "robot_v_jaw_contact_samples": 0,
             "robot_v_jaw_peak_normal_force_sum_N": 0.0,
             "robot_v_jaw_first_contact_time_s": None,
@@ -2257,6 +2321,10 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         robot_v_force_sum = 0.0
         fixture_contact_points = 0
         fixture_force_sum = 0.0
+        bushing_contact_points = 0
+        bushing_force_sum = 0.0
+        cradle_contact_points = 0
+        cradle_force_sum = 0.0
 
         for contact_id in range(data.ncon):
             contact = data.contact[contact_id]
@@ -2293,6 +2361,12 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                     contact_geom_sets) == "workpiece_fixture":
                 fixture_contact_points += 1
                 fixture_force_sum += normal_force
+                if other_name.startswith("bushing_"):
+                    bushing_contact_points += 1
+                    bushing_force_sum += normal_force
+                elif other_name.startswith("cradle_"):
+                    cradle_contact_points += 1
+                    cradle_force_sum += normal_force
 
         row = {
             "sim_time_s": float(data.time),
@@ -2339,10 +2413,41 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             "robot_v_jaw_normal_force_sum_N": float(robot_v_force_sum),
             "workpiece_fixture_contact_points": int(fixture_contact_points),
             "workpiece_fixture_normal_force_sum_N": float(fixture_force_sum),
+            "workpiece_bushing_contact_points": int(bushing_contact_points),
+            "workpiece_bushing_normal_force_sum_N": float(bushing_force_sum),
+            "workpiece_cradle_contact_points": int(cradle_contact_points),
+            "workpiece_cradle_normal_force_sum_N": float(cradle_force_sum),
             "arm_gripper_command": float(data.ctrl[arm.grip_act]),
             "arm_pad_center_world_m": [
                 float(value) for value in arm.pad_center()],
         }
+        release_control = diagnostics["release_control"]
+        if (release_control["enabled"]
+                and release_control["trigger_time_s"] is not None):
+            if robot_v_contact_points == 0:
+                if release_control["zero_contact_run_samples"] == 0:
+                    release_control["zero_contact_run_start_time_s"] = (
+                        float(data.time))
+                release_control["zero_contact_run_samples"] += 1
+                if (release_control[
+                        "robot_v_jaw_separation_confirmed_time_s"] is None
+                        and release_control[
+                            "zero_contact_run_samples"] >= 10):
+                    release_control[
+                        "robot_v_jaw_separation_confirmed_time_s"] = (
+                            release_control[
+                                "zero_contact_run_start_time_s"])
+            else:
+                if (release_control[
+                        "robot_v_jaw_separation_confirmed_time_s"]
+                        is not None):
+                    release_control[
+                        "robot_v_jaw_contact_reappeared_after_zero_window"] = (
+                            True)
+                release_control[
+                    "robot_v_jaw_separation_confirmed_time_s"] = None
+                release_control["zero_contact_run_samples"] = 0
+                release_control["zero_contact_run_start_time_s"] = None
         diagnostics["time_history"].append(row)
         diagnostics["status"] = "recording"
 
@@ -2393,6 +2498,16 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             summary["workpiece_fixture_peak_normal_force_sum_N"] = max(
                 summary["workpiece_fixture_peak_normal_force_sum_N"],
                 fixture_force_sum)
+            if bushing_contact_points:
+                summary["workpiece_bushing_contact_samples"] += 1
+            summary["workpiece_bushing_peak_normal_force_sum_N"] = max(
+                summary["workpiece_bushing_peak_normal_force_sum_N"],
+                bushing_force_sum)
+            if cradle_contact_points:
+                summary["workpiece_cradle_contact_samples"] += 1
+            summary["workpiece_cradle_peak_normal_force_sum_N"] = max(
+                summary["workpiece_cradle_peak_normal_force_sum_N"],
+                cradle_force_sum)
             if robot_v_contact_points:
                 summary["robot_v_jaw_contact_samples"] += 1
                 if summary["robot_v_jaw_first_contact_time_s"] is None:
@@ -2416,6 +2531,29 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 jaw_summary["peak_normal_force_sum_N"] = max(
                     jaw_summary["peak_normal_force_sum_N"],
                     values["normal_force_sum_N"])
+
+    def set_clamp_handover_reference():
+        diagnostics = state["clamp_handover_diagnostics"]
+        if (not diagnostics["enabled"]
+                or diagnostics["reference_shaft_center_world_m"] is not None):
+            return
+        shaft_position = shaft()
+        shaft_axis = rod_axis()
+        pad_position = arm.pad_center()
+        tool_rotation = data.site_xmat[arm.site].reshape(3, 3)
+        offset_tool, axis_tool = _pose_in_tool_frame(
+            tool_rotation, shaft_position, pad_position, shaft_axis)
+        diagnostics["reference_shaft_center_world_m"] = [
+            float(value) for value in shaft_position]
+        diagnostics["reference_shaft_axis_world_unit"] = [
+            float(value) for value in shaft_axis]
+        diagnostics["reference_arm_pad_center_world_m"] = [
+            float(value) for value in pad_position]
+        diagnostics["reference_shaft_center_offset_tool_m"] = [
+            float(value) for value in offset_tool]
+        diagnostics["reference_shaft_axis_tool_unit"] = [
+            float(value) for value in axis_tool]
+        diagnostics["status"] = "ready"
 
     def sleeve_state():
         """实体导套与棒料的接触数/法向力：径向约束是否真的在受力。"""
@@ -2567,6 +2705,40 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                  "reference_arm_pad_center_world_m": None,
                  "reference_shaft_center_offset_tool_m": None,
                  "reference_shaft_axis_tool_unit": None,
+                 "pre_chuck_grip": {
+                     "enabled": pre_chuck_grip_mode != "off",
+                     "mode": pre_chuck_grip_mode,
+                     "action_start_time_s": None,
+                     "action_complete_time_s": None,
+                     "bushing_close_time_s": None,
+                     "samples": 0,
+                     "workpiece_external_force_peak_N": 0.0,
+                     "status": (
+                         "awaiting_handover_reference"
+                         if pre_chuck_grip_mode != "off"
+                         else "not_enabled"),
+                 },
+                 "release_control": {
+                     "mode": (
+                         "after_all_three_chuck_jaws_contact"
+                         if release_after_triple_contact
+                         else "after_clamp_and_stability"),
+                     "enabled": release_after_triple_contact,
+                     "trigger_time_s": None,
+                     "trigger_shaft_center_world_m": None,
+                     "trigger_jaw_contact_points": None,
+                     "ramp_step_count": 0,
+                     "release_complete_time_s": None,
+                     "robot_v_jaw_separation_confirmed_time_s": None,
+                     "robot_v_jaw_contact_reappeared_after_zero_window": (
+                         False),
+                     "zero_contact_run_start_time_s": None,
+                     "zero_contact_run_samples": 0,
+                     "status": (
+                         "awaiting_three_jaw_contact"
+                         if release_after_triple_contact
+                         else "default_schedule"),
+                 },
                  "time_history": [],
                  "overall": new_clamp_handover_summary(),
                  "phases": {},
@@ -2733,6 +2905,10 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                      "clamp_anchor": bool(CLAMP_ANCHOR),
                      "clamp_lift": float(CLAMP_LIFT),
                      "handover_first": bool(HANDOVER_FIRST),
+                     "pre_chuck_grip_mode": pre_chuck_grip_mode,
+                     "release_after_triple_contact": bool(
+                         release_after_triple_contact),
+                     "robot_release_ramp_steps": 360,
                      "seat_stiffness": float(SEAT_K),
                      "seat_damping": float(SEAT_C),
                      "seat_dwell_steps": int(SEAT_DWELL),
@@ -2786,6 +2962,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                      RETREAT_AXIAL and not no_retreat_diagnostic),
                  "diagnostic_mode": diagnostic_mode,
              }}
+    release_control = state["clamp_handover_diagnostics"][
+        "release_control"]
 
     robot_machine_peaks = {}
 
@@ -4372,6 +4550,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         print("  卡爪夹紧(锁) 轴=%s 同轴=%5.2f mm 接触=%d"
               % (np.round(shaft(), 4), coax(), jaw_state()[0]))
     else:
+        pre_chuck_z_min = float(shaft()[2])
+        pre_chuck_z_max = float(shaft()[2])
         # 真实交接，全程不写 qpos。顺序不能反：
         #   1) 夹爪先别松 —— 工件还要靠它托着
         #   2) 三爪咬上去（自由端前 INSERT_MM 在爪里，夹爪夹着尾段，
@@ -4427,6 +4607,171 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                       % (" ".join("%+.2f" % v for v in _trail),
                          rod_pitch(), len(_trail)))
             close_bushing()
+            if pre_chuck_grip_mode != "off":
+                state["clamp_handover_diagnostics"][
+                    "pre_chuck_grip"]["bushing_close_time_s"] = float(
+                        data.time)
+            if pre_chuck_grip_mode != "off":
+                if CLAMP_ANCHOR:
+                    for _a in arm.qadr:
+                        data.ctrl[_a] = float(data.qpos[_a])
+                set_clamp_handover_reference()
+                pre_chuck_grip_diagnostics = (
+                    state["clamp_handover_diagnostics"]["pre_chuck_grip"])
+                pre_chuck_grip_diagnostics["action_start_time_s"] = float(
+                    data.time)
+                pre_chuck_grip_diagnostics["status"] = "running"
+                print("  诊断对照    导套闭合后、卡盘闭合前%s 360 步"
+                      "，保持卡盘张开"
+                      % ("保持夹持" if pre_chuck_grip_mode == "hold"
+                         else "原地松爪"))
+                for i in range(360):
+                    if pre_chuck_grip_mode == "release":
+                        t = (i + 1) / 360.0
+                        s = t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
+                        grip_direct(
+                            grip_close + s * (GRIP_OPEN - grip_close))
+                        phase = "卡盘前原地松爪"
+                    else:
+                        data.ctrl[arm.grip_act] = grip_cmd(grip_close)
+                        phase = "卡盘前保持夹持"
+                    data.ctrl[jaw_act] = SM.CHUCK_OPEN_CTRL
+                    step_sim(phase)
+                    pre_chuck_grip_diagnostics["samples"] += 1
+                    pre_chuck_grip_diagnostics[
+                        "workpiece_external_force_peak_N"] = max(
+                            pre_chuck_grip_diagnostics[
+                                "workpiece_external_force_peak_N"],
+                            float(np.max(np.abs(
+                                data.qfrc_applied[sv:sv + 3]))))
+                    pre_chuck_z_min = min(pre_chuck_z_min, float(shaft()[2]))
+                    pre_chuck_z_max = max(pre_chuck_z_max, float(shaft()[2]))
+                    state.setdefault("traj", []).append(
+                        data.site_xpos[arm.site].copy())
+                    state.setdefault("traj_label", []).append(phase)
+                    state.setdefault("traj_t", []).append(float(data.time))
+                    track_pen(phase)
+                    if frame_hook is not None and i % FRAME_EVERY == 0:
+                        tick()
+                if pre_chuck_grip_mode == "release":
+                    clamp_grip = GRIP_OPEN
+                pre_chuck_grip_diagnostics[
+                    "action_complete_time_s"] = float(data.time)
+                pre_chuck_grip_diagnostics["status"] = "completed"
+                print("  诊断记录    棒料外加力峰值=%.3f N，松爪后保持%s"
+                      % (pre_chuck_grip_diagnostics[
+                          "workpiece_external_force_peak_N"],
+                         "张开" if pre_chuck_grip_mode == "release"
+                         else "闭合"))
+                if CLAMP_ANCHOR:
+                    for _a in arm.qadr:
+                        data.ctrl[_a] = float(data.qpos[_a])
+                phase_name = (
+                    "卡盘前原地松爪" if pre_chuck_grip_mode == "release"
+                    else "卡盘前保持夹持")
+                phase_summary = state["clamp_handover_diagnostics"][
+                    "phases"][phase_name]
+                last_sample = state["clamp_handover_diagnostics"][
+                    "time_history"][-1]
+                state["clamp_handover_diagnostics"]["status"] = "recorded"
+                record_stage("pre_chuck_grip_observation")
+                observation = {
+                    "mode": pre_chuck_grip_mode,
+                    "samples": int(phase_summary["samples"]),
+                    "duration_s": float(
+                        pre_chuck_grip_diagnostics[
+                            "action_complete_time_s"]
+                        - pre_chuck_grip_diagnostics[
+                            "action_start_time_s"]),
+                    "max_center_displacement_mm": float(
+                        phase_summary[
+                            "max_shaft_center_displacement_mm"]),
+                    "time_of_max_center_displacement_s": (
+                        phase_summary[
+                            "time_of_max_shaft_center_displacement_s"]),
+                    "max_axis_change_deg": float(
+                        phase_summary["max_shaft_axis_change_deg"]),
+                    "robot_v_jaw_contact_samples": int(
+                        phase_summary["robot_v_jaw_contact_samples"]),
+                    "bushing_contact_samples": int(
+                        phase_summary["workpiece_bushing_contact_samples"]),
+                    "cradle_contact_samples": int(
+                        phase_summary["workpiece_cradle_contact_samples"]),
+                    "fixture_contact_samples": int(
+                        phase_summary["workpiece_fixture_contact_samples"]),
+                    "gripper_command_end": float(
+                        last_sample["arm_gripper_command"]),
+                    "robot_v_jaw_contact_points_end": int(
+                        last_sample["robot_v_jaw_contact_points"]),
+                    "robot_v_jaw_normal_force_sum_end_N": float(
+                        last_sample["robot_v_jaw_normal_force_sum_N"]),
+                    "bushing_contact_points_end": int(
+                        last_sample["workpiece_bushing_contact_points"]),
+                    "bushing_normal_force_sum_end_N": float(
+                        last_sample["workpiece_bushing_normal_force_sum_N"]),
+                    "cradle_contact_points_end": int(
+                        last_sample["workpiece_cradle_contact_points"]),
+                    "workpiece_external_force_peak_N": float(
+                        pre_chuck_grip_diagnostics[
+                            "workpiece_external_force_peak_N"]),
+                    "chuck_closed": False,
+                    "chuck_contact_samples": 0,
+                    "diagnostic_only": True,
+                }
+                result = {
+                    "schema_version": RESULT_SCHEMA_VERSION,
+                    "case_id": state["case_id"],
+                    "random_seed": state["random_seed"],
+                    "created_at_unix": time.time(),
+                    "duration_s": time.perf_counter() - started_at,
+                    "platform": platform.platform(),
+                    "python": platform.python_version(),
+                    "mujoco": getattr(mujoco, "__version__", "unknown"),
+                    "config": state["config"],
+                    "execution_status": "completed_observation",
+                    "diagnostic_observation": observation,
+                    "metrics": {
+                        "coax_mm": None,
+                        "tilt_deg": None,
+                        "contacts": None,
+                        "slip_mm": None,
+                        "pull_mm": None,
+                        "jaw_force_N": None,
+                        "grasp_tilt_deg": grasp_tilt,
+                        "grasp_contact_count": state.get(
+                            "grasp_contact_count"),
+                        "clamp_swing_mm": None,
+                        "stock_ecc_mm": None,
+                        "rod_external_force_max_N": float(
+                            state.get("rod_force_max", 0.0)),
+                    },
+                    "hard_pass": None,
+                    "quality_pass": None,
+                    "overall_pass": None,
+                    "hard_failures": [],
+                    "quality_failures": [],
+                    "phase_stats": state.get("phase_stats", {}),
+                    **_diagnostic_result_fields(state),
+                    "ik_solver": state.get("ik_solver", []),
+                    "ik_residuals_mm": state.get("ik_residuals_mm", {}),
+                    "stages": state.get("stage_records", []),
+                    "checkpoints": state.get("checkpoints", []),
+                }
+                result.update(_case_classification(
+                    result["execution_status"], evaluation_scope,
+                    result["hard_pass"], result["quality_pass"],
+                    result["overall_pass"]))
+                write_result_json(result)
+                print(
+                    "FEED_PRECHUCK_OBSERVATION mode=%s samples=%d "
+                    "max_center_mm=%.3f robot_contact=%d fixture_contact=%d "
+                    "external_force_N=%.3f chuck=not_closed"
+                    % (observation["mode"], observation["samples"],
+                       observation["max_center_displacement_mm"],
+                       observation["robot_v_jaw_contact_samples"],
+                       observation["fixture_contact_samples"],
+                       observation["workpiece_external_force_peak_N"]))
+                return 0
         if ARM_KP_SCALE != 1.0:
             set_arm_stiff(ARM_KP_SCALE)
             print("  伺服刚度    kp x%.1f（%.1f -> %.1f N·m/rad）"
@@ -4484,33 +4829,64 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                   % (_used, _qvel, coax()))
         # 交接起点在进给到位时取，两种顺序共用同一基准，夹紧瞬态才可比。
         clamp_p0 = shaft().copy()
-        if clamp_handover_trace_enabled:
-            clamp_diagnostics = state["clamp_handover_diagnostics"]
-            clamp_axis0 = rod_axis()
-            clamp_pad0 = arm.pad_center()
-            clamp_rotation0 = data.site_xmat[arm.site].reshape(3, 3)
-            clamp_offset_tool0, clamp_axis_tool0 = _pose_in_tool_frame(
-                clamp_rotation0, clamp_p0, clamp_pad0, clamp_axis0)
-            clamp_diagnostics["reference_shaft_center_world_m"] = [
-                float(value) for value in clamp_p0]
-            clamp_diagnostics["reference_shaft_axis_world_unit"] = [
-                float(value) for value in clamp_axis0]
-            clamp_diagnostics["reference_arm_pad_center_world_m"] = [
-                float(value) for value in clamp_pad0]
-            clamp_diagnostics["reference_shaft_center_offset_tool_m"] = [
-                float(value) for value in clamp_offset_tool0]
-            clamp_diagnostics["reference_shaft_axis_tool_unit"] = [
-                float(value) for value in clamp_axis_tool0]
-            clamp_diagnostics["status"] = "ready"
+        if (clamp_handover_trace_enabled
+                and state["clamp_handover_diagnostics"][
+                    "reference_shaft_center_world_m"] is None):
+            set_clamp_handover_reference()
         if CLAMP_ANCHOR and tuned:
             for _a in arm.qadr:
                 data.ctrl[_a] = float(data.qpos[_a])
             print("  终点锚定    伺服目标同步到实际角（不再追 IK 残差）")
         seat_x0 = float(clamp_p0[0])
-        clamp_z_min = clamp_p0[2]
-        clamp_z_max = clamp_p0[2]
+        clamp_z_min = min(clamp_p0[2], pre_chuck_z_min)
+        clamp_z_max = max(clamp_p0[2], pre_chuck_z_max)
         jaw_from = SM.CHUCK_OPEN_CTRL
-        clamp_grip = grip_close
+        clamp_grip = (
+            GRIP_OPEN if pre_chuck_grip_mode == "release" else grip_close)
+        release_ramp_steps = 360
+
+        def command_handover_gripper():
+            if (release_control["enabled"]
+                    and release_control["trigger_time_s"] is not None):
+                ramp_step = release_control["ramp_step_count"]
+                if ramp_step < release_ramp_steps:
+                    ramp_step += 1
+                    t = ramp_step / float(release_ramp_steps)
+                    s = t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
+                    release_control["ramp_step_count"] = ramp_step
+                    grip_direct(
+                        clamp_grip + s * (GRIP_OPEN - clamp_grip))
+                    return "三爪接触后松爪"
+                grip_direct(GRIP_OPEN)
+                return "提前松爪后保持"
+            data.ctrl[arm.grip_act] = grip_cmd(clamp_grip)
+            return None
+
+        def observe_triple_jaw_contact():
+            if (not release_control["enabled"]
+                    or release_control["trigger_time_s"] is not None):
+                return
+            counts = chuck_jaw_contact_counts()
+            if not all(count > 0 for count in counts):
+                return
+            release_control["trigger_time_s"] = float(data.time)
+            release_control["trigger_shaft_center_world_m"] = [
+                float(value) for value in shaft()]
+            release_control["trigger_jaw_contact_points"] = counts
+            release_control["status"] = "opening_after_triple_contact"
+            print("  诊断松爪    三只卡盘爪同时接触，开始原地松爪；"
+                  "接触点=%s t=%.3f s"
+                  % (counts, float(data.time)))
+
+        def mark_release_complete():
+            if (release_control["enabled"]
+                    and release_control["trigger_time_s"] is not None
+                    and release_control["ramp_step_count"]
+                    >= release_ramp_steps
+                    and release_control["release_complete_time_s"] is None):
+                release_control["release_complete_time_s"] = float(data.time)
+                release_control["status"] = "release_completed"
+
         if tuned and HANDOVER_FIRST:
             # 文献顺序：卡爪闭合【之前】先松开夹爪，手臂原地不动并保持
             # soft floating；料由竖直托力 + 轴向端面弹簧定位托住，不会掉。
@@ -4621,18 +4997,21 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             s = t * t * (3.0 - 2.0 * t)
             data.ctrl[jaw_act] = (jaw_from
                                   + s * (SM.CHUCK_CLAMP_CTRL - jaw_from))
-            data.ctrl[arm.grip_act] = grip_cmd(clamp_grip)
+            release_phase = command_handover_gripper()
             seat_rod(seat_x0)
             float_arm()
-            step_sim("三爪拧紧")
+            clamp_phase = release_phase or "三爪拧紧"
+            step_sim(clamp_phase)
+            observe_triple_jaw_contact()
+            mark_release_complete()
             clamp_p = shaft()
             clamp_z_min = min(clamp_z_min, float(clamp_p[2]))
             clamp_z_max = max(clamp_z_max, float(clamp_p[2]))
             state.setdefault("traj", []).append(
                 data.site_xpos[arm.site].copy())
-            state.setdefault("traj_label", []).append("三爪拧紧")
+            state.setdefault("traj_label", []).append(clamp_phase)
             state.setdefault("traj_t", []).append(float(data.time))
-            track_pen("三爪拧紧")
+            track_pen(clamp_phase)
             _a, _r, _rel = clamp_stat()
             if _seat_pads is not None and i % 10 == 0 and i <= 200:
                 _gap = (np.mean(data.geom_xpos[_seat_pads[1]], axis=0)
@@ -4657,18 +5036,21 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         # the later gravity-slip measurement.
         for _ in range(300):
             data.ctrl[jaw_act] = SM.CHUCK_CLAMP_CTRL
-            data.ctrl[arm.grip_act] = grip_cmd(clamp_grip)
+            release_phase = command_handover_gripper()
             seat_rod(seat_x0)
             float_arm()
-            step_sim("三爪稳定")
+            clamp_phase = release_phase or "三爪稳定"
+            step_sim(clamp_phase)
+            observe_triple_jaw_contact()
+            mark_release_complete()
             clamp_p = shaft()
             clamp_z_min = min(clamp_z_min, float(clamp_p[2]))
             clamp_z_max = max(clamp_z_max, float(clamp_p[2]))
             state.setdefault("traj", []).append(
                 data.site_xpos[arm.site].copy())
-            state.setdefault("traj_label", []).append("三爪稳定")
+            state.setdefault("traj_label", []).append(clamp_phase)
             state.setdefault("traj_t", []).append(float(data.time))
-            track_pen("三爪稳定")
+            track_pen(clamp_phase)
             _a, _r, _rel = clamp_stat()
         clamp_p = shaft()
         nc, fN = jaw_state()
@@ -4750,24 +5132,49 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         # 三爪夹住之后，机械臂先【原地】松开夹爪，等 V 槽刀片完全脱离，
         # 再移走。边松边退会让还没脱离的刀片横向刮着棒料，把工件从卡爪
         # 里带出去（实测同轴 1.6 mm -> 283 mm，工件直接被带飞）。
-        for i in range(360):
-            t = (i + 1) / 360
-            s = t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
-            data.ctrl[jaw_act] = SM.CHUCK_CLAMP_CTRL
-            grip_direct(clamp_grip + s * (GRIP_OPEN - clamp_grip))
-            step_sim("原地松爪")
-            _z = float(shaft()[2])
-            clamp_z_min = min(clamp_z_min, _z)
-            clamp_z_max = max(clamp_z_max, _z)
-            state.setdefault("traj", []).append(
-                data.site_xpos[arm.site].copy())
-            state.setdefault("traj_label", []).append("原地松爪")
-            state.setdefault("traj_t", []).append(float(data.time))
-            track_pen("原地松爪")
-            if frame_hook is not None and i % FRAME_EVERY == 0:
-                tick()
+        if (release_control["enabled"]
+                and release_control["trigger_time_s"] is not None):
+            for i in range(360):
+                release_phase = command_handover_gripper()
+                data.ctrl[jaw_act] = SM.CHUCK_CLAMP_CTRL
+                phase = release_phase or "提前松爪后保持"
+                step_sim(phase)
+                mark_release_complete()
+                _z = float(shaft()[2])
+                clamp_z_min = min(clamp_z_min, _z)
+                clamp_z_max = max(clamp_z_max, _z)
+                state.setdefault("traj", []).append(
+                    data.site_xpos[arm.site].copy())
+                state.setdefault("traj_label", []).append(phase)
+                state.setdefault("traj_t", []).append(float(data.time))
+                track_pen(phase)
+                if frame_hook is not None and i % FRAME_EVERY == 0:
+                    tick()
+        else:
+            if release_control["enabled"]:
+                release_control["status"] = (
+                    "three_jaw_trigger_not_reached_default_release")
+            for i in range(360):
+                t = (i + 1) / 360
+                s = t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
+                data.ctrl[jaw_act] = SM.CHUCK_CLAMP_CTRL
+                grip_direct(clamp_grip + s * (GRIP_OPEN - clamp_grip))
+                step_sim("原地松爪")
+                _z = float(shaft()[2])
+                clamp_z_min = min(clamp_z_min, _z)
+                clamp_z_max = max(clamp_z_max, _z)
+                state.setdefault("traj", []).append(
+                    data.site_xpos[arm.site].copy())
+                state.setdefault("traj_label", []).append("原地松爪")
+                state.setdefault("traj_t", []).append(float(data.time))
+                track_pen("原地松爪")
+                if frame_hook is not None and i % FRAME_EVERY == 0:
+                    tick()
         settle(120, SM.CHUCK_CLAMP_CTRL, GRIP_OPEN,
-               clamp_trace_phase="原地松爪后等待")
+               clamp_trace_phase=(
+                   "提前松爪后保持" if release_control["enabled"]
+                   and release_control["trigger_time_s"] is not None
+                   else "原地松爪后等待"))
         if clamp_handover_trace_enabled:
             state["clamp_handover_diagnostics"]["status"] = "recorded"
         release_p = shaft()
@@ -4887,6 +5294,19 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     z0 = shaft()[2]
     settle(800, SM.CHUCK_CLAMP_CTRL, GRIP_OPEN)
     slip = abs(z0 - shaft()[2]) * 1000
+    if release_control["enabled"]:
+        if release_control["trigger_time_s"] is None:
+            release_control["status"] = (
+                "three_jaw_trigger_not_reached_default_release")
+        elif release_control["release_complete_time_s"] is None:
+            release_control["status"] = "release_ramp_incomplete"
+        elif release_control[
+                "robot_v_jaw_separation_confirmed_time_s"] is None:
+            release_control["status"] = (
+                "release_completed_separation_not_confirmed")
+        else:
+            release_control["status"] = (
+                "release_completed_and_final_separation_observed")
     x0 = shaft()[0]
     state["diagnostic_scope"] = "pull_test"
     for i in range(700):
