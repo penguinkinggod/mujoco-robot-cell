@@ -118,6 +118,11 @@ class ContactSensitivityTests(unittest.TestCase):
             "PASS", summarize_result(
                 result, 0.005, "case-v15.json")["status"])
 
+        result["schema_version"] = 16
+        self.assertEqual(
+            "PASS", summarize_result(
+                result, 0.005, "case-v16.json")["status"])
+
     def test_rejects_mismatched_contact_parameter(self):
         result = self._result()
         result["penetration_diagnostics"]["by_phase"]["搬运"][

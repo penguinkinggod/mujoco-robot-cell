@@ -153,9 +153,10 @@ class PlanningModeIsolationTests(unittest.TestCase):
 
 
 def assert_reproducibility_fields(test_case, result):
-    test_case.assertEqual(15, result["schema_version"])
+    test_case.assertEqual(16, result["schema_version"])
     test_case.assertIn("pickup_motion_diagnostics", result)
     test_case.assertIn("gripper_relative_workpiece_motion", result)
+    test_case.assertIn("clamp_handover_diagnostics", result)
     test_case.assertEqual(1, result["metric_schema_version"])
     test_case.assertEqual("feed-criteria-v1", result["criterion_set_id"])
     test_case.assertTrue(result["case_id"])

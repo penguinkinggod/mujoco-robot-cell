@@ -104,7 +104,7 @@ from demo_08_pick_and_load import (
 )
 
 
-RESULT_SCHEMA_VERSION = 15
+RESULT_SCHEMA_VERSION = 16
 METRIC_SCHEMA_VERSION = 1
 CRITERION_SET_ID = "feed-criteria-v1"
 PLANNING_MODES = ("M0", "M1", "M2")
@@ -264,6 +264,7 @@ _REPRODUCIBLE_ENV_KEYS = {
     "FEED_CONVERGE", "FEED_CONVERGE_TOL", "FEED_BORE_PROBE",
     "FEED_GRIP_CLOSE", "FEED_DIAG_NO_RETREAT", "SMOOTH",
     "FEED_TRACE_RELATIVE_MOTION", "FEED_TRACE_PICKUP_MOTION",
+    "FEED_TRACE_CLAMP_HANDOVER",
     "FEED_CARRY_V_CRUISE",
     "FEED_V_JAW_LENGTH_MM",
     "SO101_KP", "SO101_KV", "SM_JAW_BORE_Q", "FEED_DEBUG",
@@ -755,6 +756,8 @@ def _diagnostic_result_fields(state):
             "pickup_motion_diagnostics", {}),
         "gripper_relative_workpiece_motion": state.get(
             "gripper_relative_workpiece_motion", {}),
+        "clamp_handover_diagnostics": state.get(
+            "clamp_handover_diagnostics", {}),
         "initial_stability": state.get("initial_stability"),
         "diagnostic_scope_definitions": {
             "feed": "送料、夹紧、松爪、退出和解锁静置；不含 20 N 拉拔测试",
@@ -2151,6 +2154,269 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             force += abs(f6[0])
         return contacts, force
 
+    clamp_handover_phases = {
+        "先松夹爪", "端面就位", "低压预夹", "端面顶正",
+        "三爪拧紧", "三爪稳定", "卸载托力", "原地松爪",
+        "原地松爪后等待", "轴向退出", "侧向撤离",
+    }
+    clamp_handover_trace_enabled = (
+        os.environ.get("FEED_TRACE_CLAMP_HANDOVER") == "1")
+    chuck_jaw_qpos_adr = [
+        int(model.jnt_qposadr[gid(
+            mujoco.mjtObj.mjOBJ_JOINT, "jaw_slide_%d" % index)])
+        for index in range(3)
+    ]
+    chuck_jaw_geom_ids = {
+        index: {
+            geom_id for geom_id in range(model.ngeom)
+            if (mujoco.mj_id2name(
+                model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or "")
+            .startswith("jaw_geom_%d_" % index)
+        }
+        for index in range(3)
+    }
+    robot_v_jaw_geom_ids = {
+        geom_id for geom_id in robot_geom_ids
+        if (mujoco.mj_id2name(
+            model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or "")
+        .startswith(("fixed_jaw_pad_v", "moving_jaw_pad_v"))
+    }
+
+    def new_clamp_handover_summary():
+        return {
+            "samples": 0,
+            "first_sample_time_s": None,
+            "last_sample_time_s": None,
+            "max_shaft_center_displacement_mm": 0.0,
+            "shaft_center_delta_at_max_mm": [0.0, 0.0, 0.0],
+            "time_of_max_shaft_center_displacement_s": None,
+            "max_shaft_axis_change_deg": 0.0,
+            "time_of_max_shaft_axis_change_s": None,
+            "max_arm_pad_center_displacement_mm": 0.0,
+            "max_shaft_relative_translation_tool_mm": 0.0,
+            "shaft_relative_translation_tool_at_max_mm": [
+                0.0, 0.0, 0.0],
+            "time_of_max_shaft_relative_translation_s": None,
+            "max_shaft_relative_axis_change_deg": 0.0,
+            "robot_workpiece_contact_samples": 0,
+            "robot_workpiece_peak_normal_force_sum_N": 0.0,
+            "workpiece_fixture_contact_samples": 0,
+            "workpiece_fixture_peak_normal_force_sum_N": 0.0,
+            "robot_v_jaw_contact_samples": 0,
+            "robot_v_jaw_peak_normal_force_sum_N": 0.0,
+            "robot_v_jaw_first_contact_time_s": None,
+            "robot_v_jaw_last_contact_time_s": None,
+            "jaws": {
+                str(index): {
+                    "first_contact_time_s": None,
+                    "last_contact_time_s": None,
+                    "contact_samples": 0,
+                    "peak_contact_points": 0,
+                    "peak_normal_force_sum_N": 0.0,
+                }
+                for index in range(3)
+            },
+        }
+
+    def record_clamp_handover_frame(phase):
+        """Optionally record clamp contacts and workpiece motion per step."""
+        diagnostics = state["clamp_handover_diagnostics"]
+        if (not diagnostics["enabled"]
+                or phase not in clamp_handover_phases):
+            return
+
+        shaft_position = shaft()
+        shaft_axis = rod_axis()
+        center_delta = (
+            shaft_position
+            - np.asarray(diagnostics["reference_shaft_center_world_m"]))
+        arm_pad_position = arm.pad_center()
+        arm_pad_delta = (
+            arm_pad_position
+            - np.asarray(
+                diagnostics["reference_arm_pad_center_world_m"]))
+        reference_axis = np.asarray(
+            diagnostics["reference_shaft_axis_world_unit"], dtype=float)
+        axis_change_deg = float(np.degrees(np.arccos(np.clip(
+            abs(float(np.dot(shaft_axis, reference_axis))), -1.0, 1.0))))
+        tool_rotation = data.site_xmat[arm.site].reshape(3, 3)
+        current_offset_tool, current_axis_tool = _pose_in_tool_frame(
+            tool_rotation, shaft_position, arm_pad_position, shaft_axis)
+        relative_translation_tool, relative_axis_change_deg = (
+            _relative_pose_change(
+                diagnostics["reference_shaft_center_offset_tool_m"],
+                diagnostics["reference_shaft_axis_tool_unit"],
+                current_offset_tool, current_axis_tool))
+        jaw_contacts = {
+            index: {"contact_points": 0, "normal_force_sum_N": 0.0}
+            for index in range(3)
+        }
+        robot_contact_points = 0
+        robot_force_sum = 0.0
+        robot_v_contact_points = 0
+        robot_v_force_sum = 0.0
+        fixture_contact_points = 0
+        fixture_force_sum = 0.0
+
+        for contact_id in range(data.ncon):
+            contact = data.contact[contact_id]
+            geom_pair = (int(contact.geom1), int(contact.geom2))
+            shaft_geom_id = next(
+                (geom_id for geom_id in geom_pair
+                 if geom_id in shaft_geoms), None)
+            if shaft_geom_id is None:
+                continue
+            other_geom_id = (
+                contact.geom2 if contact.geom1 == shaft_geom_id
+                else contact.geom1)
+            other_name = (mujoco.mj_id2name(
+                model, mujoco.mjtObj.mjOBJ_GEOM, other_geom_id) or "")
+            contact_force = np.zeros(6)
+            mujoco.mj_contactForce(model, data, contact_id, contact_force)
+            normal_force = abs(float(contact_force[0]))
+
+            for jaw_index, jaw_geom_ids in chuck_jaw_geom_ids.items():
+                if other_geom_id in jaw_geom_ids:
+                    jaw_contacts[jaw_index]["contact_points"] += 1
+                    jaw_contacts[jaw_index]["normal_force_sum_N"] += (
+                        normal_force)
+                    break
+
+            if other_geom_id in robot_geom_ids:
+                robot_contact_points += 1
+                robot_force_sum += normal_force
+                if other_geom_id in robot_v_jaw_geom_ids:
+                    robot_v_contact_points += 1
+                    robot_v_force_sum += normal_force
+            elif _contact_category(
+                    shaft_geom_id, other_geom_id,
+                    contact_geom_sets) == "workpiece_fixture":
+                fixture_contact_points += 1
+                fixture_force_sum += normal_force
+
+        row = {
+            "sim_time_s": float(data.time),
+            "phase": phase,
+            "chuck_command": float(data.ctrl[jaw_act]),
+            "jaw_position_m": [
+                float(data.qpos[address])
+                for address in chuck_jaw_qpos_adr
+            ],
+            "jaws": {
+                str(index): {
+                    "contact_points": int(values["contact_points"]),
+                    "normal_force_sum_N": float(
+                        values["normal_force_sum_N"]),
+                }
+                for index, values in jaw_contacts.items()
+            },
+            "shaft_center_world_m": [
+                float(value) for value in shaft_position],
+            "shaft_center_delta_from_handover_start_mm": [
+                float(value * 1000.0) for value in center_delta],
+            "shaft_center_displacement_from_handover_start_mm": float(
+                np.linalg.norm(center_delta) * 1000.0),
+            "shaft_axis_world_unit": [
+                float(value) for value in shaft_axis],
+            "shaft_axis_change_from_handover_start_deg": axis_change_deg,
+            "shaft_pitch_signed_deg": rod_pitch(),
+            "arm_pad_center_world_m": [
+                float(value) for value in arm_pad_position],
+            "arm_pad_center_delta_from_handover_start_mm": [
+                float(value * 1000.0) for value in arm_pad_delta],
+            "shaft_center_offset_tool_mm": [
+                float(value * 1000.0) for value in current_offset_tool],
+            "shaft_relative_translation_change_tool_mm": [
+                float(value * 1000.0)
+                for value in relative_translation_tool],
+            "shaft_relative_translation_change_tool_mm_norm": float(
+                np.linalg.norm(relative_translation_tool) * 1000.0),
+            "shaft_relative_axis_change_from_handover_start_deg": (
+                relative_axis_change_deg),
+            "robot_workpiece_contact_points": int(robot_contact_points),
+            "robot_workpiece_normal_force_sum_N": float(robot_force_sum),
+            "robot_v_jaw_contact_points": int(robot_v_contact_points),
+            "robot_v_jaw_normal_force_sum_N": float(robot_v_force_sum),
+            "workpiece_fixture_contact_points": int(fixture_contact_points),
+            "workpiece_fixture_normal_force_sum_N": float(fixture_force_sum),
+            "arm_gripper_command": float(data.ctrl[arm.grip_act]),
+            "arm_pad_center_world_m": [
+                float(value) for value in arm.pad_center()],
+        }
+        diagnostics["time_history"].append(row)
+        diagnostics["status"] = "recording"
+
+        phase_summary = diagnostics["phases"].setdefault(
+            phase, new_clamp_handover_summary())
+        for summary in (diagnostics["overall"], phase_summary):
+            summary["samples"] += 1
+            if summary["first_sample_time_s"] is None:
+                summary["first_sample_time_s"] = float(data.time)
+            summary["last_sample_time_s"] = float(data.time)
+            displacement = row[
+                "shaft_center_displacement_from_handover_start_mm"]
+            if displacement > summary[
+                    "max_shaft_center_displacement_mm"]:
+                summary["max_shaft_center_displacement_mm"] = displacement
+                summary["shaft_center_delta_at_max_mm"] = list(
+                    row["shaft_center_delta_from_handover_start_mm"])
+                summary["time_of_max_shaft_center_displacement_s"] = float(
+                    data.time)
+            if axis_change_deg > summary["max_shaft_axis_change_deg"]:
+                summary["max_shaft_axis_change_deg"] = axis_change_deg
+                summary["time_of_max_shaft_axis_change_s"] = float(
+                    data.time)
+            summary["max_arm_pad_center_displacement_mm"] = max(
+                summary["max_arm_pad_center_displacement_mm"],
+                float(np.linalg.norm(arm_pad_delta) * 1000.0))
+            relative_translation_mm = row[
+                "shaft_relative_translation_change_tool_mm_norm"]
+            if relative_translation_mm > summary[
+                    "max_shaft_relative_translation_tool_mm"]:
+                summary["max_shaft_relative_translation_tool_mm"] = (
+                    relative_translation_mm)
+                summary["shaft_relative_translation_tool_at_max_mm"] = [
+                    float(value) for value in
+                    row["shaft_relative_translation_change_tool_mm"]]
+                summary["time_of_max_shaft_relative_translation_s"] = (
+                    float(data.time))
+            summary["max_shaft_relative_axis_change_deg"] = max(
+                summary["max_shaft_relative_axis_change_deg"],
+                relative_axis_change_deg)
+            if robot_contact_points:
+                summary["robot_workpiece_contact_samples"] += 1
+            summary["robot_workpiece_peak_normal_force_sum_N"] = max(
+                summary["robot_workpiece_peak_normal_force_sum_N"],
+                robot_force_sum)
+            if fixture_contact_points:
+                summary["workpiece_fixture_contact_samples"] += 1
+            summary["workpiece_fixture_peak_normal_force_sum_N"] = max(
+                summary["workpiece_fixture_peak_normal_force_sum_N"],
+                fixture_force_sum)
+            if robot_v_contact_points:
+                summary["robot_v_jaw_contact_samples"] += 1
+                if summary["robot_v_jaw_first_contact_time_s"] is None:
+                    summary["robot_v_jaw_first_contact_time_s"] = float(
+                        data.time)
+                summary["robot_v_jaw_last_contact_time_s"] = float(data.time)
+            summary["robot_v_jaw_peak_normal_force_sum_N"] = max(
+                summary["robot_v_jaw_peak_normal_force_sum_N"],
+                robot_v_force_sum)
+            for jaw_index, values in jaw_contacts.items():
+                jaw_summary = summary["jaws"][str(jaw_index)]
+                if values["contact_points"]:
+                    if jaw_summary["first_contact_time_s"] is None:
+                        jaw_summary["first_contact_time_s"] = float(
+                            data.time)
+                    jaw_summary["last_contact_time_s"] = float(data.time)
+                    jaw_summary["contact_samples"] += 1
+                jaw_summary["peak_contact_points"] = max(
+                    jaw_summary["peak_contact_points"],
+                    values["contact_points"])
+                jaw_summary["peak_normal_force_sum_N"] = max(
+                    jaw_summary["peak_normal_force_sum_N"],
+                    values["normal_force_sum_N"])
+
     def sleeve_state():
         """实体导套与棒料的接触数/法向力：径向约束是否真的在受力。"""
         n, f = 0, 0.0
@@ -2285,6 +2551,24 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                      "center_displacement_vector_at_max_mm": [0.0, 0.0, 0.0],
                      "max_shaft_axis_change_deg": 0.0,
                  },
+                 "phases": {},
+                 "criterion": "diagnostic_only_no_pass_fail_threshold",
+             },
+             "clamp_handover_diagnostics": {
+                 "enabled": clamp_handover_trace_enabled,
+                 "status": (
+                     "awaiting_handover_reference"
+                     if clamp_handover_trace_enabled else "not_enabled"),
+                 "sampled_every_physics_step": True,
+                 "sample_interval_s": float(model.opt.timestep),
+                 "measurement_scope": sorted(clamp_handover_phases),
+                 "reference_shaft_center_world_m": None,
+                 "reference_shaft_axis_world_unit": None,
+                 "reference_arm_pad_center_world_m": None,
+                 "reference_shaft_center_offset_tool_m": None,
+                 "reference_shaft_axis_tool_unit": None,
+                 "time_history": [],
+                 "overall": new_clamp_handover_summary(),
                  "phases": {},
                  "criterion": "diagnostic_only_no_pass_fail_threshold",
              },
@@ -2519,7 +2803,6 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             contact_snapshot,
             load_snapshot,
         )
-
         pickup = state["pickup_motion_diagnostics"]
         pickup_group = next(
             (name for name in pickup["measurement_scope"]
@@ -2768,6 +3051,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         mujoco.mj_step(model, data)
         ensure_finite_state("%s:after_step" % label)
         record_diagnostic_frame(label)
+        if phase in clamp_handover_phases:
+            record_clamp_handover_frame(label)
 
     def record_stage(name, checkpoint_id=None,
                      checkpoint_status="completed"):
@@ -2969,7 +3254,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         })
 
     def move(target, ns, grip, locked, jaw_ctrl, axis_hold=None,
-             grip_end=None, s0=0.0, s1=1.0, settle_steps=None):
+             grip_end=None, s0=0.0, s1=1.0, settle_steps=None,
+             clamp_trace_phase=None):
         """Move the grip point, holding the rod axis during the feed.
 
         Position-only IK lets wrist_flex drift while the arm translates; that
@@ -3092,6 +3378,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             data.ctrl[arm.grip_act] = grip_cmd(gcmd)
             data.ctrl[jaw_act] = jaw_ctrl
             step_sim()
+            if clamp_trace_phase:
+                record_clamp_handover_frame(clamp_trace_phase)
             record_pickup_joint_frame(
                 "trajectory", q, qd_reference)
             state.setdefault("traj", []).append(
@@ -3127,6 +3415,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             data.ctrl[arm.grip_act] = grip_cmd(final_grip)
             data.ctrl[jaw_act] = jaw_ctrl
             step_sim()
+            if clamp_trace_phase:
+                record_clamp_handover_frame(clamp_trace_phase)
             record_pickup_joint_frame(
                 "settle", q_goal, np.zeros_like(q_goal))
             state.setdefault("traj", []).append(
@@ -3141,7 +3431,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
 
     def move3(target, ns, grip, locked,
               jaw_ctrl=SM.CHUCK_OPEN_CTRL, iters=8, probe=None,
-              probe_goal=None, label=""):
+              probe_goal=None, label="", clamp_trace_phase=None):
         """Iterate until the pads actually reach the goal -- by MOVING THE GOAL.
 
         Re-sending the same absolute target is useless under load: the
@@ -3196,6 +3486,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             data.ctrl[arm.grip_act] = grip_cmd(grip)
             data.ctrl[jaw_act] = jaw_ctrl
             step_sim()
+            if clamp_trace_phase:
+                record_clamp_handover_frame(clamp_trace_phase)
             state.setdefault("traj", []).append(
                 data.site_xpos[arm.site].copy())
             state.setdefault("traj_t", []).append(float(data.time))
@@ -3248,6 +3540,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 kw = {"s0": k / iters, "s1": (k + 1) / iters}
             state["label"] = "%s#%d" % (label, k + 1)
             kw["settle_steps"] = 90 if k == pass_limit - 1 else 60
+            if clamp_trace_phase:
+                kw["clamp_trace_phase"] = clamp_trace_phase
             move(tgt, steps_k, grip, locked, jaw_ctrl, **kw)
             motion_steps.append(int(steps_k))
             executed_settle_steps.append(int(kw["settle_steps"]))
@@ -3509,13 +3803,16 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         state["grip_now"] = v
         return v
 
-    def settle(n, jaw_ctrl, grip, locked=False, floating=False):
+    def settle(n, jaw_ctrl, grip, locked=False, floating=False,
+               clamp_trace_phase=None):
         for i in range(n):
             data.ctrl[jaw_act] = jaw_ctrl
             data.ctrl[arm.grip_act] = grip_cmd(grip)
             if floating:
                 float_arm()
             step_sim()
+            if clamp_trace_phase:
+                record_clamp_handover_frame(clamp_trace_phase)
             state.setdefault("traj", []).append(
                 data.site_xpos[arm.site].copy())
             state.setdefault("traj_t", []).append(float(data.time))
@@ -4187,6 +4484,24 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                   % (_used, _qvel, coax()))
         # 交接起点在进给到位时取，两种顺序共用同一基准，夹紧瞬态才可比。
         clamp_p0 = shaft().copy()
+        if clamp_handover_trace_enabled:
+            clamp_diagnostics = state["clamp_handover_diagnostics"]
+            clamp_axis0 = rod_axis()
+            clamp_pad0 = arm.pad_center()
+            clamp_rotation0 = data.site_xmat[arm.site].reshape(3, 3)
+            clamp_offset_tool0, clamp_axis_tool0 = _pose_in_tool_frame(
+                clamp_rotation0, clamp_p0, clamp_pad0, clamp_axis0)
+            clamp_diagnostics["reference_shaft_center_world_m"] = [
+                float(value) for value in clamp_p0]
+            clamp_diagnostics["reference_shaft_axis_world_unit"] = [
+                float(value) for value in clamp_axis0]
+            clamp_diagnostics["reference_arm_pad_center_world_m"] = [
+                float(value) for value in clamp_pad0]
+            clamp_diagnostics["reference_shaft_center_offset_tool_m"] = [
+                float(value) for value in clamp_offset_tool0]
+            clamp_diagnostics["reference_shaft_axis_tool_unit"] = [
+                float(value) for value in clamp_axis_tool0]
+            clamp_diagnostics["status"] = "ready"
         if CLAMP_ANCHOR and tuned:
             for _a in arm.qadr:
                 data.ctrl[_a] = float(data.qpos[_a])
@@ -4451,7 +4766,10 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             track_pen("原地松爪")
             if frame_hook is not None and i % FRAME_EVERY == 0:
                 tick()
-        settle(120, SM.CHUCK_CLAMP_CTRL, GRIP_OPEN)
+        settle(120, SM.CHUCK_CLAMP_CTRL, GRIP_OPEN,
+               clamp_trace_phase="原地松爪后等待")
+        if clamp_handover_trace_enabled:
+            state["clamp_handover_diagnostics"]["status"] = "recorded"
         release_p = shaft()
         _z = float(release_p[2])
         clamp_z_min = min(clamp_z_min, _z)
@@ -4473,7 +4791,9 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         # 去追一个歪掉的目标（原实现实测残差 41.6 mm）。这里直接给世界点。
         if RETREAT_AXIAL and os.environ.get("FEED_DIAG_NO_RETREAT") != "1":
             pull = np.array([axis[0] - 0.070, axis[1], axis[2] + 0.010])
-            move3(pull, 260, GRIP_OPEN, False, SM.CHUCK_CLAMP_CTRL)
+            move3(
+                pull, 260, GRIP_OPEN, False, SM.CHUCK_CLAMP_CTRL,
+                clamp_trace_phase="轴向退出")
             print("  轴向退出     沿轴线退 %.0f mm，刀片已离开料尾"
                   % (70.0))
         elif os.environ.get("FEED_DIAG_NO_RETREAT") == "1":
@@ -4493,13 +4813,16 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             rerr = 0.0
         else:
             rerr = move(retreat, 1100, GRIP_OPEN, False,
-                        SM.CHUCK_CLAMP_CTRL)
+                        SM.CHUCK_CLAMP_CTRL,
+                        clamp_trace_phase="侧向撤离")
         record_stage(
             "after_lateral_retreat",
             checkpoint_id="lateral_retreat_complete",
             checkpoint_status=checkpoint_statuses[
                 "lateral_retreat_complete"],
         )
+        if clamp_handover_trace_enabled:
+            state["clamp_handover_diagnostics"]["status"] = "recorded"
         retreat_p = shaft()
         _z = float(retreat_p[2])
         clamp_z_min = min(clamp_z_min, _z)
