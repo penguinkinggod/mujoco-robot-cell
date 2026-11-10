@@ -50,8 +50,8 @@ def _finite_number(value):
 
 def summarize_result(result, case_id, changed_factor, changed_value,
                      result_path, log_path):
-    if not isinstance(result, dict) or result.get("schema_version") != 13:
-        raise ValueError("expected a schema v13 result JSON")
+    if not isinstance(result, dict) or result.get("schema_version") != 14:
+        raise ValueError("expected a schema v14 result JSON")
     if result.get("execution_status") != "completed":
         raise ValueError(
             "case did not complete: %s" % result.get("execution_status"))

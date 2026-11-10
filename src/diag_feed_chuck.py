@@ -90,6 +90,7 @@ import platform
 import subprocess
 import time
 import uuid
+import weakref
 
 import numpy as np
 import mujoco
@@ -103,7 +104,7 @@ from demo_08_pick_and_load import (
 )
 
 
-RESULT_SCHEMA_VERSION = 13
+RESULT_SCHEMA_VERSION = 14
 METRIC_SCHEMA_VERSION = 1
 CRITERION_SET_ID = "feed-criteria-v1"
 PLANNING_MODES = ("M0", "M1", "M2")
@@ -1363,6 +1364,73 @@ def _lift_workpiece(spec):
     print("    cradle: rod lifted %.0f mm, V under both ends" % (LIFT_DZ * 1000))
 
 
+_CRADLE_REFERENCE_GEOMETRY = weakref.WeakKeyDictionary()
+
+
+def _cradle_reference_geometry(model):
+    """Return cached nominal support geometry for a reusable model."""
+    cached = _CRADLE_REFERENCE_GEOMETRY.get(model)
+    if cached is not None:
+        return cached
+    geom_ids = tuple(
+        geom_id for geom_id in range(model.ngeom)
+        if (mujoco.mj_id2name(
+            model, mujoco.mjtObj.mjOBJ_GEOM, geom_id) or "").startswith(
+                "cradle_")
+    )
+    if not geom_ids:
+        return None
+    cached = (
+        geom_ids,
+        model.geom_pos[list(geom_ids)].copy(),
+        model.geom_quat[list(geom_ids)].copy(),
+    )
+    _CRADLE_REFERENCE_GEOMETRY[model] = cached
+    return cached
+
+
+def _reset_cradles_to_nominal(model):
+    """Undo a previous diagnostic transform when a model instance is reused."""
+    cached = _cradle_reference_geometry(model)
+    if cached is None:
+        return
+    geom_ids, positions, quaternions = cached
+    model.geom_pos[list(geom_ids)] = positions
+    model.geom_quat[list(geom_ids)] = quaternions
+
+
+def _move_cradles_with_initial_pose(model, shaft_center_m, offset_mm,
+                                    yaw_world_z_deg):
+    """Set supports to the requested pose relative to nominal geometry."""
+    offset_m = np.asarray(offset_mm, dtype=float) / 1000.0
+    angle = np.radians(float(yaw_world_z_deg))
+    half_angle = angle / 2.0
+    yaw_quaternion = np.array([
+        np.cos(half_angle), 0.0, 0.0, np.sin(half_angle)])
+    yaw_rotation = np.array([
+        [np.cos(angle), -np.sin(angle), 0.0],
+        [np.sin(angle), np.cos(angle), 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    center = np.asarray(shaft_center_m, dtype=float)
+    cached = _cradle_reference_geometry(model)
+    if cached is None:
+        raise ValueError(
+            "moving the incoming support requires --lift and cradle geoms")
+    cradle_ids, nominal_positions, nominal_quaternions = cached
+    _reset_cradles_to_nominal(model)
+    for index, geom_id in enumerate(cradle_ids):
+        model.geom_pos[geom_id] = (
+            center + offset_m
+            + yaw_rotation @ (nominal_positions[index] - center))
+        rotated_quaternion = np.zeros(4)
+        mujoco.mju_mulQuat(
+            rotated_quaternion, yaw_quaternion,
+            nominal_quaternions[index])
+        model.geom_quat[geom_id] = rotated_quaternion
+    return len(cradle_ids)
+
+
 # ---- 实体托料导套（2026-11-07，CURRENT.md「下一步」唯一一条）----
 # 真机长棒料送料会在卡爪口外装导套/中心架，55 mm 悬空段才有【不可撤销】
 # 的径向约束。之前 SEAT_RADIAL_K 只是「力等效」支撑，夹紧后必须撤销：
@@ -1677,7 +1745,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
          random_seed=None, initial_yaw_deg=None, planning_mode="M1",
          m2_error_mm=(0.0, 0.0, 0.0), m2_error_yaw_deg=0.0,
          initial_settle_steps=DEFAULT_INITIAL_SETTLE_STEPS,
-         stop_after_grasp=False):
+         stop_after_grasp=False, support_follows_initial_pose=False):
     """Run the feed sequence.
 
     frame_hook(tag, model, data) is an OPTIONAL visualisation tap.
@@ -1712,6 +1780,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     model = model if model is not None else build_model(
         v_jaw=v_jaw, lift=lift, machine_solid=machine_solid)
     data = data if data is not None else mujoco.MjData(model)
+    if lift:
+        _reset_cradles_to_nominal(model)
 
     def tick(tag=None):
         if tag is not None and "stage_records" in state:
@@ -2135,6 +2205,9 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     if (not np.all(np.isfinite(offset_mm))
             or not np.isfinite(yaw_world_z_deg)):
         raise ValueError("initial pose values must be finite")
+    if support_follows_initial_pose and not lift:
+        raise ValueError(
+            "support_follows_initial_pose requires lift=True")
     planning_mode = str(planning_mode).upper()
     if planning_mode not in PLANNING_MODES:
         raise ValueError(
@@ -2257,6 +2330,10 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                      "offset_world_xyz_mm": [
                          float(x) for x in offset_mm],
                      "yaw_world_z_deg": float(yaw_world_z_deg),
+                     "support_frame_mode": (
+                         "rigidly_transformed_with_requested_initial_pose"
+                         if support_follows_initial_pose
+                         else "fixed_at_nominal_pose"),
                      "roll_deg": float(legacy_roll_deg),
                      "legacy_roll_argument_deg": (
                          None if initial_roll_deg is None
@@ -3413,6 +3490,12 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     state["inputs"]["workpiece"]["nominal_start_position_m"] = (
         reset_pose["position_m"])
     state["inputs"]["pose_before_perturbation"] = reset_pose
+    if support_follows_initial_pose:
+        state["inputs"]["requested_initial_pose"][
+            "transformed_support_geom_count"] = (
+                _move_cradles_with_initial_pose(
+                    model, reset_pose["position_m"], offset_mm,
+                    yaw_world_z_deg))
     data.qpos[sq:sq + 3] += offset_mm / 1000.0
     if yaw_world_z_deg:
         data.qpos[sq + 3:sq + 7] = _apply_world_yaw_to_quaternion(
@@ -4708,6 +4791,12 @@ if __name__ == "__main__":
     ap.add_argument("--initial-dy-mm", type=float, default=0.0)
     ap.add_argument("--initial-dz-mm", type=float, default=0.0)
     ap.add_argument(
+        "--support-follows-initial-pose",
+        action="store_true",
+        help=("rigidly move the V cradles with the requested incoming "
+              "workpiece offset/yaw; requires --lift"),
+    )
+    ap.add_argument(
         "--initial-settle-steps",
         type=int,
         default=DEFAULT_INITIAL_SETTLE_STEPS,
@@ -4763,4 +4852,6 @@ if __name__ == "__main__":
                                        args.m2_error_dz_mm),
                           m2_error_yaw_deg=args.m2_error_yaw_deg,
                           random_seed=args.random_seed,
-                          initial_settle_steps=args.initial_settle_steps))
+                          initial_settle_steps=args.initial_settle_steps,
+                          support_follows_initial_pose=(
+                              args.support_follows_initial_pose)))

@@ -153,7 +153,7 @@ class PlanningModeIsolationTests(unittest.TestCase):
 
 
 def assert_reproducibility_fields(test_case, result):
-    test_case.assertEqual(13, result["schema_version"])
+    test_case.assertEqual(14, result["schema_version"])
     test_case.assertIn("pickup_motion_diagnostics", result)
     test_case.assertIn("gripper_relative_workpiece_motion", result)
     test_case.assertEqual(1, result["metric_schema_version"])
@@ -187,6 +187,9 @@ def assert_reproducibility_fields(test_case, result):
     test_case.assertIn(
         "yaw_world_z_deg",
         result["inputs"]["requested_initial_pose"])
+    test_case.assertEqual(
+        "fixed_at_nominal_pose",
+        result["inputs"]["requested_initial_pose"]["support_frame_mode"])
     test_case.assertIn("pose_before_perturbation", result["inputs"])
     test_case.assertIn(
         "pose_after_perturbation_before_settle", result["inputs"])
