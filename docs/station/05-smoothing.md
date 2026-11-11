@@ -74,4 +74,10 @@
 横向摆幅从 1.90 mm 降到 1.14 mm。代价是进给慢了约 1.5 秒，整条流程从 13 秒变成 14.5 秒。
 嫌慢可以用 `FEED_STEPS=400` 换回来，摆幅会回到 1.5 mm 左右。
 
+### 2026-11-11：分段内平滑与阶段间连续是两件事
+
+P5.8.19 为接近、侧向进入、下降分别生成姿态 IK 航点和 quintic 时间律；每一段内部平滑，但 `move3()` 仍按阶段分别规划，并在段后做伺服停稳。因此减慢会降低速度，不能消掉边界的零速段。P5.8.20 的有限对照是将接近→侧向进入→下降合成为一条连续全姿态轨迹，在内部路径点允许平滑通过，在最终预接触点减速停稳后再闭爪。blend 可能让 TCP 偏离指定 waypoint，必须复核路径和接触，不能只凭动画评价。
+
+参考：Universal Robots [官方 Blend Parameters 手册](https://www.universal-robots.com/manuals/EN/HTML/SW5_26/Content/prod-usr-man/software/PolyScope/content/BasicProgNodes/commandtab_way_blend_para.htm) 说明轨迹可不在内部 waypoint 停止，并提示 blend 半径可能改变经过点的路径；[Universal Robots 官方论坛讨论](https://forum.universal-robots.com/t/smooth-and-more-optimized-robot-movement/42737) 也直接讨论 waypoint 之间的停顿。论坛回复属于社区经验，官方手册是厂商规范来源；UR 的具体参数不直接移植到 SO-101/MuJoCo。
+
 回到 [README](../../README.md) · 全部工位资料见 [索引](README.md)

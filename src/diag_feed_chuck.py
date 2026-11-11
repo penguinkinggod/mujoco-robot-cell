@@ -96,6 +96,7 @@ import numpy as np
 import mujoco
 import scipy
 from scipy.interpolate import CubicSpline
+from scipy.spatial.transform import Rotation as SciRotation
 
 import scene_full as F
 import scene_machining as SM
@@ -149,6 +150,34 @@ def _apply_world_yaw_to_quaternion(quaternion_wxyz, yaw_world_z_deg):
 def _normalise_axis(axis):
     axis = np.asarray(axis, dtype=float)
     return axis / max(float(np.linalg.norm(axis)), 1e-12)
+
+
+def _mouth_axis_pickup_waypoints(pick_at, entry_axis,
+                                approach_clearance_m,
+                                entry_distance_m=0.020,
+                                final_lift_m=0.002):
+    """Build an overhead, vertical-drop, then monotone mouth-entry path."""
+    pick_at = np.asarray(pick_at, dtype=float)
+    entry_axis = np.asarray(entry_axis, dtype=float)
+    if pick_at.shape != (3,) or entry_axis.shape != (3,):
+        raise ValueError("pickup position and entry axis must be 3-vectors")
+    if (not np.isfinite(pick_at).all()
+            or not np.isfinite(entry_axis).all()
+            or not np.isfinite(float(approach_clearance_m))
+            or not np.isfinite(float(entry_distance_m))
+            or not np.isfinite(float(final_lift_m))):
+        raise ValueError("pickup path inputs must be finite")
+    axis_norm = float(np.linalg.norm(entry_axis))
+    if axis_norm < 1e-12:
+        raise ValueError("entry_axis must be nonzero")
+    if approach_clearance_m <= 0.0 or entry_distance_m <= 0.0:
+        raise ValueError("pickup clearances must be positive")
+    entry_axis = entry_axis / axis_norm
+    grasp_target = pick_at + np.array([0.0, 0.0, final_lift_m])
+    mouth_outside = grasp_target - entry_distance_m * entry_axis
+    overhead = mouth_outside + np.array(
+        [0.0, 0.0, float(approach_clearance_m)])
+    return overhead, mouth_outside, grasp_target
 
 
 def _pose_in_tool_frame(tool_rotation, object_position, tool_position,
@@ -272,6 +301,9 @@ _REPRODUCIBLE_ENV_KEYS = {
     "FEED_CLAMP_TRACE", "FEED_SEAT_TRACE",
     "FEED_V_CONTACT_SOLREF_TIME",
     "FEED_WORKPIECE_LIFT_MM", "FEED_PICKUP_REFINEMENT",
+    "FEED_PICKUP_POSE_ALIGN", "FEED_PICKUP_TARGET_SITE_ROTATION",
+    "FEED_PICKUP_ENTRY_TIME_SCALE", "FEED_PICKUP_CONTINUOUS",
+    "FEED_PICKUP_ALGORITHM", "FEED_PICKUP_FINAL_CORRECTION_GAIN",
 }
 _SOURCE_IDENTITY = None
 
@@ -1008,6 +1040,22 @@ def tilt_deg(quat):
         2 * np.arccos(min(1.0, abs(float(np.dot(SHAFT_Q0, quat)))))))
 
 
+def _rotation_slerp(start, end, fraction):
+    """Interpolate two 3-D rotations along their shortest geodesic."""
+    start = np.asarray(start, dtype=float)
+    end = np.asarray(end, dtype=float)
+    if start.shape != (3, 3) or end.shape != (3, 3):
+        raise ValueError("rotation interpolation requires 3x3 matrices")
+    for rotation in (start, end):
+        if (not np.isfinite(rotation).all()
+                or np.linalg.norm(rotation.T @ rotation - np.eye(3)) > 1e-5
+                or np.linalg.det(rotation) < 0.99999):
+            raise ValueError("rotation interpolation requires proper rotations")
+    relative = SciRotation.from_matrix(start.T @ end).as_rotvec()
+    return start @ SciRotation.from_rotvec(
+        float(np.clip(fraction, 0.0, 1.0)) * relative).as_matrix()
+
+
 CRADLE_DROP = 0.011      # 托条中心比两 pad 中点低多少（R10 + 板半厚 1 mm）
 CRADLE_LEN = 0.060       # 托条沿工件轴向的长度
 
@@ -1614,6 +1662,23 @@ MIN_FIX_STEPS = 150      # 闭环修正轮的最短时长（0.30 s）：再短�
 PICKUP_MAX_CORRECTIONS = 2
 PICKUP_REFINEMENT = os.environ.get(
     "FEED_PICKUP_REFINEMENT", "1") == "1"
+PICKUP_POSE_ALIGN = os.environ.get(
+    "FEED_PICKUP_POSE_ALIGN", "1") == "1"
+PICKUP_ENTRY_TIME_SCALE = _positive_finite_env_float(
+    "FEED_PICKUP_ENTRY_TIME_SCALE", 2.0)
+PICKUP_CONTINUOUS = os.environ.get(
+    "FEED_PICKUP_CONTINUOUS", "0") == "1"
+PICKUP_ALGORITHM = os.environ.get(
+    "FEED_PICKUP_ALGORITHM", "mouth_axis").strip().lower()
+if PICKUP_ALGORITHM not in ("legacy", "mouth_axis"):
+    raise ValueError(
+        "FEED_PICKUP_ALGORITHM must be 'legacy' or 'mouth_axis'")
+PICKUP_FINAL_CORRECTION_GAIN = float(os.environ.get(
+    "FEED_PICKUP_FINAL_CORRECTION_GAIN", "0.5"))
+if (not np.isfinite(PICKUP_FINAL_CORRECTION_GAIN)
+        or not 0.0 <= PICKUP_FINAL_CORRECTION_GAIN <= 1.0):
+    raise ValueError(
+        "FEED_PICKUP_FINAL_CORRECTION_GAIN must be between 0 and 1")
 
 # ---- 送料场景专用伺服阻尼（文献 B：hunting 是欠阻尼，先加阻尼）----
 # 全局 ARM_SERVO_KV 必须保持 2.6，否则 demo_09 搬运到槽上方 xy 误差会从
@@ -2646,6 +2711,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
 
     state = {"offset": None, "off_site": None, "abs_pos": None,
              "lock_active": True, "axis_hold": False,
+             "pickup_rotation_target": None,
+             "pickup_rotation_start": None,
              "stage_records": [], "checkpoints": [], "case_id": case_id,
              "random_seed": random_seed,
              "rod_force_max": 0.0, "robot_machine_contact_max": 0,
@@ -2876,10 +2943,29 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                      "minimum_fix_steps": int(MIN_FIX_STEPS),
                      "pickup_refinement_enabled": bool(
                          PICKUP_REFINEMENT),
+                     "pickup_pose_align_enabled": bool(
+                         PICKUP_POSE_ALIGN),
+                     "pickup_entry_time_scale": float(
+                         PICKUP_ENTRY_TIME_SCALE),
+                     "pickup_continuous_enabled": bool(
+                         PICKUP_CONTINUOUS),
+                     "pickup_path_curve_enabled": bool(
+                         v_jaw and PICKUP_POSE_ALIGN
+                         and (PICKUP_ALGORITHM == "mouth_axis"
+                              or PICKUP_CONTINUOUS)),
+                     "pickup_algorithm": PICKUP_ALGORITHM,
+                     "pickup_final_correction_gain": float(
+                         PICKUP_FINAL_CORRECTION_GAIN
+                         if PICKUP_ALGORITHM == "mouth_axis" else 1.0),
                      "pickup_max_corrections": int(
                          PICKUP_MAX_CORRECTIONS),
                      "pickup_motion_strategy": (
-                         "full_stage_first_pass_then_bounded_corrections"
+                         "mouth_entry_position_axis_ik"
+                         if (PICKUP_ALGORITHM == "mouth_axis"
+                             and PICKUP_POSE_ALIGN and v_jaw)
+                         else "single_full_pose_curve_with_final_settle"
+                         if (PICKUP_CONTINUOUS and PICKUP_POSE_ALIGN and v_jaw)
+                         else "full_stage_first_pass_then_bounded_corrections"
                          if PICKUP_REFINEMENT else "legacy"),
                      "pickup_joint_time_history_enabled": bool(
                          os.environ.get(
@@ -3366,7 +3452,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             return
         label = str(state.get("label") or "")
         stage = next(
-            (name for name in ("接近", "侧向进入")
+            (name for name in ("接近", "侧向进入", "下降", "夹紧")
              if label == name or label.startswith(name + "#")),
             None,
         )
@@ -3447,11 +3533,18 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         time law, so release and retreat happen together rather than the
         gripper kicking the clamped rod while still parked against it.
         """
+        ensure_finite_state("%s:before_move" % state.get("label", "?"))
         if axis_hold is None:
             axis_hold = state["axis_hold"]
         grasp_axis_active = state.get("grasp_axis_active", False)
+        label = str(state.get("label", ""))
+        pickup_pose_active = (
+            PICKUP_POSE_ALIGN and v_jaw and not grasp_axis_active
+            and label.split("#", 1)[0] in (
+                "接近", "侧向进入", "下降"))
         use_axis_ik = axis_hold or grasp_axis_active
-        if not use_axis_ik:
+        use_ik_path = use_axis_ik or pickup_pose_active
+        if not use_ik_path:
             # 只写 ctrl，绝对不要写 qpos。
             # 直接给 qpos 会在每段第一帧把腕关节一步拽到 wrist，末端
             # 瞬跳 5~10 mm（实测 夹紧段 10.3 mm / 5.13 m/s、对中段
@@ -3464,34 +3557,69 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         q_start = np.array([data.qpos[a] for a in arm.qadr])
         q_path = None
         grid = None
-        if use_axis_ik:
+        if use_ik_path:
             # Solve IK at several Cartesian waypoints instead of only at the
             # segment end. A straight joint-space interpolation between two
             # IK solutions lets the tool axis wander 20+ deg in between.
             R_site = data.site_xmat[arm.site].reshape(3, 3)
-            if axis_hold:
-                a_local = state["a_local"]
-                axis_target = _AXIS_TGT
+            if use_axis_ik:
+                if axis_hold:
+                    a_local = state["a_local"]
+                    axis_target = _AXIS_TGT
+                else:
+                    a_local = state["grasp_axis_local"]
+                    axis_target = state["grasp_axis_target"]
             else:
-                a_local = state["grasp_axis_local"]
-                axis_target = state["grasp_axis_target"]
-            site_start = data.site_xpos[arm.site].copy()
+                phase = label.split("#", 1)[0]
+                phase_progress = {
+                    "接近": 1.0 / 3.0,
+                    "侧向进入": 2.0 / 3.0,
+                    "下降": 1.0,
+                }[phase]
+                pickup_rotation_start = R_site.copy()
+                pickup_rotation_target = _rotation_slerp(
+                    state["pickup_rotation_start"],
+                    state["pickup_rotation_target"], phase_progress)
+                pad_start = arm.pad_center().copy()
+                pad_offset_local = R_site.T @ off
             nwp = 8
             grid = np.linspace(0.0, 1.0, nwp + 1)
             pts = [q_start]
             q_prev = q_start.copy()
             last_ik = (0.0, 0.0)
             for frac in grid[1:]:
-                p = site_start + frac * (site_target - site_start)
-                q_prev, pe, ae = arm.ik_axis(
-                    p, axis_target, a_local,
-                    q_init=q_prev, iters=240)
-                last_ik = (pe, ae)
-                state.setdefault("ik_solver", []).append({
-                    "stage": state.get("label", "?"),
-                    "position_residual_mm": float(pe * 1000),
-                    "axis_residual_deg": float(np.degrees(ae)),
-                })
+                if pickup_pose_active:
+                    blend = (frac * frac * frac
+                             * (10.0 + frac * (-15.0 + 6.0 * frac)))
+                    rotation_at_waypoint = _rotation_slerp(
+                        pickup_rotation_start, pickup_rotation_target,
+                        blend)
+                    pad_p = pad_start + frac * (
+                        np.asarray(target, dtype=float) - pad_start)
+                    p = pad_p - rotation_at_waypoint @ pad_offset_local
+                    q_prev, pe, re = arm.ik_pose(
+                        p, rotation_at_waypoint, q_init=q_prev,
+                        iters=360, lock_wrist_roll=wrist)
+                    last_ik = (pe, re)
+                    state.setdefault("ik_solver", []).append({
+                        "stage": state.get("label", "?"),
+                        "position_residual_mm": float(pe * 1000),
+                        "axis_residual_deg": None,
+                        "orientation_residual_deg": float(
+                            np.degrees(re)),
+                    })
+                else:
+                    p = data.site_xpos[arm.site].copy() + frac * (
+                        site_target - data.site_xpos[arm.site])
+                    q_prev, pe, ae = arm.ik_axis(
+                        p, axis_target, a_local,
+                        q_init=q_prev, iters=240)
+                    last_ik = (pe, ae)
+                    state.setdefault("ik_solver", []).append({
+                        "stage": state.get("label", "?"),
+                        "position_residual_mm": float(pe * 1000),
+                        "axis_residual_deg": float(np.degrees(ae)),
+                    })
                 pts.append(q_prev.copy())
             q_path = np.asarray(pts)
             # 关节空间样条：C1/C2 连续，配合 quintic 时间律才不折角。
@@ -3499,8 +3627,10 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                     for j in range(q_path.shape[1])]
             q_goal = q_path[-1].copy()
             if DEBUG_MOVE:
-                print("    ik_axis[%s] 终点 %.1f mm / %.1f deg"
-                      % (state.get("label", ""), last_ik[0] * 1000,
+                ik_kind = "ik_pose" if pickup_pose_active else "ik_axis"
+                print("    %s[%s] 终点 %.1f mm / %.2f deg"
+                      % (ik_kind, state.get("label", ""),
+                         last_ik[0] * 1000,
                          np.degrees(last_ik[1])))
         else:
             q_goal, solver_residual = arm.ik(
@@ -3634,7 +3764,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         hold_done = (state["axis_hold"] and state["offset"] is not None)
         move_steps = ns if hold_done else max(90, ns // 3)
         pickup_refinement = (
-            PICKUP_REFINEMENT and label in ("接近", "侧向进入"))
+            PICKUP_REFINEMENT
+            and label in ("接近", "侧向进入"))
         if hold_done and iters == 8:
             # Full-length minimum-jerk corrections, not chopped point-to-point
             # retries. Measured error halves each pass (51 -> 17 -> 8 -> 2 mm).
@@ -3753,6 +3884,249 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                   % (label, " ".join("%.1f" % (e * 1000) for e in trace),
                      len(trace) - 1, sign_flips))
         return err
+
+    def move_pickup_continuous(stages, grip, jaw_ctrl):
+        """Run approach, side entry and descent as one full-pose trajectory.
+
+        Stage targets remain exact geometric waypoints, but the joint reference
+        is solved and played as one curve. The quintic time law has zero speed
+        only at the start and final pre-grasp pose; internal waypoints do not
+        trigger a settle or a restart.
+        """
+        if len(stages) != 3:
+            raise ValueError("continuous pickup requires three stages")
+        mujoco.mj_forward(model, data)
+        q_start = np.array([data.qpos[a] for a in arm.qadr], dtype=float)
+        R_start = data.site_xmat[arm.site].reshape(3, 3).copy()
+        pad_start = arm.pad_center().copy()
+        site_start = data.site_xpos[arm.site].copy()
+        off = arm.pad_offset()
+        pad_offset_local = R_start.T @ off
+
+        # Preview the approach endpoint so the side-entry direction is
+        # measured at the same planned approach pose as in the staged path.
+        first_rotation = _rotation_slerp(
+            state["pickup_rotation_start"],
+            state["pickup_rotation_target"], 1.0 / 3.0)
+        first_pad_target = np.asarray(stages[0][1], dtype=float)
+        first_site_target = first_pad_target - first_rotation @ pad_offset_local
+        q_approach, _pe, _re = arm.ik_pose(
+            first_site_target, first_rotation, q_init=q_start,
+            iters=360, lock_wrist_roll=wrist)
+        preview = mujoco.MjData(model)
+        preview.qpos[:] = data.qpos
+        for adr, value in zip(arm.qadr, q_approach):
+            preview.qpos[adr] = value
+        mujoco.mj_forward(model, preview)
+        fixed = [mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_GEOM,
+            "fixed_jaw_pad_v%d" % k) for k in (1, 2)]
+        moving = [mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_GEOM,
+            "moving_jaw_pad_v%d" % k) for k in (1, 2)]
+        entry_axis = (np.mean(preview.geom_xpos[moving], axis=0)
+                      - np.mean(preview.geom_xpos[fixed], axis=0))
+        rod = state["grasp_axis_target"]
+        entry_axis -= np.dot(entry_axis, rod) * rod
+        entry_axis /= max(float(np.linalg.norm(entry_axis)), 1e-12)
+        if PICKUP_ALGORITHM == "mouth_axis":
+            approach_clearance = float(
+                np.asarray(stages[0][1], dtype=float)[2] - pick_at[2])
+            approach_target, mouth_outside, grasp_target = (
+                _mouth_axis_pickup_waypoints(
+                    pick_at, entry_axis, approach_clearance,
+                    final_lift_m=0.0))
+            stages[0] = (
+                stages[0][0], approach_target, stages[0][2])
+            stages[1] = (stages[1][0], mouth_outside, stages[1][2])
+            print("  新路线=槽口外上方→垂直下降→沿槽口进入")
+        else:
+            stages[1] = (stages[1][0],
+                         np.asarray(pick_at, dtype=float)
+                         - 0.020 * entry_axis, stages[1][2])
+        print("  抓取接近轴  fixed->moving=%s  进入目标=%s"
+              % (np.round(entry_axis, 4), np.round(stages[1][1], 4)))
+
+        stage_progress = (1.0 / 3.0, 2.0 / 3.0, 1.0)
+        pad_targets = [np.asarray(stage[1], dtype=float)
+                       for stage in stages]
+        rotations = [R_start] + [
+            _rotation_slerp(
+                state["pickup_rotation_start"],
+                state["pickup_rotation_target"], fraction)
+            for fraction in stage_progress]
+        points = [q_start]
+        site_points = [site_start]
+        parameter_grid = [0.0]
+        segment_lengths = []
+        q_prev = q_start.copy()
+        last_residual = (0.0, 0.0)
+        last_pad_residual = None
+        pad_target_data = mujoco.MjData(model)
+
+        def smooth(value):
+            value = float(value)
+            return value * value * value * (
+                10.0 + value * (-15.0 + 6.0 * value))
+
+        stage_steps = [int(stage[2]) for stage in stages]
+        steps = max(1, sum(stage_steps))
+        elapsed_steps = 0
+        for segment in range(3):
+            p0 = pad_start if segment == 0 else pad_targets[segment - 1]
+            p1 = pad_targets[segment]
+            segment_site_start = len(site_points) - 1
+            for frac in np.linspace(1.0 / 8.0, 1.0, 8):
+                # Keep the geometric path monotone through each waypoint;
+                # the single global time law below provides endpoint easing.
+                blend = float(frac)
+                R_waypoint = _rotation_slerp(
+                    rotations[segment], rotations[segment + 1], blend)
+                pad_p = p0 + frac * (p1 - p0)
+                site_p = pad_p - R_waypoint @ pad_offset_local
+                if PICKUP_ALGORITHM == "mouth_axis":
+                    q_prev, pe, re = arm.ik_axis(
+                        site_p, state["grasp_axis_target"],
+                        state["grasp_axis_local"], q_init=q_prev,
+                        iters=360)
+                    for _pad_solve in range(3):
+                        pad_target_data.qpos[:] = data.qpos
+                        for adr, value in zip(arm.qadr, q_prev):
+                            pad_target_data.qpos[adr] = value
+                        mujoco.mj_forward(model, pad_target_data)
+                        pad_error = (
+                            pad_p - arm.pad_center(pad_target_data))
+                        last_pad_residual = float(np.linalg.norm(pad_error))
+                        if last_pad_residual <= 5e-5:
+                            break
+                        # Solve the actual V-jaw midpoint, not an assumed
+                        # fixed tool-frame offset. Axis IK leaves axial roll
+                        # free, so the pad midpoint can move with that roll.
+                        site_p += pad_error
+                        q_prev, pe, re = arm.ik_axis(
+                            site_p, state["grasp_axis_target"],
+                            state["grasp_axis_local"], q_init=q_prev,
+                            iters=360)
+                else:
+                    q_prev, pe, re = arm.ik_pose(
+                        site_p, R_waypoint, q_init=q_prev,
+                        iters=360, lock_wrist_roll=wrist)
+                last_residual = (float(pe), float(re))
+                state.setdefault("ik_solver", []).append({
+                    "stage": stages[segment][0] + "#continuous",
+                    "position_residual_mm": float(pe * 1000),
+                    "pad_position_residual_mm": (
+                        None if last_pad_residual is None
+                        else float(last_pad_residual * 1000)),
+                    "axis_residual_deg": (
+                        float(np.degrees(re))
+                        if PICKUP_ALGORITHM == "mouth_axis" else None),
+                    "orientation_residual_deg": (
+                        None if PICKUP_ALGORITHM == "mouth_axis"
+                        else float(np.degrees(re))),
+                })
+                points.append(q_prev.copy())
+                site_points.append(site_p.copy())
+                parameter_grid.append(smooth(
+                    (elapsed_steps + frac * stage_steps[segment]) / steps))
+            segment_lengths.append(float(np.sum(np.linalg.norm(
+                np.diff(np.asarray(site_points[segment_site_start:]),
+                         axis=0), axis=1))))
+            elapsed_steps += stage_steps[segment]
+
+        q_path = np.asarray(points, dtype=float)
+        grid = np.asarray(parameter_grid, dtype=float)
+        # Remove duplicate coordinates defensively before fitting a spline.
+        keep = np.concatenate([[True], np.diff(grid) > 1e-10])
+        grid = grid[keep]
+        q_path = q_path[keep]
+        splines = [CubicSpline(grid, q_path[:, j], bc_type="natural")
+                   for j in range(q_path.shape[1])]
+        boundaries = np.cumsum(stage_steps, dtype=float) / steps
+        dt = float(model.opt.timestep)
+        q_goal = q_path[-1].copy()
+        previous_label = None
+        for i in range(steps):
+            t = (i + 1) / steps
+            s = smooth(t)
+            segment = min(2, int(np.searchsorted(boundaries, t, side="left")))
+            label = stages[segment][0] + "#continuous"
+            if label != previous_label:
+                state["label"] = label
+                previous_label = label
+            q = np.asarray([spline(s) for spline in splines], dtype=float)
+            s_next = smooth(min(1.0, (i + 2) / steps))
+            q_next = np.asarray(
+                [spline(s_next) for spline in splines], dtype=float)
+            qd_reference = (q_next - q) / dt
+            if ARM_MOVE_LEAD or ARM_MOVE_DAMP:
+                for adr, value, velocity in zip(
+                        arm.qadr, q, qd_reference):
+                    data.ctrl[adr] = (
+                        value + ARM_MOVE_LEAD * velocity
+                        - ARM_MOVE_DAMP
+                        * (float(data.qvel[adr]) - velocity))
+            else:
+                for adr, value in zip(arm.qadr, q):
+                    data.ctrl[adr] = value
+            data.ctrl[arm.grip_act] = grip_cmd(grip)
+            data.ctrl[jaw_act] = jaw_ctrl
+            step_sim()
+            record_pickup_joint_frame("trajectory", q, qd_reference)
+            state.setdefault("traj", []).append(
+                data.site_xpos[arm.site].copy())
+            state.setdefault("traj_t", []).append(float(data.time))
+            state.setdefault("traj_label", []).append(state["label"])
+            track_pen(state["label"])
+            if frame_hook is not None and i % FRAME_EVERY == 0:
+                tick()
+
+        state["label"] = "下降#continuous"
+        for _ in range(90):
+            for adr, value in zip(arm.qadr, q_goal):
+                data.ctrl[adr] = value
+            data.ctrl[arm.grip_act] = grip_cmd(grip)
+            data.ctrl[jaw_act] = jaw_ctrl
+            step_sim()
+            record_pickup_joint_frame(
+                "settle", q_goal, np.zeros_like(q_goal))
+            state.setdefault("traj", []).append(
+                data.site_xpos[arm.site].copy())
+            state.setdefault("traj_t", []).append(float(data.time))
+            state.setdefault("traj_label", []).append(state["label"])
+            track_pen(state["label"])
+            if frame_hook is not None and _ % (FRAME_EVERY * 2) == 0:
+                tick()
+
+        state["pickup_motion_diagnostics"]["motion_refinement"].append({
+            "stage": "接近→侧向进入→下降",
+            "strategy": (
+                "mouth_entry_position_axis_ik"
+                if PICKUP_ALGORITHM == "mouth_axis"
+                else "single_full_pose_curve_with_final_settle"),
+            "entry_axis_world_unit": [
+                float(value) for value in entry_axis],
+            "stage_waypoints": [
+                [float(x) for x in target] for target in pad_targets],
+            "stage_path_lengths_mm": [
+                float(value * 1000) for value in segment_lengths],
+            "motion_steps": steps,
+            "settle_steps": 90,
+            "last_ik_position_residual_mm": last_residual[0] * 1000,
+            "last_ik_axis_residual_deg": (
+                float(np.degrees(last_residual[1]))
+                if PICKUP_ALGORITHM == "mouth_axis" else None),
+            "last_ik_orientation_residual_deg": (
+                None if PICKUP_ALGORITHM == "mouth_axis"
+                else float(np.degrees(last_residual[1]))),
+            "last_pad_ik_residual_mm": (
+                None if last_pad_residual is None
+                else float(last_pad_residual * 1000)),
+            "final_pad_target_error_mm": float(
+                np.linalg.norm(arm.pad_center() - pad_targets[-1]) * 1000),
+        })
+        return float(np.linalg.norm(
+            arm.pad_center() - pad_targets[-1]))
 
     def move_path(targets, grip, locked, jaw_ctrl=SM.CHUCK_OPEN_CTRL,
                   label="搬运", samples=None, v_cruise=0.55, a_max=2.0,
@@ -4164,6 +4538,34 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     mujoco.mj_forward(model, calibration_data)
     calibrated_site_rotation = calibration_data.site_xmat[
         arm.site].reshape(3, 3)
+    state["pickup_rotation_target"] = calibrated_site_rotation.copy()
+    pickup_rotation_source = "calibrated_nominal_grasp_ik"
+    pickup_rotation_raw = os.environ.get(
+        "FEED_PICKUP_TARGET_SITE_ROTATION")
+    if pickup_rotation_raw:
+        pickup_rotation = np.asarray(
+            json.loads(pickup_rotation_raw), dtype=float)
+        if pickup_rotation.size == 9:
+            pickup_rotation = pickup_rotation.reshape(3, 3)
+        if pickup_rotation.shape != (3, 3):
+            raise ValueError(
+                "FEED_PICKUP_TARGET_SITE_ROTATION must contain 9 values")
+        if (not np.isfinite(pickup_rotation).all()
+                or np.linalg.norm(
+                    pickup_rotation.T @ pickup_rotation - np.eye(3)) > 1e-5
+                or np.linalg.det(pickup_rotation) < 0.99999):
+            raise ValueError(
+                "FEED_PICKUP_TARGET_SITE_ROTATION must be a proper rotation")
+        state["pickup_rotation_target"] = pickup_rotation.copy()
+        pickup_rotation_source = "explicit_successful_grasp_reference"
+    state["inputs"]["pickup_pose_target"] = {
+        "source": pickup_rotation_source,
+        "site_rotation_world": [
+            [float(value) for value in row]
+            for row in state["pickup_rotation_target"]],
+    }
+    state["pickup_rotation_start"] = data.site_xmat[
+        arm.site].reshape(3, 3).copy()
     state["grasp_axis_local"] = (
         calibrated_site_rotation.T @ WORLD_X_AXIS)
     state["grasp_axis_target"] = planning_axis
@@ -4230,7 +4632,52 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
          grip_close, 320),
     ])
     grasp_tilt = None
+    continuous_pickup = v_jaw and PICKUP_POSE_ALIGN and (
+        PICKUP_ALGORITHM == "mouth_axis" or PICKUP_CONTINUOUS)
+    if continuous_pickup:
+        continuous_stages = [tuple(stage) for stage in pick[:3]]
+        continuous_stages = [
+            (name, tgt, int(round(ns * PICKUP_ENTRY_TIME_SCALE))
+             if name in ("侧向进入", "下降") else ns)
+            for name, tgt, grip, ns in continuous_stages]
+        if PICKUP_REFINEMENT:
+            # Match the accepted staged baseline's 550+150-step approach
+            # budget without inserting its intermediate stop/correction.
+            name, target, approach_steps = continuous_stages[0]
+            continuous_stages[0] = (
+                name, target, approach_steps + MIN_FIX_STEPS)
+        if len(continuous_stages) != 3:
+            raise RuntimeError("continuous pickup needs approach, entry, descent")
+        if continuous_stages[1][1] is not None:
+            raise RuntimeError("side-entry target must be derived at approach")
+        move_pickup_continuous(continuous_stages, GRIP_OPEN,
+                               SM.CHUCK_OPEN_CTRL)
+        grasp_tilt = tilt_deg(data.qpos[sq + 3:sq + 7])
+        print("  连续进场 轴=%s 轴向偏=%5.1f deg pad-轴=%5.1f mm"
+              % (np.round(shaft(), 4), axdev(),
+                 np.linalg.norm(arm.pad_center() - shaft()) * 1000))
+        descent_target = np.asarray(pick_at, dtype=float) + np.array(
+            [0.0, 0.0, 0.002])
+        descent_error = float(np.linalg.norm(
+            arm.pad_center() - descent_target))
+        correction_gain = (
+            PICKUP_FINAL_CORRECTION_GAIN
+            if PICKUP_ALGORITHM == "mouth_axis" else 1.0)
+        if descent_error > 0.003 and correction_gain > 0.0:
+            correction_target = (
+                arm.pad_center()
+                + correction_gain
+                * (descent_target - arm.pad_center()))
+            print("  连续进场末端误差 %.2f mm，末段纠正增益 %.2f"
+                  % (descent_error * 1000, correction_gain))
+            move3(correction_target, 1200, GRIP_OPEN, False,
+                  iters=1, label="下降")
+        tick("④ 连续进场到达抓取姿态")
+        pick = pick[3:]
+
     for name, tgt, grip, ns in pick:
+        if name in ("侧向进入", "下降") and PICKUP_POSE_ALIGN:
+            ns = int(round(ns * PICKUP_ENTRY_TIME_SCALE))
         if name == "侧向进入":
             fixed = [mujoco.mj_name2id(
                 model, mujoco.mjtObj.mjOBJ_GEOM,
@@ -4246,7 +4693,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             tgt = pick_at - 0.020 * entry_axis
             print("  抓取接近轴  fixed->moving=%s  进入目标=%s"
                   % (np.round(entry_axis, 4), np.round(tgt, 4)))
-        move3(np.array(tgt), ns, grip, False, label=name)
+        err = move3(np.array(tgt), ns, grip, False, label=name)
         grasp_tilt = tilt_deg(data.qpos[sq + 3:sq + 7])
         print("  %-6s 轴=%s 轴向偏=%5.1f deg  pad-轴=%5.1f mm"
               % (name, np.round(shaft(), 4), axdev(),
@@ -4359,6 +4806,11 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 float(value) for value in arm.pad_center()],
             "sim_time_s": float(data.time),
             "carry_lock": bool(carry_lock),
+            "pickup_motion_diagnostics": state.get(
+                "pickup_motion_diagnostics", {}),
+            "ik_solver": state.get("ik_solver", []),
+            "ik_residuals_mm": state.get("ik_residuals_mm", {}),
+            "stages": state.get("stage_records", []),
         }
     state["grasp_axis_target"] = None
     state["grasp_axis_active"] = False

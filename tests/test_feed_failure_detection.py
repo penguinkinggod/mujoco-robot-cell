@@ -43,6 +43,54 @@ class WorldYawConventionTests(unittest.TestCase):
             feed._resolve_initial_yaw_deg(5.0, -5.0)
 
 
+class PickupRotationPlanningTests(unittest.TestCase):
+    def test_rotation_slerp_uses_shortest_midpoint(self):
+        angle = np.radians(90.0)
+        end = np.array([
+            [np.cos(angle), -np.sin(angle), 0.0],
+            [np.sin(angle), np.cos(angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        midpoint = feed._rotation_slerp(np.eye(3), end, 0.5)
+        expected_angle = np.radians(45.0)
+        expected = np.array([
+            [np.cos(expected_angle), -np.sin(expected_angle), 0.0],
+            [np.sin(expected_angle), np.cos(expected_angle), 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+
+        np.testing.assert_allclose(expected, midpoint, atol=1e-12)
+        np.testing.assert_allclose(
+            np.eye(3), midpoint.T @ midpoint, atol=1e-12)
+
+    def test_rotation_slerp_rejects_nonfinite_rotation(self):
+        invalid = np.eye(3)
+        invalid[0, 0] = np.nan
+        with self.assertRaises(ValueError):
+            feed._rotation_slerp(np.eye(3), invalid, 0.5)
+
+
+class MouthAxisPickupWaypointTests(unittest.TestCase):
+    def test_path_drops_outside_then_enters_along_mouth_axis(self):
+        grasp = np.array([0.260, -0.130, 0.042])
+        axis = np.array([0.0, -0.8, 0.6])
+        overhead, outside, target = feed._mouth_axis_pickup_waypoints(
+            grasp, axis, 0.085, entry_distance_m=0.020,
+            final_lift_m=0.0)
+
+        np.testing.assert_allclose(
+            outside - overhead, [0.0, 0.0, -0.085], atol=1e-12)
+        np.testing.assert_allclose(
+            target - outside, 0.020 * axis / np.linalg.norm(axis),
+            atol=1e-12)
+        self.assertGreater(float(np.dot(target - outside, axis)), 0.0)
+
+    def test_rejects_degenerate_mouth_axis(self):
+        with self.assertRaises(ValueError):
+            feed._mouth_axis_pickup_waypoints(
+                [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 0.1)
+
+
 class ToolFrameMotionTests(unittest.TestCase):
     def test_rigid_tool_rotation_is_not_reported_as_slip(self):
         angle = np.radians(73.0)
@@ -405,6 +453,10 @@ class RobotMachineContactTests(unittest.TestCase):
 
     def test_full_feed_reports_injected_collision_as_hard_failure(self):
         model, data = self._build_model()
+        previous_algorithm = feed.PICKUP_ALGORITHM
+        # Keep this fault injection at its original callback index. Its goal
+        # is collision classification, not testing the selected pickup route.
+        feed.PICKUP_ALGORITHM = "legacy"
         stage_count = [0]
         injected = [False]
 
@@ -444,6 +496,7 @@ class RobotMachineContactTests(unittest.TestCase):
                         carry_lock=False,
                     )
             finally:
+                feed.PICKUP_ALGORITHM = previous_algorithm
                 if previous_path is None:
                     os.environ.pop("FEED_RESULT_JSON", None)
                 else:
@@ -524,20 +577,38 @@ class RobotMachineContactTests(unittest.TestCase):
         assert_reproducibility_fields(self, result)
         pickup_motion = result["pickup_motion_diagnostics"]
         self.assertEqual("observed", pickup_motion["status"])
+        expected_strategy = (
+            "mouth_entry_position_axis_ik"
+            if feed.PICKUP_ALGORITHM == "mouth_axis"
+            else "full_stage_first_pass_then_bounded_corrections")
         self.assertEqual(
-            "full_stage_first_pass_then_bounded_corrections",
+            expected_strategy,
             result["effective_parameters"]["controller"][
                 "pickup_motion_strategy"])
         self.assertTrue(
             result["effective_parameters"]["controller"][
                 "pickup_refinement_enabled"])
-        self.assertEqual(
-            ["接近", "侧向进入"],
-            [row["stage"] for row in pickup_motion["motion_refinement"]])
-        self.assertTrue(all(
-            row["correction_count"] <= 2
-            and row["final_target_error_mm"] <= row["target_tolerance_mm"]
-            for row in pickup_motion["motion_refinement"]))
+        if feed.PICKUP_ALGORITHM == "mouth_axis":
+            route = pickup_motion["motion_refinement"][-1]
+            self.assertEqual("mouth_entry_position_axis_ik",
+                             route["strategy"])
+            waypoints = np.asarray(route["stage_waypoints"])
+            # The second and third targets advance into the jaw mouth; they
+            # must not reverse laterally as the old side-entry path did.
+            entry_delta = waypoints[2] - waypoints[1]
+            mouth_axis = np.asarray(route["entry_axis_world_unit"])
+            self.assertGreater(float(np.dot(entry_delta, mouth_axis)), 0.0)
+            self.assertLess(route["last_pad_ik_residual_mm"], 0.1)
+        else:
+            self.assertEqual(
+                ["接近", "侧向进入"],
+                [row["stage"]
+                 for row in pickup_motion["motion_refinement"]])
+            self.assertTrue(all(
+                row["correction_count"] <= 2
+                and row["final_target_error_mm"]
+                <= row["target_tolerance_mm"]
+                for row in pickup_motion["motion_refinement"]))
         self.assertEqual(
             2.0, result["effective_parameters"]["feed"]["axis_lead_deg"])
         self.assertEqual(
@@ -721,12 +792,41 @@ class FeedFailureStatusTests(unittest.TestCase):
             result = json.loads(result_path.read_text(encoding="utf-8"))
         return exit_code, result
 
+    def test_default_pickup_pose_path_preserves_v_jaw_grasp(self):
+        self.assertTrue(feed.PICKUP_POSE_ALIGN)
+        self.assertEqual(2.0, feed.PICKUP_ENTRY_TIME_SCALE)
+        self.assertEqual("mouth_axis", feed.PICKUP_ALGORITHM)
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = feed.main(
+                v_jaw=True,
+                lift=True,
+                carry_lock=False,
+                planning_mode="M1",
+                initial_settle_steps=600,
+                random_seed=0,
+                stop_after_grasp=True,
+            )
+
+        self.assertEqual("grasp_complete", result["execution_status"])
+        self.assertEqual(8, result["grasp_contact_count"])
+        self.assertLess(result["grasp_tilt_deg"], 2.0)
+        pickup_ik = [row for row in result["ik_solver"]
+                     if row.get("axis_residual_deg") is not None]
+        self.assertTrue(pickup_ik)
+        self.assertTrue(all(np.isfinite(
+            row["axis_residual_deg"]) for row in pickup_ik))
+
     def test_robot_release_can_start_after_triple_chuck_contact(self):
         keys = (
             "FEED_TRACE_CLAMP_HANDOVER",
             "FEED_RELEASE_AFTER_TRIPLE_CONTACT",
         )
         previous = {key: os.environ.get(key) for key in keys}
+        previous_pose_align = feed.PICKUP_POSE_ALIGN
+        # This case covers the legacy path's zero-contact/recontact reset in
+        # the release detector. The default pose-aligned path is covered by
+        # the pickup-grasp and full-feed checks separately.
+        feed.PICKUP_POSE_ALIGN = False
         os.environ["FEED_TRACE_CLAMP_HANDOVER"] = "1"
         os.environ["FEED_RELEASE_AFTER_TRIPLE_CONTACT"] = "1"
         try:
@@ -745,6 +845,7 @@ class FeedFailureStatusTests(unittest.TestCase):
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+            feed.PICKUP_POSE_ALIGN = previous_pose_align
 
         self.assertIn(exit_code, (0, 1))
         assert_reproducibility_fields(self, result)
@@ -941,11 +1042,15 @@ class FeedFailureStatusTests(unittest.TestCase):
         previous_axis_lead = feed.AXIS_LEAD_DEG
         previous_axis_target = feed._AXIS_TGT.copy()
         previous_pickup_refinement = feed.PICKUP_REFINEMENT
+        previous_pose_align = feed.PICKUP_POSE_ALIGN
         os.environ["FEED_V_CONTACT_SOLREF_TIME"] = "0.005"
         feed.AXIS_LEAD_DEG = 1.0
         feed._AXIS_TGT = np.array([
             np.cos(np.radians(1.0)), 0.0, np.sin(np.radians(1.0))])
         feed.PICKUP_REFINEMENT = False
+        # Keep this classification fixture on its original pickup trajectory;
+        # the new default posture profile changes its final stock eccentricity.
+        feed.PICKUP_POSE_ALIGN = False
         try:
             exit_code, result = self._run_feed(
                 "test-quality-fail-solref-005",
@@ -961,6 +1066,7 @@ class FeedFailureStatusTests(unittest.TestCase):
             feed.AXIS_LEAD_DEG = previous_axis_lead
             feed._AXIS_TGT = previous_axis_target
             feed.PICKUP_REFINEMENT = previous_pickup_refinement
+            feed.PICKUP_POSE_ALIGN = previous_pose_align
 
         self.assertEqual(1, exit_code)
         assert_reproducibility_fields(self, result)
@@ -1056,8 +1162,14 @@ class FeedFailureStatusTests(unittest.TestCase):
         self.assertEqual(0.002, trace["joint_time_history_sample_interval_s"])
         rows = trace["joint_time_history"]
         self.assertGreater(len(rows), 1000)
-        self.assertEqual({"接近", "侧向进入"},
-                         {row["stage"] for row in rows})
+        # 抓取段记录至少要覆盖接近与侧向进入；下降/夹紧也属于抓取动作，
+        # 用于点头角与抓取姿态诊断，允许存在但不强制要求。
+        stages = {row["stage"] for row in rows}
+        self.assertTrue({"接近", "侧向进入"}.issubset(stages),
+                        "missing pickup stages: %s" % (stages,))
+        self.assertTrue(
+            stages.issubset({"接近", "侧向进入", "下降", "夹紧"}),
+            "unexpected stage in pickup trace: %s" % (stages,))
         self.assertTrue(all(
             len(row["joint_position_rad"]) == 5
             and len(row["joint_velocity_rad_s"]) == 5

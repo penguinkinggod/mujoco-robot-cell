@@ -15,6 +15,9 @@ Run:
 --quick    only syntax/compile checks (seconds). Use while editing.
 --verbose  print the full output of every child script.
 
+The full regression already runs the unittest suite as its last check. Avoid
+running unittest discovery separately and then repeating it inside this script.
+
 Exit code: 0 = all passed, 1 = at least one failed.
 """
 import argparse
@@ -291,8 +294,8 @@ CHECKS = [
     dict(name="送料失败检测单测",
          cmd=[PY, "-m", "unittest", "discover", "-s", "tests",
               "-p", "test_*.py"],
-         check=check_feed_failure_detection, slow=False,
-         hint="约 5 秒"),
+         check=check_feed_failure_detection, slow=True,
+         hint="约 70 秒"),
 ]
 
 
@@ -353,8 +356,10 @@ def main():
     n_ok = sum(1 for ok, _ in results if ok)
     all_ok = n_ok == len(results) and len(results) > 0
     print("-" * 68)
+    passed_label = ("PASS — 快速检查通过" if args.quick
+                    else "PASS — 项目没有退化")
     print("  %s  (%d/%d 通过, 用时 %.1fs)" %
-          ("PASS — 项目没有退化" if all_ok else "FAIL — 有检查未通过",
+          (passed_label if all_ok else "FAIL — 有检查未通过",
            n_ok, len(results), total))
     print("=" * 68)
     return 0 if all_ok else 1

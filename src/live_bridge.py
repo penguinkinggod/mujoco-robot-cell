@@ -36,6 +36,7 @@ ROOT = os.path.dirname(HERE)          # project root (src/ -> ..)
 OUT = os.path.join(ROOT, "_build")    # generated figures, not tracked
 STATE = os.path.join(OUT, "live_state.npy")
 TMP = os.path.join(OUT, "_live_tmp.npy")   # 必须以 .npy 结尾，否则 numpy 会自动补后缀
+RUN_LOCK = os.path.join(OUT, "live_bridge.run.lock")
 
 # 画面里放哪一套场景。view 和 run 必须用同一套，否则同轴、接触这些
 # 指标是对着 V 槽算的，画面上却是平板爪 —— 看着抓住了，其实不是那只手。
@@ -162,7 +163,53 @@ def view():
         print("VIEW_RELOAD scene source changed -> recompiling", flush=True)
 
 
+def _acquire_run_lock():
+    """Hold an OS-managed exclusive lock while this process publishes frames."""
+    os.makedirs(OUT, exist_ok=True)
+    lock_file = open(RUN_LOCK, "a+b")
+    lock_file.seek(0, os.SEEK_END)
+    if lock_file.tell() == 0:
+        lock_file.write(b"\0")
+        lock_file.flush()
+    lock_file.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock_file.close()
+        return None
+    return lock_file
+
+
+def _release_run_lock(lock_file):
+    lock_file.seek(0)
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    lock_file.close()
+
+
 def run(loop=False):
+    """Reject a second frame publisher so two simulations cannot fight visually."""
+    lock_file = _acquire_run_lock()
+    if lock_file is None:
+        print("RUN_ALREADY_ACTIVE another live_bridge publisher holds the lock",
+              flush=True)
+        return 2
+    try:
+        return _run_locked(loop)
+    finally:
+        _release_run_lock(lock_file)
+
+
+def _run_locked(loop=False):
     """跑仿真并把每帧关节值推给窗口。
 
     没有这个进程，view 那个窗口只会停在初始姿态上 —— 它就是一只
