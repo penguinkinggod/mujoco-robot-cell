@@ -1105,6 +1105,16 @@ class FeedFailureStatusTests(unittest.TestCase):
         feed.PICKUP_INTERP = "cspline"
         feed.PICKUP_APPROACH_STEPS = 550
         feed.PATH_END_CLOSE = 0
+        # P5.8.34 turns SM_JAW_ARC_SEGS=20 into the default. More arc segments
+        # grip the rod better and drop this fixture's stock_ecc from 2.188 to
+        # ~0.33, which no longer crosses the 2.0 mm threshold. Pin the old
+        # 5-segment geometry for this fixture only by patching the already
+        # imported module constant (it is read at import time, so an env var
+        # would be too late here).
+        _sm = sys.modules.get("scene_machining")
+        previous_segs = getattr(_sm, "JAW_ARC_SEGS", None) if _sm else None
+        if _sm is not None:
+            _sm.JAW_ARC_SEGS = 5
         try:
             exit_code, result = self._run_feed(
                 "test-quality-fail-solref-005",
@@ -1117,6 +1127,8 @@ class FeedFailureStatusTests(unittest.TestCase):
             feed.PICKUP_INTERP = previous_interp
             feed.PICKUP_APPROACH_STEPS = previous_approach
             feed.PATH_END_CLOSE = previous_end_close
+            if _sm is not None and previous_segs is not None:
+                _sm.JAW_ARC_SEGS = previous_segs
             if previous_solref is None:
                 os.environ.pop("FEED_V_CONTACT_SOLREF_TIME", None)
             else:

@@ -2661,6 +2661,18 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 }
                 for index, values in jaw_contacts.items()
             },
+            # P5.8.35：三爪力比。原来 jaw_state() 只统计「总接触点 + 总力」，
+            # 三爪各自分担多少从来没进过判据。实测 20 段默认下
+            # 爪0/1/2 = 20.26 / 71.98 / 69.82 N，力比 3.55 —— 而
+            # diag_chuck_health.py 的 FORCE_RATIO_LIMIT 是 2.0，早就超线。
+            # 爪0 在正上方 90°，重力向下它不承重，所以力最小属正常；
+            # 但它滑座走得最深（-15.694 vs -15.597），是被 mjEQ_JOINT
+            # 软约束拖着走的结果，正是力比失控的机理。
+            "jaw_force_ratio": float(
+                max(values["normal_force_sum_N"]
+                    for values in jaw_contacts.values())
+                / max(min(values["normal_force_sum_N"]
+                          for values in jaw_contacts.values()), 1e-6)),
             "shaft_center_world_m": [
                 float(value) for value in shaft_position],
             "shaft_center_delta_from_handover_start_mm": [

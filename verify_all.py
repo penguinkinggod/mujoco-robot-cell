@@ -291,6 +291,8 @@ CHECKS = [
     dict(name="送料·官方场景(SO-101 env)",
          cmd=[PY, "src/env_cell.py", "--run", "--no-video"],
          check=check_env_cell, slow=True, hint="约 5 秒"),
+    # 这一项把 tests/ 全跑了，所以它是「唯一入口」——不要再单独跑 unittest，
+    # 那等于白跑两遍（用户 2026-11-12 指出验证成本没必要）。
     dict(name="送料失败检测单测",
          cmd=[PY, "-m", "unittest", "discover", "-s", "tests",
               "-p", "test_*.py"],
