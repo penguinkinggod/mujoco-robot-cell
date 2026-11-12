@@ -44,6 +44,17 @@ class WorldYawConventionTests(unittest.TestCase):
 
 
 class PickupRotationPlanningTests(unittest.TestCase):
+    def test_axis_slerp_uses_shortest_midpoint(self):
+        midpoint = feed._axis_slerp([0.0, 0.0, 1.0], [0.0, 1.0, 0.0], 0.5)
+        expected = np.array([0.0, np.sqrt(0.5), np.sqrt(0.5)])
+        np.testing.assert_allclose(expected, midpoint, atol=1e-12)
+
+    def test_axis_slerp_treats_antiparallel_as_same_cylinder_axis(self):
+        start = np.array([0.0, 0.0, 1.0])
+        for fraction in np.linspace(0.0, 1.0, 5):
+            np.testing.assert_allclose(
+                start, feed._axis_slerp(start, -start, fraction), atol=1e-12)
+
     def test_rotation_slerp_uses_shortest_midpoint(self):
         angle = np.radians(90.0)
         end = np.array([
@@ -796,16 +807,24 @@ class FeedFailureStatusTests(unittest.TestCase):
         self.assertTrue(feed.PICKUP_POSE_ALIGN)
         self.assertEqual(2.0, feed.PICKUP_ENTRY_TIME_SCALE)
         self.assertEqual("mouth_axis", feed.PICKUP_ALGORITHM)
-        with contextlib.redirect_stdout(io.StringIO()):
-            result = feed.main(
-                v_jaw=True,
-                lift=True,
-                carry_lock=False,
-                planning_mode="M1",
-                initial_settle_steps=600,
-                random_seed=0,
-                stop_after_grasp=True,
-            )
+        previous_trace = os.environ.get("FEED_TRACE_PICKUP_MOTION")
+        os.environ["FEED_TRACE_PICKUP_MOTION"] = "1"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = feed.main(
+                    v_jaw=True,
+                    lift=True,
+                    carry_lock=False,
+                    planning_mode="M1",
+                    initial_settle_steps=600,
+                    random_seed=0,
+                    stop_after_grasp=True,
+                )
+        finally:
+            if previous_trace is None:
+                os.environ.pop("FEED_TRACE_PICKUP_MOTION", None)
+            else:
+                os.environ["FEED_TRACE_PICKUP_MOTION"] = previous_trace
 
         self.assertEqual("grasp_complete", result["execution_status"])
         self.assertEqual(8, result["grasp_contact_count"])
@@ -815,6 +834,21 @@ class FeedFailureStatusTests(unittest.TestCase):
         self.assertTrue(pickup_ik)
         self.assertTrue(all(np.isfinite(
             row["axis_residual_deg"]) for row in pickup_ik))
+        approach = [
+            row for row in result["pickup_motion_diagnostics"][
+                "joint_time_history"]
+            if row["stage"] == "接近" and row["sample_phase"] == "trajectory"]
+        self.assertTrue(approach, "startup approach trace is missing")
+        approach_z = np.asarray([
+            row["tool_position_world_m"][2] for row in approach])
+        self.assertLess(
+            float(np.ptp(approach_z)), 0.065,
+            "startup approach has an unintended vertical swing")
+        peak_joint_reference_speed = float(np.max(np.abs([
+            row["joint_reference_velocity_rad_s"] for row in approach])))
+        self.assertLess(
+            peak_joint_reference_speed, 4.0,
+            "startup IK path is still commanding an excessive joint speed")
 
     def test_robot_release_can_start_after_triple_chuck_contact(self):
         keys = (

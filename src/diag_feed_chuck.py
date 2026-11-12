@@ -274,6 +274,10 @@ def _resolve_planning_pose(planning_mode, true_pose, nominal_position_m,
 
 _REPRODUCIBLE_ENV_KEYS = {
     "FEED_INSERT_MM", "FEED_Z_COMP_MM", "FEED_GRIP_STATION_MM",
+    "FEED_FEED_OFFSET_Y_MM", "FEED_FEED_OFFSET_Z_MM",
+    "FEED_V_JAW_OFFSET_MM", "FEED_V_JAW_HALF_SPAN_MM", "FEED_CARRY_LIFT_MM",
+    "FEED_CARRY_END_HOLD", "FEED_PATH_CORNER_DENSIFY", "FEED_PATH_CORNER_K",
+    "FEED_PATH_CORNER_WINDOW", "FEED_PATH_QSMOOTH",
     "FEED_RETREAT_AXIAL", "FEED_LEVEL_ROD", "FEED_AXIS_LEAD_DEG",
     "FEED_SEAT_TAP_MM", "FEED_BUSHING", "FEED_BUSHING_GAP",
     "FEED_BUSHING_FRONT", "FEED_BUSHING_LEN", "FEED_BUSHING_N",
@@ -802,6 +806,54 @@ def _diagnostic_result_fields(state):
     }
 
 
+def _grip_timing_payload(grip_timing):
+    """夹爪指令→实际闭合/张开的实测时序（只读诊断）。
+
+    用户 2026-11-12 要求这个数：用它判断「三爪拧紧后机械臂静止 0.96 s」
+    到底是夹爪真的需要这么久，还是多余的等待。
+    """
+    records = grip_timing.get("records", [])
+    completed = [r for r in records if r["duration_ms"] is not None]
+    return {
+        "enabled_by": "FEED_TRACE_TCP=1",
+        "records": records,
+        "completed_count": len(completed),
+        "incomplete_count": len(records) - len(completed),
+        "close_durations_ms": [
+            r["duration_ms"] for r in completed if r["event"] == "闭合"],
+        "open_durations_ms": [
+            r["duration_ms"] for r in completed if r["event"] == "张开"],
+        "settle_tolerance": "max(0.5% of travel, 2e-3) rad and |qvel| < 0.02",
+        "criterion": "diagnostic_only_no_pass_fail_threshold",
+    }
+
+
+def _tcp_trace_payload(state, model):
+    """Export the per-step TCP trace so motion quality can be recomputed later.
+
+    This is an OUTPUT-ONLY view of state["traj"] / ["traj_t"] / ["traj_label"],
+    which the run already accumulates for the console smoothness summary. No
+    control value, criterion or threshold depends on it; consumers recompute
+    stops, zero-velocity intervals, frame-to-frame turn angles and shortest
+    motion segments from it with whatever threshold they need.
+    """
+    positions = state.get("traj") or []
+    times = state.get("traj_t") or []
+    labels = state.get("traj_label") or []
+    count = min(len(positions), len(times), len(labels))
+    return {
+        "enabled_by": "FEED_TRACE_TCP=1",
+        "sample_interval_s": float(model.opt.timestep),
+        "sample_count": int(count),
+        "labels": [str(labels[i]) for i in range(count)],
+        "time_s": [round(float(times[i]), 6) for i in range(count)],
+        "tcp_position_m": [
+            [round(float(v), 6) for v in positions[i]] for i in range(count)
+        ],
+        "criterion": "diagnostic_only_no_pass_fail_threshold",
+    }
+
+
 def _summarize_initial_stability(
         samples, timestep_s, shaft_length_m, support_geom_names_by_side,
         gravity, workpiece_gravcomp):
@@ -1008,6 +1060,12 @@ APPROACH_MM = 0.030        # 对轴时工件头端离卡爪前端面的间隙
 # 补偿自然归零：0 / 0.5 / 1 mm 扫描对应同轴 0.14 / 0.52 / 1.02 mm，
 # 越补偿越偏。留这个开关只为量测，默认必须是 0。
 FEED_Z_COMP = float(os.environ.get("FEED_Z_COMP_MM", "0")) / 1000.0
+# 送料偏置探针（P5.8.24）：在进给终点上叠加一个横向/竖向偏差，用来测
+# 「三爪卡盘的捕获窗口有多大」。这不是调整参数，是量测卡盘的容差：
+# 偏置越大，夹紧后同轴误差越差，直到某一档开始 FAIL。窗口宽度决定
+# 机械臂交付精度要求，也决定学习路线在交付环节有没有位置。
+FEED_OFFSET_Y = float(os.environ.get("FEED_FEED_OFFSET_Y_MM", "0")) / 1000.0
+FEED_OFFSET_Z = float(os.environ.get("FEED_FEED_OFFSET_Z_MM", "0")) / 1000.0
 # 抓取点沿棒料轴线相对工件中心的位置：负 x = 靠机器人这一侧的尾段。
 # 让自由端（+x）伸出去插卡盘，夹爪始终留在卡盘口外。
 # 2026-11-07 重定：原来是 -15 mm（贴尾端）。实测 -15 时料的重心离夹爪
@@ -1054,6 +1112,26 @@ def _rotation_slerp(start, end, fraction):
     relative = SciRotation.from_matrix(start.T @ end).as_rotvec()
     return start @ SciRotation.from_rotvec(
         float(np.clip(fraction, 0.0, 1.0)) * relative).as_matrix()
+
+
+def _axis_slerp(start, end, fraction):
+    """Interpolate directed unit axes along the shortest spherical arc."""
+    start = _normalise_axis(np.asarray(start, dtype=float))
+    end = _normalise_axis(np.asarray(end, dtype=float))
+    fraction = float(np.clip(fraction, 0.0, 1.0))
+    dot = float(np.clip(np.dot(start, end), -1.0, 1.0))
+    # A cylinder axis is unoriented; choose the equivalent target direction
+    # that avoids an unnecessary half-turn from the current tool pose.
+    if dot < 0.0:
+        end = -end
+        dot = -dot
+    if dot > 1.0 - 1e-10:
+        return _normalise_axis((1.0 - fraction) * start + fraction * end)
+    angle = float(np.arccos(dot))
+    sine = float(np.sin(angle))
+    return _normalise_axis(
+        (np.sin((1.0 - fraction) * angle) / sine) * start
+        + (np.sin(fraction * angle) / sine) * end)
 
 
 CRADLE_DROP = 0.011      # 托条中心比两 pad 中点低多少（R10 + 板半厚 1 mm）
@@ -1174,6 +1252,35 @@ def _add_cradle(spec):
 # shallower the better: 8 mm -> 16.6 deg / 2.3 mm, 16 mm -> 53.6 deg / 3.9 mm.
 V_DEPTH = 0.008          # slot depth (m); swept 8..20 mm, 8 is best so far
 V_BAR = 0.004            # blade thickness
+# P5.8.26：V 刀片中心偏移覆盖（米）。None = 用原公式 depth/2 + bar/(2√2)。
+# 原公式让刀片内表面越过 V 顶点，实测切进棒料 2.99 mm（683 步全程）。
+# 这是几何构造误差，不是碰撞求解问题，所以只能改几何。
+_v_off_env = os.environ.get("FEED_V_JAW_OFFSET_MM")
+V_JAW_OFFSET = None if _v_off_env in (None, "") else float(_v_off_env) / 1000.0
+# 解析零穿透点 off = (r + bar/2)/√2（Ø20 + 4 mm 刀片 → 8.485 mm）。
+# 实测会破坏抓取位姿（grasp_tilt 1.9°→19.2°），所以不做默认，只作参考值。
+V_JAW_OFFSET_DEFAULT = ((0.010 + V_BAR / 2.0) / np.sqrt(2.0))
+# 刀片半长覆盖（米）。None = 用原值 depth·√2/2。
+_hs_env = os.environ.get("FEED_V_JAW_HALF_SPAN_MM")
+V_JAW_HALF_SPAN = None if _hs_env in (None, "") else float(_hs_env) / 1000.0
+# P5.8.27 搬运巡航高度（米）。None = 旧行为（抬起 g[2]+130mm，横移用绝对 0.16）。
+# 设为数值时，抬起与横移都用这个绝对高度，z 变成单调上升→单调下降。
+_cl_env = os.environ.get("FEED_CARRY_LIFT_MM")
+CARRY_LIFT_Z = None if _cl_env in (None, "") else float(_cl_env) / 1000.0
+# P5.8.27 末端保持点：在搬运路径最后插一个与 feed_goal 同 y/z、同「下到
+# 轴线」x 的路点，消掉 PCHIP 在末端的过冲（z 折返 4 次 → 预期 2 次）。
+CARRY_END_HOLD = os.environ.get("FEED_CARRY_END_HOLD", "0") == "1"
+# P5.8.28 路径拐角加密采样。move_path 原本按弧长均匀重采样，折线拐角落在
+# 两个采样点之间时 PCHIP 会把它抹圆，方向不受控。默认关闭以便单变量对比。
+PATH_CORNER_DENSIFY = os.environ.get("FEED_PATH_CORNER_DENSIFY", "0") == "1"
+PATH_CORNER_K = int(os.environ.get("FEED_PATH_CORNER_K", "3"))
+PATH_CORNER_WINDOW = float(os.environ.get("FEED_PATH_CORNER_WINDOW", "0.04"))
+# P5.8.28 关节序列平滑遍数。逐点 IK 在零空间里会跳分支，表现为「s 单调、
+# TCP 不单调」。0 = 关闭（原行为），N = 做 N 遍 3 点加权平均。
+# 默认 4：实测把搬运段 z 反向从 4 次降到 2 次（只留起步/到顶两次正常
+# 反向），coax 0.189→0.218 仍在 0.25 阈值内，其余指标全 PASS。
+# 1/2 遍还不够（反向仍是 4 次），4 遍起稳定，5–12 遍无进一步收益。
+PATH_QSMOOTH = int(os.environ.get("FEED_PATH_QSMOOTH", "4"))
 V_LEN = (_positive_finite_env_float("FEED_V_JAW_LENGTH_MM", 24.0)
          / 1000.0)  # slot length along the workpiece axis
 V_QREF = 0.10            # gripper qpos the slot frame is measured at
@@ -1215,13 +1322,36 @@ def _v_plates(O, u_ax, w_ax, v_ax, depth=None, bar=None, length=None):
     bar = V_BAR if bar is None else bar
     length = V_LEN if length is None else length
     out = []
-    off = depth / 2 + bar / (2 * np.sqrt(2))
+    # off 是刀片中心沿 (u,w) 各自偏离 V 顶点的量。
+    #
+    # P5.8.26 调查结论（未改默认）：原公式 depth/2 + bar/(2√2) 让刀片内表面
+    # 距顶点只有 5.657 mm，而 Ø20 棒料坐在 90° V 槽里时切点需要距顶点
+    # 7.071 mm，于是刀片实体切进棒料 2.99 mm（683 步全程 overlap>0.2mm）。
+    # 解析零穿透条件是 off >= (r + bar/2)/√2 = 8.485 mm。
+    #
+    # 但实测把 off 从 5.414 提到 8.485 后：penetration 2.99 → 1.58 mm，
+    # 代价是 grasp_tilt 1.857° → 19.2°、抓取接触 8 → 6 点。
+    # 原因不是刀片长度，而是 off 决定了「顶点到内表面」的距离，也就决定了
+    # 棒料在 V 槽里的静止位置：inner 从 4.00 mm 变到 7.07 mm，棒料沿开口
+    # 方向移动 3.07 mm，与 shaft_in_grip 的 z 变化 2.76 mm 吻合。
+    # 所以单独改 off 必然破坏抓取位姿，正确修法要连 O 顶点一起重推，
+    # 属于几何重设计而不是打补丁。默认保持原值，开关留给后续实验。
+    if V_JAW_OFFSET is not None:
+        off = V_JAW_OFFSET
+    else:
+        off = depth / 2 + bar / (2 * np.sqrt(2))
+    # 刀片半长：默认保持原值（单变量原则，改 off 就不动长度）。
+    # V_JAW_HALF_SPAN 只在需要单独扫刀片长度时才设。
+    if V_JAW_HALF_SPAN is not None:
+        half_span = V_JAW_HALF_SPAN
+    else:
+        half_span = depth * np.sqrt(2) / 2
     for sgn in (+1, -1):
         c = O + (-off) * u_ax + (sgn * off) * w_ax
         x = (u_ax + sgn * w_ax) / np.sqrt(2)
         z = np.cross(x, v_ax)
         R = np.column_stack([x, v_ax, z])
-        out.append((c, R, [depth * np.sqrt(2) / 2, length / 2, bar / 2]))
+        out.append((c, R, [half_span, length / 2, bar / 2]))
     return out
 
 
@@ -1802,6 +1932,14 @@ BORE_PROBE = os.environ.get("FEED_BORE_PROBE", "0") == "1"
 # SMOOTH=1 走「一条连续轨迹」：抬升 -> 横移 -> 下降 -> 进给 合并成一次
 # Ruckig 规划，中途不减速、不停车。0 = 老的分段 rest-to-rest 路径。
 SMOOTH_PATH = os.environ.get("SMOOTH", "1") == "1"
+# FEED_TRACE_TCP=1：把逐步采样的 TCP（gripper site）世界位置连同时间戳、
+# 阶段标签一起写进结果 JSON。默认关闭，避免每个结果文件从 ~0.9 MB 涨到
+# 几 MB。它只增加输出字段，不改任何控制量、判据或运动参数；用于事后按
+# 任意阈值复算「停点 / 归零区间 / 相邻帧方向夹角 / 最短运动片段」。
+TCP_TRACE = os.environ.get("FEED_TRACE_TCP") == "1"
+# 夹爪时序探针：连续多少步 |qvel| < 0.02 rad/s 才算「夹爪停住了」。
+# 取 25 步 = 50 ms，比夹爪本身的时间常数短一个量级，不会把爬行误判成到位。
+GRIP_TIMING_STILL_STEPS = 25
 # 位置伺服的速度前馈系数 = kv/kp（秒）。纯 PD 在匀速段的跟踪误差是
 # (kv/kp)*qdot，把参考速度按这个比例提前量加进指令即可补偿。
 # 注意：这里刻意用【全局】ARM_SERVO_KV(2.6)，不是本场景注入的 5.0。
@@ -2660,6 +2798,26 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
 
     arm = Arm(model, data)
     started_at = time.perf_counter()
+    # 夹爪时序探针（只读）：记录夹爪指令下达到实际闭合/张开的时间。
+    # 用户 2026-11-12 要求用它判断「三爪拧紧后 0.96 s 机械臂静止」是否合理。
+    grip_timing = {"records": [], "enabled_by": "FEED_TRACE_TCP=1"}
+
+    def record_grip_event(name, command):
+        """记一次夹爪指令切换，并开始测量它多久真正到位。"""
+        if not TCP_TRACE:
+            return
+        grip_timing["records"].append({
+            "event": name,
+            "command": float(command),
+            "start_time_s": float(data.time),
+            "start_qpos": float(data.qpos[arm.grip_act]),
+            "start_ctrl": float(data.ctrl[arm.grip_act]),
+            "settled_time_s": None,
+            "settled_qpos": None,
+            "duration_ms": None,
+            "contact_at_settle": None,
+        })
+
     case_id = (os.environ.get("FEED_CASE_ID") or uuid.uuid4().hex[:12])
     if random_seed is None:
         seed_env = os.environ.get("FEED_RANDOM_SEED")
@@ -2892,6 +3050,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                      "insert_mm": float(INSERT_MM * 1000),
                      "approach_mm": float(APPROACH_MM * 1000),
                      "z_comp_mm": float(FEED_Z_COMP * 1000),
+                     "feed_offset_y_mm": float(FEED_OFFSET_Y * 1000),
+                     "feed_offset_z_mm": float(FEED_OFFSET_Z * 1000),
                      "grip_station_mm": float(GRIP_STATION * 1000),
                      "retreat_axial": bool(RETREAT_AXIAL),
                      "diagnostic_no_retreat": bool(no_retreat_diagnostic),
@@ -3259,6 +3419,9 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         relative_motion = result.get(
             "gripper_relative_workpiece_motion", {})
         relative_motion.pop("_previous_translation_delta_tool_m", None)
+        if TCP_TRACE:
+            result["tcp_trace"] = _tcp_trace_payload(state, model)
+            result["grip_timing"] = _grip_timing_payload(grip_timing)
         result.update(_case_metadata(state, model))
         path = os.path.abspath(json_path)
         directory = os.path.dirname(path)
@@ -3317,6 +3480,50 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         record_diagnostic_frame(label)
         if phase in clamp_handover_phases:
             record_clamp_handover_frame(label)
+        _update_grip_timing()
+
+    def _update_grip_timing():
+        """判断当前未完成的夹爪事件是否已经到位（只读探针）。
+
+        判据不能用「到达指令值」：夹爪闭合时是顶着棒料停住的，实际 qpos
+        永远到不了指令角（实测指令 -0.10，实际停在 -0.03 附近）。所以这里
+        判的是「物理上停住了」——关节速度连续 N 步近零，这才是用户真正想
+        知道的「指令到闭合实际需要多少毫秒」。
+        """
+        if not TCP_TRACE:
+            return
+        for record in grip_timing["records"]:
+            if record["settled_time_s"] is not None:
+                continue
+            # 先等指令本身真正开始走。`grip_direct()` 是逐步写 ctrl 的
+            # （松爪用 360 步 quintic），刚下发那几帧指令几乎没动，
+            # 若直接判「速度近零」会把还没起步误判成已经到位（实测得到
+            # 一个假的 50 ms）。指令走过 10% 行程后才开始计时静止。
+            travel = abs(record["command"] - record["start_qpos"])
+            command_moved = abs(
+                float(data.ctrl[arm.grip_act]) - record["start_ctrl"])
+            if not record.get("armed"):
+                if command_moved < 0.10 * max(travel, 1e-6):
+                    continue
+                record["armed"] = True
+                record["armed_time_s"] = float(data.time)
+            moving = abs(float(data.qvel[arm.grip_act])) >= 0.02
+            if moving:
+                record["still_steps"] = 0
+                continue
+            record["still_steps"] = record.get("still_steps", 0) + 1
+            if record["still_steps"] < GRIP_TIMING_STILL_STEPS:
+                continue
+            record["settled_time_s"] = float(data.time)
+            record["settled_qpos"] = float(data.qpos[arm.grip_act])
+            record["duration_ms"] = (
+                float(data.time) - record["start_time_s"]) * 1000.0
+            record["command_to_settle_ms"] = (
+                float(data.time) - record["armed_time_s"]) * 1000.0
+            record["contact_at_settle"] = int(grip_state()[0])
+            record["reached_command"] = bool(
+                abs(record["settled_qpos"] - record["command"])
+                <= max(0.005 * travel, 2e-3))
 
     def record_stage(name, checkpoint_id=None,
                      checkpoint_status="completed"):
@@ -3898,6 +4105,12 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         mujoco.mj_forward(model, data)
         q_start = np.array([data.qpos[a] for a in arm.qadr], dtype=float)
         R_start = data.site_xmat[arm.site].reshape(3, 3).copy()
+        pickup_axis_start = _normalise_axis(
+            R_start @ state["grasp_axis_local"])
+        pickup_axis_target = _normalise_axis(
+            state["grasp_axis_target"])
+        if float(np.dot(pickup_axis_start, pickup_axis_target)) < 0.0:
+            pickup_axis_target = -pickup_axis_target
         pad_start = arm.pad_center().copy()
         site_start = data.site_xpos[arm.site].copy()
         off = arm.pad_offset()
@@ -3985,8 +4198,20 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 pad_p = p0 + frac * (p1 - p0)
                 site_p = pad_p - R_waypoint @ pad_offset_local
                 if PICKUP_ALGORITHM == "mouth_axis":
+                    # The reset arm pose can be far from the calibrated grasp
+                    # axis. Applying the final axis constraint at the very
+                    # first free-space waypoint made IK fold the nearly
+                    # straight arm abruptly, then the position servos could
+                    # not track the resulting joint reference. Align the axis
+                    # smoothly during the free-space approach and finish it
+                    # before descending toward the V-jaw mouth.
+                    axis_target_at_waypoint = (
+                        _axis_slerp(
+                            pickup_axis_start, pickup_axis_target,
+                            smooth(frac))
+                        if segment == 0 else pickup_axis_target)
                     q_prev, pe, re = arm.ik_axis(
-                        site_p, state["grasp_axis_target"],
+                        site_p, axis_target_at_waypoint,
                         state["grasp_axis_local"], q_init=q_prev,
                         iters=360)
                     for _pad_solve in range(3):
@@ -4004,7 +4229,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                         # free, so the pad midpoint can move with that roll.
                         site_p += pad_error
                         q_prev, pe, re = arm.ik_axis(
-                            site_p, state["grasp_axis_target"],
+                            site_p, axis_target_at_waypoint,
                             state["grasp_axis_local"], q_init=q_prev,
                             iters=360)
                 else:
@@ -4167,7 +4392,31 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         if samples is None:
             samples = int(np.clip(total / 0.012, 24, 80))
 
-        s_grid = np.linspace(0.0, 1.0, samples + 1)
+        # P5.8.28：弧长均匀采样会跨过折线拐角，拐角落在两个采样点之间时
+        # PCHIP 在关节空间把它「抹圆」，抹圆方向不受控 —— 实测搬运段
+        # z 出现 4 次反向、峰谷 117.2 mm，其中 t=8.40/8.49 两次是纯多余
+        # 折返（x 从 264 跑到 155 再回 208.5，终点本该是 210）。
+        # 修法：拐角两侧各加密若干个采样点，让 PCHIP 在拐角处「看见」顶点。
+        # 只影响采样密度，不改路点、不改时间律、不改 IK 约束。
+        s_list = list(np.linspace(0.0, 1.0, samples + 1))
+        if PATH_CORNER_DENSIFY and len(cum) > 2:
+            extra = []
+            for c in cum[1:-1]:                 # 内部路点才是拐角
+                sc = c / total
+                for k in range(1, PATH_CORNER_K + 1):
+                    w = PATH_CORNER_WINDOW * k / PATH_CORNER_K
+                    for s in (sc - w, sc + w):
+                        if 0.0 < s < 1.0:
+                            extra.append(s)
+            if extra:
+                s_list = sorted(set(
+                    [round(s, 9) for s in s_list]
+                    + [round(s, 9) for s in extra]))
+                s_grid = np.array(s_list)
+            else:
+                s_grid = np.array(s_list)
+        else:
+            s_grid = np.array(s_list)
         dense = []
         for s in s_grid:
             d = s * total
@@ -4200,6 +4449,21 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             "stage": label, "position_residual_mm": float(worst * 1000),
             "axis_residual_deg": None,
         })
+
+        # P5.8.28：逐点 IK 虽然都用同一个初值，但 4 个自由关节解 3 维位置
+        # 本身有 1 维零空间，相邻采样点仍可能落在零空间的不同分支上。表现
+        # 是「路径参数 s 单调递增，TCP 却不单调」—— 实测搬运段 s 从 0.8705
+        # 一路涨到 0.9606，z 却先降到 64.3 再升到 77.4 再降回 73.9。
+        # 所以问题不在采样密度（拐角加密实测无效），在 Q 序列本身有跳变。
+        # 修法：对 Q 逐关节做限幅平滑，把零空间跳变抹掉，再交给 PCHIP。
+        if PATH_QSMOOTH > 0 and len(Q) > 3:
+            Qs = Q.copy()
+            for _pass in range(PATH_QSMOOTH):
+                for j in range(1, len(Qs) - 1):
+                    Qs[j] = 0.5 * Qs[j] + 0.25 * (Qs[j - 1] + Qs[j + 1])
+            # 端点保持不动，否则起止位姿会漂
+            Qs[0], Qs[-1] = Q[0], Q[-1]
+            Q = Qs
 
         # 归一化弧长上做 jerk 受限的时间参数化。
         dt = float(model.opt.timestep)
@@ -4349,6 +4613,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             state["grip_tgt"] = tgt
             state["grip_from"] = cur
             state["grip_k"] = 0
+            record_grip_event(
+                "闭合" if abs(tgt) < abs(cur) else "张开", tgt)
         state["grip_k"] = state.get("grip_k", 0) + 1
         k = 1.0 if GRIP_RAMP <= 0 else min(1.0, state["grip_k"] / float(GRIP_RAMP))
         v = state["grip_from"] + (tgt - state["grip_from"]) * k
@@ -4869,22 +5135,51 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     #   转正 -> 沿 +x 直线推进到设定深度 -> 卡爪夹紧 -> 夹爪松开 -> 退出
     # 老版本是「横移时 x 已经在卡盘里，然后垂直往下捅」：工件是斜着插进
     # 卡爪的，而且一步就到 axis（整根 80 mm 只剩 1 mm 露头）。
+    # P5.8.27：抬起与高位横移的 z 原来不一致（g[2]+130mm vs 绝对 0.16m），
+    # 两者几乎重合却又各是一次方向变化，z 上形成 122 mm 峰谷与单次 180°
+    # 反向（P5.8.23 实测 8.33 s 处 dz 从 -624 冲到 +239 mm/s）。
+    # 用 FEED_CARRY_LIFT_MM 把抬起高度统一到巡航高度，路径变成
+    # 垂直抬升 → 等高横移 → 垂直下降，z 单调上升后单调下降。
+    carry_lift_z = CARRY_LIFT_Z if CARRY_LIFT_Z is not None else 0.16
     carry = [
         ("对中", [g[0], g[1], g[2] + 0.020], 260),
-        ("抬起", [g[0], g[1], g[2] + 0.130], 420),
-        ("高位横移", [stage_x, axis[1], 0.16], 900),
+        ("抬起", [g[0], g[1], carry_lift_z], 420),
+        ("高位横移", [stage_x, axis[1], carry_lift_z], 900),
         ("下到轴线", [stage_x, axis[1], axis[2]], 700),
     ]
     # 直线进给：只动 x，y/z 和工件轴线由 ik_axis 全程保持。
     feed_goal = axis.copy()
     if not carry_lock:
         feed_goal[2] += FEED_Z_COMP
+    # P5.8.24 捕获窗口探针：把交付点整体平移，测卡盘能吃掉多大的偏差。
+    feed_goal[1] += FEED_OFFSET_Y
+    feed_goal[2] += FEED_OFFSET_Z
+    if FEED_OFFSET_Y or FEED_OFFSET_Z:
+        print("  送料偏置   dy=%+.2f mm  dz=%+.2f mm（捕获窗口探针）"
+              % (FEED_OFFSET_Y * 1000, FEED_OFFSET_Z * 1000))
 
     if SMOOTH_PATH:
         # 抬升 / 横移 / 下降 / 进给 合成一条连续轨迹。老写法是四个
         # move3，每个都是一次 rest -> rest，等于四次完整起停。
-        err = move_path([pad_target(t) for _n, t, _ns in carry]
-                        + [pad_target(feed_goal)],
+        #
+        # P5.8.27：PCHIP 在最后一个路点前会过冲，实测 x 从 160.1 反弹到
+        # 207.3 mm、z 从 64.4 冲到 77.4 再掉回 60.1（4 次 z 反向，峰谷
+        # 117.2 mm，其中 8.40 s 之后那两次是纯多余折返）。
+        # 修法不是调抬升高度（实测 lift=160 与基线逐位相同、lift=175 反而
+        # 更差），而是在末端插一个「轴线保持点」：它和 feed_goal 只差 x，
+        # y/z 完全相同，于是 z 在下到轴线后不再有自由度可过冲。
+        path_pts = [pad_target(t) for _n, t, _ns in carry]
+        if CARRY_END_HOLD:
+            approach = axis.copy()
+            approach[0] = carry[-1][1][0]      # 与「下到轴线」同 x
+            approach[1] = feed_goal[1]
+            approach[2] = feed_goal[2]
+            path_pts.append(pad_target(approach))
+            print("  末端保持点 x=%.1f mm（下到轴线 x=%.1f，feed_goal x=%.1f）"
+                  % (approach[0] * 1000, carry[-1][1][0] * 1000,
+                     feed_goal[0] * 1000))
+        path_pts.append(pad_target(feed_goal))
+        err = move_path(path_pts,
                         grip_close, carry_lock, label="搬运",
                         v_cruise=_positive_finite_env_float(
                             "FEED_CARRY_V_CRUISE", 0.55))
@@ -5606,6 +5901,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             if release_control["enabled"]:
                 release_control["status"] = (
                     "three_jaw_trigger_not_reached_default_release")
+            record_grip_event("张开", GRIP_OPEN)
             for i in range(360):
                 t = (i + 1) / 360
                 s = t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
