@@ -279,6 +279,7 @@ _REPRODUCIBLE_ENV_KEYS = {
     "FEED_CARRY_END_HOLD", "FEED_PATH_CORNER_DENSIFY", "FEED_PATH_CORNER_K",
     "FEED_PATH_CORNER_WINDOW", "FEED_PATH_QSMOOTH",
     "FEED_RETREAT_AXIAL", "FEED_LEVEL_ROD", "FEED_AXIS_LEAD_DEG",
+    "FEED_RETREAT_ZOFF", "FEED_RETREAT_SINGLE", "FEED_RETREAT_SETTLE0",
     "FEED_SEAT_TAP_MM", "FEED_BUSHING", "FEED_BUSHING_GAP",
     "FEED_BUSHING_FRONT", "FEED_BUSHING_LEN", "FEED_BUSHING_N",
     "FEED_BUSHING_MODE", "FEED_BUSHING_MU", "FEED_BUSHING_OPEN",
@@ -1077,6 +1078,23 @@ GRIP_STATION = -float(os.environ.get("FEED_GRIP_STATION_MM", "5")) / 1000.0
 # 松爪退出分两段：先沿轴线退到料尾之外，再侧向撤离。斜着一把撤时张开
 # 的刀片会横刮还没脱离的料尾，把刚定好心的料带歪。
 RETREAT_AXIAL = os.environ.get("FEED_RETREAT_AXIAL", "1") == "1"
+# P5.8.29 轴向退出的三个修正开关（默认关闭，与旧行为逐位一致）：
+#
+# 1) RETREAT_ZOFF — 旧代码 pull 带 +10 mm 的 z 偏置（axis[2]+0.010），于是
+#    「轴向退出」实际是一条 x -70 / z +10 的斜线。那是 z 漂移 10.8 mm 的
+#    直接来源，也让「沿轴线退出」这个说法名不副实。设为 0 走纯轴向。
+# 2) RETREAT_SINGLE — 旧代码用 move3() 跑三轮闭环（hold_done+iters==8 时
+#    iters 被改成 3）。每一轮都是 rest→rest，于是 x 上出现 3 次往返
+#    （212→148→142.5→144），净位移只有 70 mm 却走了 90.4 mm。设 1 走
+#    单遍。
+# 3) RETREAT_SETTLE0 — 退出段结束时先 settle 90 步（0.18 s）原地不动，再
+#    进下一段。设 0 不给 settle（退出段之后本来就接着侧向撤离）。
+RETREAT_ZOFF = os.environ.get("FEED_RETREAT_ZOFF", "1") == "1"
+# P5.8.29 默认 1：实测把轴向退出的三维方向翻转 2→0、最大帧间角
+# 114.1°→54.7°、z 漂移 +10.69→+2.76 mm、该段时长 2.04→0.76 s、
+# 行程 88.4→67.6 mm（净位移 70 mm），停点总数 12→10。
+RETREAT_SINGLE = os.environ.get("FEED_RETREAT_SINGLE", "1") == "1"
+RETREAT_SETTLE0 = os.environ.get("FEED_RETREAT_SETTLE0", "0") == "1"
 # 进给到位后把料轴调平（见 level_rod()）。默认开：不调平时料"尾端翘起"
 # 约 1.2°，80 mm 料两端高差 1.7 mm，肉眼一眼看得出来。
 LEVEL_ROD = os.environ.get("FEED_LEVEL_ROD", "0") == "1"
@@ -3946,7 +3964,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
 
     def move3(target, ns, grip, locked,
               jaw_ctrl=SM.CHUCK_OPEN_CTRL, iters=8, probe=None,
-              probe_goal=None, label="", clamp_trace_phase=None):
+              probe_goal=None, label="", clamp_trace_phase=None,
+              settle0=None):
         """Iterate until the pads actually reach the goal -- by MOVING THE GOAL.
 
         Re-sending the same absolute target is useless under load: the
@@ -3979,6 +3998,10 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             # The final feed gets one extra pass because its position decides
             # whether all six chuck contacts survive the gripper release.
             iters = 4 if label == "进给" else 3
+        # P5.8.29：settle0 显式传入时覆盖「每轮末尾的原地停」。退出类阶段
+        # 不需要停（后面紧接另一段运动），90 步 settle 会让轨迹在段尾归零。
+        _settle_last = 90 if settle0 is None else int(settle0)
+        _settle_mid = 60 if settle0 is None else int(settle0)
         pass_limit = (
             min(iters, PICKUP_MAX_CORRECTIONS + 1)
             if pickup_refinement else iters)
@@ -4055,7 +4078,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 steps_k = move_steps
                 kw = {"s0": k / iters, "s1": (k + 1) / iters}
             state["label"] = "%s#%d" % (label, k + 1)
-            kw["settle_steps"] = 90 if k == pass_limit - 1 else 60
+            kw["settle_steps"] = _settle_last if k == pass_limit - 1 else _settle_mid
             if clamp_trace_phase:
                 kw["clamp_trace_phase"] = clamp_trace_phase
             move(tgt, steps_k, grip, locked, jaw_ctrl, **kw)
@@ -5945,12 +5968,17 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         # 实时量出来的「pad − 料」是个 40 mm 的大偏置，套上去等于让手臂
         # 去追一个歪掉的目标（原实现实测残差 41.6 mm）。这里直接给世界点。
         if RETREAT_AXIAL and os.environ.get("FEED_DIAG_NO_RETREAT") != "1":
-            pull = np.array([axis[0] - 0.070, axis[1], axis[2] + 0.010])
+            # P5.8.29：z 偏置可关。原写法固定 +10 mm，让「轴向退出」变成斜线。
+            _zdz = 0.010 if RETREAT_ZOFF else 0.0
+            pull = np.array([axis[0] - 0.070, axis[1], axis[2] + _zdz])
             move3(
                 pull, 260, GRIP_OPEN, False, SM.CHUCK_CLAMP_CTRL,
+                iters=(1 if RETREAT_SINGLE else 8),
+                settle0=(0 if RETREAT_SETTLE0 else None),
                 clamp_trace_phase="轴向退出")
-            print("  轴向退出     沿轴线退 %.0f mm，刀片已离开料尾"
-                  % (70.0))
+            print("  轴向退出     沿轴线退 %.0f mm（dz=%+.1f mm，%s），刀片已离开料尾"
+                  % (70.0, _zdz * 1000,
+                     "单遍" if RETREAT_SINGLE else "多轮闭环"))
         elif os.environ.get("FEED_DIAG_NO_RETREAT") == "1":
             print("  诊断对照     松爪后不移动机械臂（仅定位用）")
         checkpoint_statuses = _feed_checkpoint_statuses(

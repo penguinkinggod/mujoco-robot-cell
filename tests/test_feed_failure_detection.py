@@ -1085,6 +1085,15 @@ class FeedFailureStatusTests(unittest.TestCase):
         # Keep this classification fixture on its original pickup trajectory;
         # the new default posture profile changes its final stock eccentricity.
         feed.PICKUP_POSE_ALIGN = False
+        # Same reason for the carry-path joint smoothing (P5.8.28): turning it
+        # on (new default 4) moves this fixture's stock_ecc from 2.19 to 1.56
+        # mm, i.e. across the 2.0 mm threshold. This test only asserts that a
+        # *quality* failure is classified as quality_fail rather than aborted,
+        # so it must be pinned to a run that actually crosses the threshold.
+        # Measured on this fixture: qsmooth=0 -> ecc 2.188 (FAIL),
+        # qsmooth=4 -> ecc 1.565 (PASS).
+        previous_qsmooth = feed.PATH_QSMOOTH
+        feed.PATH_QSMOOTH = 0
         try:
             exit_code, result = self._run_feed(
                 "test-quality-fail-solref-005",
@@ -1093,6 +1102,7 @@ class FeedFailureStatusTests(unittest.TestCase):
                 carry_lock=False,
             )
         finally:
+            feed.PATH_QSMOOTH = previous_qsmooth
             if previous_solref is None:
                 os.environ.pop("FEED_V_CONTACT_SOLREF_TIME", None)
             else:
