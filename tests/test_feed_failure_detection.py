@@ -620,8 +620,13 @@ class RobotMachineContactTests(unittest.TestCase):
                 and row["final_target_error_mm"]
                 <= row["target_tolerance_mm"]
                 for row in pickup_motion["motion_refinement"]))
+        # P5.8.38：默认轴目标从 lead=2.0/yaw=0 改成 lead=3.05/yaw=0.84
+        # （见 diag_feed_chuck.py 里的扫描记录）。这条断言的是「实际生效的
+        # 参数」，跟着默认值走，不是钉死旧值。
         self.assertEqual(
-            2.0, result["effective_parameters"]["feed"]["axis_lead_deg"])
+            3.05, result["effective_parameters"]["feed"]["axis_lead_deg"])
+        self.assertEqual(
+            0.84, result["effective_parameters"]["feed"]["axis_yaw_deg"])
         self.assertEqual(
             30.0,
             result["effective_parameters"]["gripper"]["workpiece_lift_mm"])
@@ -1078,9 +1083,17 @@ class FeedFailureStatusTests(unittest.TestCase):
         previous_pickup_refinement = feed.PICKUP_REFINEMENT
         previous_pose_align = feed.PICKUP_POSE_ALIGN
         os.environ["FEED_V_CONTACT_SOLREF_TIME"] = "0.005"
-        feed.AXIS_LEAD_DEG = 1.0
-        feed._AXIS_TGT = np.array([
-            np.cos(np.radians(1.0)), 0.0, np.sin(np.radians(1.0))])
+        feed.AXIS_LEAD_DEG = 0.0
+        # P5.8.38：AXIS_YAW_DEG 默认从 0 改成 0.84，且 move_path 的前馈速度
+        # 改成 PCHIP 解析导数（更准）。两者叠加把这条 fixture 的 stock_ecc
+        # 从 2.1880 压到 1.9500 —— 刚好卡在 2.0 阈值下方，不再产生质量失败。
+        # 这条测试只验证「质量失败被分类成 quality_fail 而不是 aborted」，
+        # 所以必须让它真的越线。改用 lead=0（去掉轴前倾补偿）：
+        # 实测 lead=0 -> ecc 3.1287（稳定越线），lead=1 -> 1.2312，
+        # lead=2 -> 0.6513。阈值/断言都不动，只换输入。
+        previous_axis_yaw = feed.AXIS_YAW_DEG
+        feed.AXIS_YAW_DEG = 0.0
+        feed._AXIS_TGT = np.array([1.0, 0.0, 0.0])
         feed.PICKUP_REFINEMENT = False
         # Keep this classification fixture on its original pickup trajectory;
         # the new default posture profile changes its final stock eccentricity.
@@ -1134,6 +1147,7 @@ class FeedFailureStatusTests(unittest.TestCase):
             else:
                 os.environ["FEED_V_CONTACT_SOLREF_TIME"] = previous_solref
             feed.AXIS_LEAD_DEG = previous_axis_lead
+            feed.AXIS_YAW_DEG = previous_axis_yaw
             feed._AXIS_TGT = previous_axis_target
             feed.PICKUP_REFINEMENT = previous_pickup_refinement
             feed.PICKUP_POSE_ALIGN = previous_pose_align

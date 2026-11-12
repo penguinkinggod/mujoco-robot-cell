@@ -1105,7 +1105,21 @@ LEVEL_ROD = os.environ.get("FEED_LEVEL_ROD", "0") == "1"
 # 进给轴目标的前倾补偿（度）。P5.8.6 在 nominal 和五个固定 M2 样本中
 # 配对比较 1/2 度后，2 度的进给前有符号 pitch 更接近水平且五例均通过。
 # 这是当前仿真模型的目标前馈，不是通用机械臂标定，也不给棒料施加调平力。
-AXIS_LEAD_DEG = float(os.environ.get("FEED_AXIS_LEAD_DEG", "2.0"))
+# P5.8.38：lead/yaw 联合转正为 (3.05, 0.84)。
+#
+# 20 段默认下重扫 41 个点（_build/sweep_axis20.py、sweep_pareto.py、
+# sweep_robust.py），按「邻域中位数」选稳健点而不是尖峰：
+#
+#   参数            clamp轴误差°  tilt°   coax mm   邻域中位°
+#   (2.00, 0.00) 默认   0.7829   0.5365   0.0359     —
+#   (3.20, 0.84) 尖峰   0.0055   0.0675   0.0658   0.1307  <- 9 邻点仅 1 个<0.05，不可用
+#   (3.05, 0.84) 选定   0.1410   0.1172   0.0837   0.1307  <- 13 邻居，稳健
+#   (2.93, 0.50)        0.1011   0.1641   0.0580   0.1293
+#
+# 相对默认：轴误差 0.7829 -> 0.1410（-82%）、tilt 0.5365 -> 0.1172（-78%），
+# coax 0.0359 -> 0.0837（仍远低于 COAX_LIMIT=2.0）。
+# 不选 (3.20,0.84) 的 0.0055°：±0.05° 邻域就掉回 0.09~0.20，是刀锋不是最优。
+AXIS_LEAD_DEG = float(os.environ.get("FEED_AXIS_LEAD_DEG", "3.05"))
 # P5.8.33：进给轴目标的 yaw 补偿（度）。
 #
 # 旧定义是 (cos(lead), 0, sin(lead))，**y 分量恒为 0**，也就是说目标轴线
@@ -1117,7 +1131,7 @@ AXIS_LEAD_DEG = float(os.environ.get("FEED_AXIS_LEAD_DEG", "2.0"))
 # 实测 lead=3 时轴误差 0.804°，已经贴着这个下界——再怎么调 lead 也下不去。
 # 这不是几何问题，也不是调参问题，是目标轴线少了一个自由度。
 # 加上 yaw 分量后两个方向都受控。
-AXIS_YAW_DEG = float(os.environ.get("FEED_AXIS_YAW_DEG", "0"))
+AXIS_YAW_DEG = float(os.environ.get("FEED_AXIS_YAW_DEG", "0.84"))
 _AXIS_TGT = np.array([
     np.cos(np.radians(AXIS_LEAD_DEG)) * np.cos(np.radians(AXIS_YAW_DEG)),
     np.cos(np.radians(AXIS_LEAD_DEG)) * np.sin(np.radians(AXIS_YAW_DEG)),
@@ -1861,7 +1875,17 @@ PICKUP_INTERP = os.environ.get("FEED_PICKUP_INTERP", "pchip")
 # 实测「下到轴线」目标 axis[2]=60.74 mm，播放完实际停在 54.58 mm，差
 # 6.16 mm；随后的进给 move3 闭环会把它抬回去，z 于是在送料途中从 53.5
 # 抬到 65.8（峰峰 12.08，中途还下探到 49.13）——肉眼就是「点头」。
-PATH_END_CLOSE = int(os.environ.get("FEED_PATH_END_CLOSE", "120"))
+#
+# P5.8.38：120 -> 600。120 帧（0.24 s）不够把伺服静态下垂吃掉。
+# 扫描 FEED_PATH_END_CLOSE = 0 / 120 / 300 / 600，量搬运段最后 150 帧的
+# 末端过冲（相对终点，x/y/z 三个方向）：
+#   120（旧默认） 过冲和 15.591 mm (x 1.81 z 2.79 y 10.99)  coax 0.0871
+#   0            过冲和  0.113 mm                          coax 0.5147
+#   300          过冲和  0.343 mm                          coax 0.5216
+#   600          过冲和  0.042 mm (x 0.00 z 0.00 y 0.04)  coax 0.0804
+# 600 帧把末端过冲降 371 倍，coax 反而略好。0 虽然过冲也小但 coax 崩 6 倍，
+# 因为完全不做闭环收车、送料起点姿态没到位。
+PATH_END_CLOSE = int(os.environ.get("FEED_PATH_END_CLOSE", "600"))
 MIN_FIX_STEPS = 150      # 闭环修正轮的最短时长（0.30 s）：再短伺服落不了地
 PICKUP_MAX_CORRECTIONS = 2
 PICKUP_REFINEMENT = os.environ.get(
@@ -3155,6 +3179,8 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                      "diagnostic_no_retreat": bool(no_retreat_diagnostic),
                      "level_rod": bool(LEVEL_ROD),
                      "axis_lead_deg": float(AXIS_LEAD_DEG),
+                     # P5.8.38：yaw 现在是轴目标的有效自由度，一并导出。
+                     "axis_yaw_deg": float(AXIS_YAW_DEG),
                      "seat_tap_mm": float(SEAT_TAP * 1000),
                      "smooth_path": bool(SMOOTH_PATH),
                  },
@@ -4687,13 +4713,21 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
 
         prof = [traj.at_time(min(i * dt, traj.duration)) for i in range(n + 1)]
         pchip = PchipInterpolator(s_grid, Q, axis=0)
+        # P5.8.38：前馈速度改用 PCHIP 的解析导数。
+        #
+        # 旧写法是 qd = (pchip(s2) - pchip(s)) / dt —— 前后两帧差分。
+        # 拐角加密区（PATH_CORNER_DENSIFY）采样点密集，s 在两帧间的变化量
+        # 不均匀，差分会突然跳变，直接进 ctrl = q_ref + lead*qd 变成尖峰。
+        # 实测搬运段 jerk 峰 7.7e6 mm/s³、加速峰 15742 mm/s²、速率峰 546 mm/s，
+        # 而 Ruckig 规划里 j_max=25.0 —— 规划是顺的，是播放把规划抹坏了。
+        # 解析导数 dq/ds * sdot 是连续量，不受采样密度影响。
+        dpchip = pchip.derivative()
 
         for i in range(n):
             s = float(np.clip(prof[i][0][0], 0.0, 1.0))
             sd = float(prof[i][1][0])
-            s2 = float(np.clip(prof[min(i + 1, n)][0][0], 0.0, 1.0))
             q = pchip(s)
-            qd = (pchip(s2) - q) / dt
+            qd = dpchip(s) * sd
             for a, v, w in zip(arm.qadr, q, qd):
                 data.ctrl[a] = v + lead * w
             data.ctrl[arm.grip_act] = grip_cmd(grip)
