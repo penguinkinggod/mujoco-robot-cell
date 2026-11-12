@@ -1094,6 +1094,17 @@ class FeedFailureStatusTests(unittest.TestCase):
         # qsmooth=4 -> ecc 1.565 (PASS).
         previous_qsmooth = feed.PATH_QSMOOTH
         feed.PATH_QSMOOTH = 0
+        # P5.8.32 adds three more pickup/carry defaults (PCHIP interpolation,
+        # a larger approach budget, and a carry end-of-path closed loop) that
+        # push this fixture's stock_ecc back under the 2.0 mm threshold, so
+        # pin them too. Same rationale as the qsmooth pin above: the test
+        # classifies a quality failure, so it must actually produce one.
+        previous_interp = feed.PICKUP_INTERP
+        previous_approach = feed.PICKUP_APPROACH_STEPS
+        previous_end_close = feed.PATH_END_CLOSE
+        feed.PICKUP_INTERP = "cspline"
+        feed.PICKUP_APPROACH_STEPS = 550
+        feed.PATH_END_CLOSE = 0
         try:
             exit_code, result = self._run_feed(
                 "test-quality-fail-solref-005",
@@ -1103,6 +1114,9 @@ class FeedFailureStatusTests(unittest.TestCase):
             )
         finally:
             feed.PATH_QSMOOTH = previous_qsmooth
+            feed.PICKUP_INTERP = previous_interp
+            feed.PICKUP_APPROACH_STEPS = previous_approach
+            feed.PATH_END_CLOSE = previous_end_close
             if previous_solref is None:
                 os.environ.pop("FEED_V_CONTACT_SOLREF_TIME", None)
             else:

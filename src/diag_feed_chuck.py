@@ -278,7 +278,9 @@ _REPRODUCIBLE_ENV_KEYS = {
     "FEED_V_JAW_OFFSET_MM", "FEED_V_JAW_HALF_SPAN_MM", "FEED_CARRY_LIFT_MM",
     "FEED_CARRY_END_HOLD", "FEED_PATH_CORNER_DENSIFY", "FEED_PATH_CORNER_K",
     "FEED_PATH_CORNER_WINDOW", "FEED_PATH_QSMOOTH",
-    "FEED_PICKUP_QSMOOTH",
+    "FEED_PICKUP_QSMOOTH", "FEED_PICKUP_TIME_LAW",
+    "FEED_PICKUP_APPROACH_STEPS", "FEED_PICKUP_INTERP",
+    "FEED_PATH_END_CLOSE",
     "FEED_RETREAT_AXIAL", "FEED_LEVEL_ROD", "FEED_AXIS_LEAD_DEG",
     "FEED_RETREAT_ZOFF", "FEED_RETREAT_SINGLE", "FEED_RETREAT_SETTLE0",
     "FEED_SEAT_TAP_MM", "FEED_BUSHING", "FEED_BUSHING_GAP",
@@ -1814,6 +1816,35 @@ FEED_STEPS = int(os.environ.get("FEED_STEPS", 600))  # 进给每轮步数（1.2 
 # 选 4 不选 8：8 遍把参考 x 的峰峰从 0.128 撑到 0.856 mm（平滑把路点拉偏
 # 成了过冲），`coax` 从 0.219 恶化到 0.513。4 遍同时 `coax 0.219→0.166`。
 PICKUP_QSMOOTH = int(os.environ.get("FEED_PICKUP_QSMOOTH", "4"))
+# P5.8.32：连续进场段的时间律。
+#   "global"  = 一条全局 quintic（旧行为），只有一个速度峰在 t=0.5，
+#               三段的 s 边界是 0/0.1689/0.7682/1.0，「接近」段只拿到
+#               前 16.89% 却要走 170.6 mm，被迫先冲 265 mm/s 再刹住。
+#   "segment" = 每段按自身时长算一条两端速度给定的最小 jerk 曲线，
+#               段边界共享速度（不停车、不突变），首尾仍为 0。
+PICKUP_TIME_LAW = os.environ.get("FEED_PICKUP_TIME_LAW", "global")
+# 接近段的步数预算（旧值 550，加 150 修正 = 700）。实测该段要背 170.6 mm
+# 的自由空间路径，700 步只有 122 mm/s 均值，最小-jerk 峰值 228 mm/s，
+# 每 100 ms 速度中位数来回两个峰（37→250→46→237→71），jerk 峰 526789。
+# 提到 1100 步（+150 = 1250，2.5 s）后均速降到 68 mm/s。
+PICKUP_APPROACH_STEPS = int(
+    os.environ.get("FEED_PICKUP_APPROACH_STEPS", "1100"))
+# 连续进场段的关节插值方式。
+#   "cspline" = CubicSpline(bc_type="natural")（旧行为），会穿过稀疏路点
+#               产生过冲。
+#   "pchip"   = 保单调、不过冲，move_path() 已在用。
+# 实测接近段的「关节参考速度符号翻转总数」（不丝滑的直接度量）与该段
+# 实际 TCP 速度峰值：
+#   cspline  700 步：翻转 15、峰值 265.2 mm/s、参考峰 371.8
+#   cspline 1100 步：翻转 15、峰值 169.2、参考峰 192.8
+#   pchip    700 步：翻转  5、峰值 148.2、参考峰 229.4
+#   pchip   1100 步：翻转  5、峰值 117.3、参考峰 155.2  ← 选这个
+PICKUP_INTERP = os.environ.get("FEED_PICKUP_INTERP", "pchip")
+# 搬运连续轨迹（move_path）播放完后的末端闭环步数。0 = 旧行为（开环收车）。
+# 实测「下到轴线」目标 axis[2]=60.74 mm，播放完实际停在 54.58 mm，差
+# 6.16 mm；随后的进给 move3 闭环会把它抬回去，z 于是在送料途中从 53.5
+# 抬到 65.8（峰峰 12.08，中途还下探到 49.13）——肉眼就是「点头」。
+PATH_END_CLOSE = int(os.environ.get("FEED_PATH_END_CLOSE", "120"))
 MIN_FIX_STEPS = 150      # 闭环修正轮的最短时长（0.30 s）：再短伺服落不了地
 PICKUP_MAX_CORRECTIONS = 2
 PICKUP_REFINEMENT = os.environ.get(
@@ -4313,24 +4344,107 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                                + 0.25 * (_qs[_j - 1] + _qs[_j + 1]))
             _qs[0], _qs[-1] = q_path[0], q_path[-1]
             q_path = _qs
-        splines = [CubicSpline(grid, q_path[:, j], bc_type="natural")
-                   for j in range(q_path.shape[1])]
+        # P5.8.32：插值方式。CubicSpline(bc_type="natural") 会穿过 24 个
+        # 稀疏路点（3 段 × 8 个）并在这之间产生过冲：实测参考 TCP 速度峰
+        # 371.8 mm/s（实际 TCP 才 265.5），关节 2 参考速度符号翻转 6 次、
+        # 关节 1 翻转 4 次，每 100 ms 速度中位数在 36→278→238→151→209→282
+        # →32→98 之间来回。这就是肉眼看到的「起步那段不丝滑」。
+        # PCHIP 保单调、不过冲，也是 move_path() 已经在用的做法。
+        if PICKUP_INTERP == "pchip":
+            from scipy.interpolate import PchipInterpolator
+            _interp = PchipInterpolator(grid, q_path, axis=0)
+            splines = [_interp] * q_path.shape[1]
+        else:
+            splines = [CubicSpline(grid, q_path[:, j], bc_type="natural")
+                       for j in range(q_path.shape[1])]
         boundaries = np.cumsum(stage_steps, dtype=float) / steps
         dt = float(model.opt.timestep)
+
+        # P5.8.32：分段 C1 时间律（替代单条全局 quintic）。
+        #
+        # 问题：全局 quintic 只有一个速度峰（t=0.5），而三段的步数预算是
+        # 700/800/800，s 的边界值是 0 / 0.1689 / 0.7682 / 1.0。也就是说
+        # 「接近」段只拿到 s 的前 16.89%，却要背着 170.6 mm 的路径在 1.4 s
+        # 内走完——它被迫先冲到 265 mm/s 再猛地刹住。实测该段每 100 ms 的
+        # 速度中位数是 37→118→250→49→46→237→156→71 mm/s，来回两个峰，
+        # jerk 峰 526789 mm/s^3。肉眼就是「起步那段不丝滑」。
+        #
+        # 做法：每段按自己的时长算一条「两端速度给定」的最小 jerk 曲线，
+        # 段边界共享同一个速度值（不停车、不突变），首尾速度仍为 0。
+        # 段边界速度取「等速分配」：v_b = 2 * (s_b - s_{b-1}) / (dt_b + dt_{b-1})，
+        # 即让相邻两段在该点的速度一致且等于两段的平均推进率，避免任何一段
+        # 为了追上共享速度而额外冲刺。
+        if PICKUP_TIME_LAW == "segment":
+            _sb = [0.0] + [float(smooth(b)) for b in boundaries]
+            _segs = len(stage_steps)
+            _vb = [0.0]
+            for _k in range(1, _segs):
+                _ds = _sb[_k] - _sb[_k - 1]
+                _d1 = stage_steps[_k - 1] / steps
+                _d2 = (stage_steps[_k] / steps
+                       if _k < _segs else _d1)
+                _vb.append(2.0 * _ds / (_d1 + _d2))
+            _vb.append(0.0)
+        else:
+            _sb = None
+
+        def _seg_s(u, s_span, v0, v1, dur):
+            """段内归一化进度 [0,1]，两端速度给定（单位：s 每秒）。
+
+            五次多项式 s(u) 满足 s(0)=0、s(1)=s_span、
+            s'(0)=v0*dur、s'(1)=v1*dur，且两端加速度为 0。
+            这组约束下五次多项式唯一确定，也是 jerk 平方积分最小的解。
+            """
+            u = float(u)
+            d0 = v0 * dur
+            d1 = v1 * dur
+            a1 = d0
+            a3 = 10.0 * s_span - 6.0 * d0 - 4.0 * d1
+            a4 = -15.0 * s_span + 8.0 * d0 + 7.0 * d1
+            a5 = 6.0 * s_span - 3.0 * d0 - 3.0 * d1
+            return a1 * u + a3 * u ** 3 + a4 * u ** 4 + a5 * u ** 5
+
+        def _progress(t):
+            """全局 t∈[0,1] → 路径参数 s∈[0,1]，分段 C1。"""
+            if _sb is None:
+                return float(smooth(t)), None
+            t = min(max(float(t), 0.0), 1.0)
+            k = 0
+            while k < len(stage_steps) - 1 and t > boundaries[k]:
+                k += 1
+            t0 = 0.0 if k == 0 else boundaries[k - 1]
+            t1 = boundaries[k]
+            dur = max(t1 - t0, 1e-12)
+            u = (t - t0) / dur
+            s_span = _sb[k + 1] - _sb[k]
+            return (_sb[k] + _seg_s(u, s_span, _vb[k], _vb[k + 1], dur), k)
+
         q_goal = q_path[-1].copy()
         previous_label = None
         for i in range(steps):
             t = (i + 1) / steps
-            s = smooth(t)
-            segment = min(2, int(np.searchsorted(boundaries, t, side="left")))
+            s, _seg = _progress(t)
+            if _seg is None:
+                segment = min(
+                    2, int(np.searchsorted(boundaries, t, side="left")))
+            else:
+                segment = min(2, _seg)
             label = stages[segment][0] + "#continuous"
             if label != previous_label:
                 state["label"] = label
                 previous_label = label
-            q = np.asarray([spline(s) for spline in splines], dtype=float)
-            s_next = smooth(min(1.0, (i + 2) / steps))
-            q_next = np.asarray(
-                [spline(s_next) for spline in splines], dtype=float)
+            if PICKUP_INTERP == "pchip":
+                q = np.asarray(splines[0](float(s)), dtype=float).reshape(-1)
+            else:
+                q = np.asarray([spline(s) for spline in splines],
+                               dtype=float)
+            s_next = _progress(min(1.0, (i + 2) / steps))[0]
+            if PICKUP_INTERP == "pchip":
+                q_next = np.asarray(
+                    splines[0](float(s_next)), dtype=float).reshape(-1)
+            else:
+                q_next = np.asarray(
+                    [spline(s_next) for spline in splines], dtype=float)
             qd_reference = (q_next - q) / dt
             if ARM_MOVE_LEAD or ARM_MOVE_DAMP:
                 for adr, value, velocity in zip(
@@ -4563,6 +4677,37 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             print("    path[%s] 弧长 %.0f mm / %d 点 / 规划 %.2f s / IK 最大残差 %.1f mm"
                   % (label, total * 1000, samples + 1, traj.duration,
                      worst * 1000))
+        # P5.8.32：末端闭环补齐。
+        # 这条轨迹是开环 + 前馈，匀速段的滞后 (kv/kp)*qdot 被前馈抵掉，
+        # 但末端减速到 0 之后伺服仍有静态下垂。实测「下到轴线」的目标是
+        # axis[2]=60.74 mm，播放完实际停在 54.58 mm——差 6.16 mm。
+        # 后面的进给是 move3 闭环，它会把 z 抬回 60.74，于是在送料途中
+        # z 从 53.5 一路抬到 65.8（峰峰 12.08 mm，中途还下探到 49.13），
+        # 肉眼就是「送料到三爪前面点头」。
+        # 这里在轨迹播完后原地补一段闭环，把稳态下垂吃掉，让进给从一个
+        # 已经到位的姿态起步。
+        if PATH_END_CLOSE > 0:
+            _end_tgt = np.asarray(targets[-1], dtype=float)
+            if state["axis_hold"]:
+                _qt, _pe, _ae = arm.ik_axis(
+                    _end_tgt, _AXIS_TGT, a_local, q_init=q_start, iters=300)
+            else:
+                _qt, _pe = arm.ik(_end_tgt, lock_wrist_roll=wrist)
+            _qt = np.asarray(_qt, float)
+            for _k in range(PATH_END_CLOSE):
+                for adr, value in zip(arm.qadr, _qt):
+                    data.ctrl[adr] = value
+                data.ctrl[arm.grip_act] = grip_cmd(grip)
+                data.ctrl[jaw_act] = jaw_ctrl
+                step_sim()
+                state.setdefault("traj", []).append(
+                    data.site_xpos[arm.site].copy())
+                state.setdefault("traj_t", []).append(float(data.time))
+                state.setdefault("traj_label", []).append(
+                    state.get("label", "?"))
+                if locked:
+                    lock()
+                track_pen(label)
         return float(np.linalg.norm(arm.pad_center() - np.asarray(targets[-1])))
 
     def support_rod():
@@ -4933,9 +5078,14 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     # measured from the two V-jaw mouth centres at the approach pose, with
     # the rod-axis component removed.  This keeps the change local to pickup
     # and avoids hard-coding a world Y/Z direction for a calibrated wrist.
+    # P5.8.32：接近段的步数预算。三段的时间密度严重不匹配（实测
+    # 0.244 / 0.103 / 0.027 mm/步，差 9 倍）：接近段要背 170.6 mm 却只有
+    # 700 步，被迫均速 122 mm/s、最小-jerk 峰值 228 mm/s；设计值 550 步
+    # （+150 修正）更紧。把它提到 1100 步（2.2 s）后均速降到 78 mm/s。
+    # 这是纯自由空间接近，不与料接触，慢一点没有接触代价。
     pick = [
         ("接近", [pick_at[0], pick_at[1], pick_at[2] + R + 0.075],
-         GRIP_OPEN, 550),
+         GRIP_OPEN, PICKUP_APPROACH_STEPS),
     ]
     if v_jaw:
         pick.append(("侧向进入", None, GRIP_OPEN, 400))
