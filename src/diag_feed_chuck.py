@@ -291,6 +291,7 @@ _REPRODUCIBLE_ENV_KEYS = {
     "FEED_STEPS", "FEED_ARM_KV", "FEED_CLAMP_SETTLE",
     "FEED_CLAMP_FLOAT", "FEED_ARM_GCOMP", "FEED_ARM_GCOMP_GAIN",
     "FEED_ARM_PAYLOAD", "FEED_ARM_KP", "FEED_GRIP_FORCE_NM",
+    "FEED_AXIS_LEAD_DEG", "FEED_AXIS_YAW_DEG",
     "FEED_GRIP_KP", "FEED_CLAMP_ANCHOR", "FEED_CLAMP_LIFT",
     "FEED_HANDOVER_FIRST", "FEED_SEAT_K", "FEED_SEAT_C",
     "FEED_SEAT_DWELL", "FEED_SEAT_RADIAL_K", "FEED_SEAT_RADIAL_C",
@@ -1105,8 +1106,24 @@ LEVEL_ROD = os.environ.get("FEED_LEVEL_ROD", "0") == "1"
 # 配对比较 1/2 度后，2 度的进给前有符号 pitch 更接近水平且五例均通过。
 # 这是当前仿真模型的目标前馈，不是通用机械臂标定，也不给棒料施加调平力。
 AXIS_LEAD_DEG = float(os.environ.get("FEED_AXIS_LEAD_DEG", "2.0"))
-_AXIS_TGT = np.array([np.cos(np.radians(AXIS_LEAD_DEG)), 0.0,
-                      np.sin(np.radians(AXIS_LEAD_DEG))])
+# P5.8.33：进给轴目标的 yaw 补偿（度）。
+#
+# 旧定义是 (cos(lead), 0, sin(lead))，**y 分量恒为 0**，也就是说目标轴线
+# 被硬编码成只落在 x-z 平面内，只有一个自由度。实测（lead 扫描 0/3/4.914/
+# 6/8 度，在 feed_complete 处取棒料轴线）：
+#   pitch = 0.9893 * lead - 2.8958      ← 线性、斜率≈1，可控
+#   yaw   = 恒 -0.7580（范围 -0.900…-0.645），对 lead 的敏感度仅 0.032°/°
+# 所以 yaw 那一路根本不响应 lead，轴误差因此有下界 |yaw| = 0.758°。
+# 实测 lead=3 时轴误差 0.804°，已经贴着这个下界——再怎么调 lead 也下不去。
+# 这不是几何问题，也不是调参问题，是目标轴线少了一个自由度。
+# 加上 yaw 分量后两个方向都受控。
+AXIS_YAW_DEG = float(os.environ.get("FEED_AXIS_YAW_DEG", "0"))
+_AXIS_TGT = np.array([
+    np.cos(np.radians(AXIS_LEAD_DEG)) * np.cos(np.radians(AXIS_YAW_DEG)),
+    np.cos(np.radians(AXIS_LEAD_DEG)) * np.sin(np.radians(AXIS_YAW_DEG)),
+    np.sin(np.radians(AXIS_LEAD_DEG)),
+])
+_AXIS_TGT /= max(float(np.linalg.norm(_AXIS_TGT)), 1e-12)
 # 落座：抓起后先抬离台面 SEAT_TAP，静置让料在 V 槽里坐到底。
 # 【已否掉，默认 0，留作对照】实测只吃掉 0.33 mm（相对爪 -0.22 -> -0.55），
 # 交接位移 1.56 -> 1.54。原因见下：料不是"滑落"，是夹爪被料重撑开，

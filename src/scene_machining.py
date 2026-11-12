@@ -128,7 +128,7 @@ CHUCK_FORCE_LIMIT = 150.0     # N，扭矩上限（三爪合计；每爪名义 5
 # 段数是精度与数值稳定性的折中：9 段时三爪法向力比 2.33（>2 判据挂），
 # 7 段 2.01，5 段 1.63，3 段 1.61。取 5 段：弦弧误差在 0.2 mm 以内，
 # 接触点少，力分配不被 0.13 mm 的三爪同步差放大。
-JAW_ARC_SEGS = 5
+JAW_ARC_SEGS = int(os.environ.get("SM_JAW_ARC_SEGS", "5"))
 # 包角原来取 52 deg（每爪 104 deg，三爪 312 deg，缝只有 3x16 deg）。
 # 变径扫描发现 Φ18 以下三爪内缘先互顶，力全花在爪与爪上；扫包角后确认
 # 互顶临界在 45/46 deg 之间（46 deg 时 Φ15 互顶 845 N）。
@@ -138,7 +138,7 @@ JAW_ARC_SEGS = 5
 # 三爪共 264 deg、缝 3x32 deg，反而更接近真机软爪（本来就不该包满）。
 # Φ20 主线接触点仍 30，爪力和同轴基本不变。
 JAW_ARC_HALF_DEG = 44.0       # 每爪包角 88 deg，三爪共 264 deg，留 3x32 deg 缝
-JAW_ARC_CLEAR = 0.0002        # 镗孔半径比料半径大 0.2 mm（真机软爪留的间隙）
+JAW_ARC_CLEAR = float(os.environ.get("SM_JAW_ARC_CLEAR", "0.0002"))
 JAW_ARC_THICK = 0.005         # 弧片径向厚度
 JAW_ARC_OVERLAP = 1.02        # 相邻弧片段的角向重叠系数（防漏缝）
 JAW_BACK_THICK = 0.008        # 背板厚度（只在视觉上补成实心块）
