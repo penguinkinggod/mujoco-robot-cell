@@ -489,13 +489,44 @@ def build_scene(shaft_mass=None, jaw_open=None):
     # 力 = kp x (ctrl - q)，过盈 7 mm 才 28 N，夹 Φ20 的 45 钢根本不够
     # （师傅夹 55x75、只咬 5 mm 都不掉，那是 kN 级）。力控还顺便解决了
     # 「过盈一调就炸」——位置伺服硬顶 27 个弧片会互相打架，力控不会。
+    # P5.8.36：驱动爪可配置。默认 0（保持旧行为）。
+    #
+    # 三爪相位固定 90/210/330 deg，重力沿 -z，所以 90°（爪0）在正上方
+    # 不承重、210°/330° 各承担约一半料重。实测力比 3.55（20.26/71.98/69.82 N），
+    # 而被驱动的爪0 反而走最深（-15.694 vs -15.597）。
+    # 换驱动爪是为了判定：力比失控是「软约束 + 伺服位置」的耦合问题，
+    # 还是接触几何本身的不对称。若换到承重爪力比明显下降，就是前者。
+    DRIVEN_JAW = int(os.environ.get("SM_DRIVEN_JAW", "0"))
+    # P5.8.36 方案 1：三爪各给一个伺服。
+    #
+    # 旧注释（下面 L512）记的「3 个伺服 + equality 会失败：q 冲到 202 mm、
+    # 轴被弹飞、12 组 kp/ctrl 全灭」是**方形爪 + 5 段时代**的结论。
+    # 当前是弧形软爪 20 段 + kp=20000/kv=600 + forcerange 限幅，
+    # 条件完全不同，必须重测，不能直接引用。
+    #
+    # 三档：
+    #   0 = 1 个伺服 + 2 条软约束（旧行为，逐位不变）
+    #   1 = 3 个伺服 + 2 条软约束
+    #   2 = 3 个伺服，不建约束
+    JAW_SERVO_MODE = int(os.environ.get("SM_JAW_SERVO_MODE", "0"))
     act = spec.add_actuator()
     act.name = "jaw_act"
-    act.target = "jaw_slide_0"
+    act.target = "jaw_slide_%d" % DRIVEN_JAW
     act.trntype = mujoco.mjtTrn.mjTRN_JOINT
     act.set_to_position(kp=20000.0, kv=600.0)
     act.ctrlrange[:] = CHUCK_CTRL_RANGE
     act.forcerange[:] = (-CHUCK_FORCE_LIMIT, CHUCK_FORCE_LIMIT)
+    if JAW_SERVO_MODE >= 1:
+        for k in range(3):
+            if k == DRIVEN_JAW:
+                continue
+            a2 = spec.add_actuator()
+            a2.name = "jaw_act_%d" % k
+            a2.target = "jaw_slide_%d" % k
+            a2.trntype = mujoco.mjtTrn.mjTRN_JOINT
+            a2.set_to_position(kp=20000.0, kv=600.0)
+            a2.ctrlrange[:] = CHUCK_CTRL_RANGE
+            a2.forcerange[:] = (-CHUCK_FORCE_LIMIT, CHUCK_FORCE_LIMIT)
 
     # 联动约束：q_jaw_slide_0 = q_jaw_slide_1 = q_jaw_slide_2。
     # MjsEquality.data 默认是 [0,1,0,0,0,...]，即 q1 = q2 的多项式恒等，
@@ -516,10 +547,6 @@ def build_scene(shaft_mass=None, jaw_open=None):
         eq.solimp[:] = [0.9, 0.99, 0.0001, 0.5, 100.0]
 
     # ---- 相机 ----
-    # 用 lookat 方式建相机最不容易错：
-    # MuJoCo 相机看向自身 -z，用 quat 手算很容易朝向反掉（第一版就是全黑）。
-    # 这里改用 MjvCamera 的等价参数：位置 + 目标点。
-    # MJCF 里没有 lookat 属性，所以先给位置，再在渲染时用 MjvCamera 覆盖。
     cam = wb.add_camera()
     cam.name = "overview"
     cam.pos = [0.05, -0.62, 0.62]
@@ -663,22 +690,51 @@ def add_lathe(spec, *, origin=None, table_z=0.0, jaw_open=None,
     # [0,1,0,0,0,...], i.e. polycoef 0+1x => q2 = q1. Verified in
     # diag_chuck_health.check_jaw_coupling (structure AND empty-load
     # following), so do not "helpfully" zero it.
+    DRIVEN_JAW = int(os.environ.get("SM_DRIVEN_JAW", "0"))
+    JAW_SERVO_MODE = int(os.environ.get("SM_JAW_SERVO_MODE", "0"))
     act = spec.add_actuator()
     act.name = "jaw_act"
-    act.target = "jaw_slide_0"
+    act.target = "jaw_slide_%d" % DRIVEN_JAW
     act.trntype = mujoco.mjtTrn.mjTRN_JOINT
     # 位置伺服 + 力限幅 = 丝杠：目标位置给行程，forcerange 给扭矩上限。
-    act.set_to_position(kp=20000.0, kv=600.0)
+    # P5.8.36 方案 2b：kp 可扫。推论是「伺服爪与跟随爪的稳态差」
+    # 决定了谁先接触、谁吃满力，所以 kp 越大稳态差越小、力比应越接近 1。
+    JAW_KP = float(os.environ.get("SM_JAW_KP", "20000.0"))
+    JAW_KV = float(os.environ.get("SM_JAW_KV", "600.0"))
+    act.set_to_position(kp=JAW_KP, kv=JAW_KV)
     act.ctrlrange[:] = CHUCK_CTRL_RANGE
     act.forcerange[:] = (-CHUCK_FORCE_LIMIT, CHUCK_FORCE_LIMIT)
+    if JAW_SERVO_MODE >= 1:
+        for k in range(3):
+            if k == DRIVEN_JAW:
+                continue
+            a2 = spec.add_actuator()
+            a2.name = "jaw_act_%d" % k
+            a2.target = "jaw_slide_%d" % k
+            a2.trntype = mujoco.mjtTrn.mjTRN_JOINT
+            a2.set_to_position(kp=20000.0, kv=600.0)
+            a2.ctrlrange[:] = CHUCK_CTRL_RANGE
+            a2.forcerange[:] = (-CHUCK_FORCE_LIMIT, CHUCK_FORCE_LIMIT)
 
-    for k in (1, 2):
+    # P5.8.36 方案 2：收紧联动约束的柔度。
+    #
+    # mjEQ_JOINT 的稳态柔度由 solref/solimp 决定。旧值 solref=[0.001,1.0]、
+    # solimp=[0.9,0.99,0.0001,0.5,100] 对应注释里的「稳态柔度 0.12 mm」。
+    # 实测三爪力比 3.55，滑座同步差 0.099 mm —— 与那个量级吻合。
+    # 这里把时间常数和阻尼比做成可扫，看力比能否压到 2.0 以内。
+    EQ_SOLREF_T = float(os.environ.get("SM_EQ_SOLREF_T", "0.001"))
+    EQ_SOLREF_D = float(os.environ.get("SM_EQ_SOLREF_D", "1.0"))
+    EQ_IMP_MIN = float(os.environ.get("SM_EQ_IMP_MIN", "0.0001"))
+    EQ_IMP_MAX = float(os.environ.get("SM_EQ_IMP_MAX", "100.0"))
+    for k in range(3):
+        if k == DRIVEN_JAW:
+            continue
         eq = spec.add_equality()
         eq.type = mujoco.mjtEq.mjEQ_JOINT
-        eq.name1 = "jaw_slide_0"
+        eq.name1 = "jaw_slide_%d" % DRIVEN_JAW
         eq.name2 = "jaw_slide_%d" % k
-        eq.solref[:] = [0.001, 1.0]
-        eq.solimp[:] = [0.9, 0.99, 0.0001, 0.5, 100.0]
+        eq.solref[:] = [EQ_SOLREF_T, EQ_SOLREF_D]
+        eq.solimp[:] = [0.9, 0.99, EQ_IMP_MIN, 0.5, EQ_IMP_MAX]
 
     return {"jaw_act": "jaw_act",
             "jaws": ["jaw_%d" % k for k in range(3)],

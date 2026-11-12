@@ -1,4 +1,4 @@
-"""diag_feed_chuck.py -- the ROBOT feeds a shaft into the three-jaw chuck.
+﻿"""diag_feed_chuck.py -- the ROBOT feeds a shaft into the three-jaw chuck.
 
 STATUS 2026-11-05: PASS. Wired into verify_all.py CHECKS.
 
@@ -2077,6 +2077,18 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         return mujoco.mj_name2id(model, kind, name)
 
     jaw_act = gid(mujoco.mjtObj.mjOBJ_ACTUATOR, "jaw_act")
+    # P5.8.36：三爪各伺服时不止一个执行器，统一从这里下发同一个丝杠目标。
+    jaw_all_acts = [jaw_act]
+    for _k in range(3):
+        _nm = "jaw_act_%d" % _k
+        _aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, _nm)
+        if _aid >= 0:
+            jaw_all_acts.append(_aid)
+
+    def set_jaw_ctrl(value):
+        """把丝杠目标位置写给全部卡爪执行器（默认只有 jaw_act 一个）。"""
+        for _a in jaw_all_acts:
+            data.ctrl[_a] = value
     shaft_body = gid(mujoco.mjtObj.mjOBJ_BODY, "shaft")
     shaft_joint = gid(mujoco.mjtObj.mjOBJ_JOINT, "shaft_free")
     sq = model.jnt_qposadr[shaft_joint]
@@ -3977,7 +3989,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                     data.ctrl[a] = v
             gcmd = grip if grip_end is None else grip + s * (grip_end - grip)
             data.ctrl[arm.grip_act] = grip_cmd(gcmd)
-            data.ctrl[jaw_act] = jaw_ctrl
+            set_jaw_ctrl(jaw_ctrl)
             step_sim()
             if clamp_trace_phase:
                 record_clamp_handover_frame(clamp_trace_phase)
@@ -4014,7 +4026,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             for a, v in zip(arm.qadr, q_goal):
                 data.ctrl[a] = v
             data.ctrl[arm.grip_act] = grip_cmd(final_grip)
-            data.ctrl[jaw_act] = jaw_ctrl
+            set_jaw_ctrl(jaw_ctrl)
             step_sim()
             if clamp_trace_phase:
                 record_clamp_handover_frame(clamp_trace_phase)
@@ -4091,7 +4103,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             0 if skip_redundant_grip_prep else GRIP_SETTLE)
         for _ in range(grip_prep_steps):
             data.ctrl[arm.grip_act] = grip_cmd(grip)
-            data.ctrl[jaw_act] = jaw_ctrl
+            set_jaw_ctrl(jaw_ctrl)
             step_sim()
             if clamp_trace_phase:
                 record_clamp_handover_frame(clamp_trace_phase)
@@ -4486,7 +4498,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 for adr, value in zip(arm.qadr, q):
                     data.ctrl[adr] = value
             data.ctrl[arm.grip_act] = grip_cmd(grip)
-            data.ctrl[jaw_act] = jaw_ctrl
+            set_jaw_ctrl(jaw_ctrl)
             step_sim()
             record_pickup_joint_frame("trajectory", q, qd_reference)
             state.setdefault("traj", []).append(
@@ -4502,7 +4514,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             for adr, value in zip(arm.qadr, q_goal):
                 data.ctrl[adr] = value
             data.ctrl[arm.grip_act] = grip_cmd(grip)
-            data.ctrl[jaw_act] = jaw_ctrl
+            set_jaw_ctrl(jaw_ctrl)
             step_sim()
             record_pickup_joint_frame(
                 "settle", q_goal, np.zeros_like(q_goal))
@@ -4685,7 +4697,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             for a, v, w in zip(arm.qadr, q, qd):
                 data.ctrl[a] = v + lead * w
             data.ctrl[arm.grip_act] = grip_cmd(grip)
-            data.ctrl[jaw_act] = jaw_ctrl
+            set_jaw_ctrl(jaw_ctrl)
             step_sim()
             state.setdefault("traj", []).append(
                 data.site_xpos[arm.site].copy())
@@ -4727,7 +4739,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 for adr, value in zip(arm.qadr, _qt):
                     data.ctrl[adr] = value
                 data.ctrl[arm.grip_act] = grip_cmd(grip)
-                data.ctrl[jaw_act] = jaw_ctrl
+                set_jaw_ctrl(jaw_ctrl)
                 step_sim()
                 state.setdefault("traj", []).append(
                     data.site_xpos[arm.site].copy())
@@ -4846,7 +4858,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     def settle(n, jaw_ctrl, grip, locked=False, floating=False,
                clamp_trace_phase=None):
         for i in range(n):
-            data.ctrl[jaw_act] = jaw_ctrl
+            set_jaw_ctrl(jaw_ctrl)
             data.ctrl[arm.grip_act] = grip_cmd(grip)
             if floating:
                 float_arm()
@@ -4891,7 +4903,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     data.qpos[arm.qadr[4]] = wrist
     data.ctrl[4] = wrist
     grip_direct(GRIP_OPEN)
-    data.ctrl[jaw_act] = SM.CHUCK_OPEN_CTRL
+    set_jaw_ctrl(SM.CHUCK_OPEN_CTRL)
     initial_stability_samples = []
     for settle_step in range(initial_settle_steps):
         for k in range(5):
@@ -5508,7 +5520,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         for i in range(400):
             t = (i + 1) / 400.0
             s = t * t * (3.0 - 2.0 * t)
-            data.ctrl[jaw_act] = (SM.CHUCK_OPEN_CTRL
+            set_jaw_ctrl((SM.CHUCK_OPEN_CTRL)
                                   + s * (SM.CHUCK_CLAMP_CTRL
                                          - SM.CHUCK_OPEN_CTRL))
             data.ctrl[arm.grip_act] = grip_cmd(GRIP_OPEN)
@@ -5567,7 +5579,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                             data.ctrl[a] = (q_now[k]
                                             + s * (q_goal[k] - q_now[k]))
                         data.ctrl[arm.grip_act] = grip_cmd(grip_close)
-                        data.ctrl[jaw_act] = SM.CHUCK_OPEN_CTRL
+                        set_jaw_ctrl(SM.CHUCK_OPEN_CTRL)
                         step_sim("axis_leveling")
                         state.setdefault("traj", []).append(
                             data.site_xpos[arm.site].copy())
@@ -5609,7 +5621,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                     else:
                         data.ctrl[arm.grip_act] = grip_cmd(grip_close)
                         phase = "卡盘前保持夹持"
-                    data.ctrl[jaw_act] = SM.CHUCK_OPEN_CTRL
+                    set_jaw_ctrl(SM.CHUCK_OPEN_CTRL)
                     step_sim(phase)
                     pre_chuck_grip_diagnostics["samples"] += 1
                     pre_chuck_grip_diagnostics[
@@ -5786,7 +5798,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             # 工件），只等关节速度降到阈值就立刻交接。
             _qvel, _used = 9.9, 0
             for _j in range(CONVERGE_STEPS):
-                data.ctrl[jaw_act] = SM.CHUCK_OPEN_CTRL
+                set_jaw_ctrl(SM.CHUCK_OPEN_CTRL)
                 data.ctrl[arm.grip_act] = grip_cmd(grip_close)
                 float_arm()
                 step_sim("servo_convergence")
@@ -5871,7 +5883,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             for i in range(360):
                 t = (i + 1) / 360.0
                 s = t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
-                data.ctrl[jaw_act] = SM.CHUCK_OPEN_CTRL
+                set_jaw_ctrl(SM.CHUCK_OPEN_CTRL)
                 grip_direct(grip_close + s * (GRIP_OPEN - grip_close))
                 seat_rod(seat_x0)
                 float_arm()
@@ -5890,7 +5902,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             # clamping before the part has slipped to full depth locks a
             # proud part into the jaws。
             for _ in range(SEAT_DWELL):
-                data.ctrl[jaw_act] = SM.CHUCK_OPEN_CTRL
+                set_jaw_ctrl(SM.CHUCK_OPEN_CTRL)
                 data.ctrl[arm.grip_act] = grip_cmd(GRIP_OPEN)
                 seat_rod(seat_x0)
                 float_arm()
@@ -5916,7 +5928,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             for i in range(PRECLAMP_STEPS):
                 t = (i + 1) / PRECLAMP_STEPS
                 s = t * t * (3.0 - 2.0 * t)
-                data.ctrl[jaw_act] = (jaw_from
+                set_jaw_ctrl((jaw_from)
                                       + s * (PRECLAMP_CTRL - jaw_from))
                 data.ctrl[arm.grip_act] = grip_cmd(clamp_grip)
                 pusher_rod(seat_x0)
@@ -5934,7 +5946,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             print("  预夹贴料    同轴=%5.2f mm 接触=%d"
                   % (coax(), jaw_state()[0]))
             for _ in range(PRECLAMP_DWELL):
-                data.ctrl[jaw_act] = PRECLAMP_CTRL
+                set_jaw_ctrl(PRECLAMP_CTRL)
                 data.ctrl[arm.grip_act] = grip_cmd(clamp_grip)
                 pusher_rod(seat_x0)
                 seat_rod(seat_x0)
@@ -5969,7 +5981,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         for i in range(500):
             t = (i + 1) / 500.0
             s = t * t * (3.0 - 2.0 * t)
-            data.ctrl[jaw_act] = (jaw_from
+            set_jaw_ctrl((jaw_from)
                                   + s * (SM.CHUCK_CLAMP_CTRL - jaw_from))
             release_phase = command_handover_gripper()
             seat_rod(seat_x0)
@@ -6009,7 +6021,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         # workpiece each step so a brief drop-and-rebound cannot be hidden by
         # the later gravity-slip measurement.
         for _ in range(300):
-            data.ctrl[jaw_act] = SM.CHUCK_CLAMP_CTRL
+            set_jaw_ctrl(SM.CHUCK_CLAMP_CTRL)
             release_phase = command_handover_gripper()
             seat_rod(seat_x0)
             float_arm()
@@ -6091,7 +6103,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                     _lift * mg2
                     + s * (SEAT_RADIAL_K * (axis[2] - float(p[2]))
                            - cr2 * float(data.qvel[sv + 2])))
-                data.ctrl[jaw_act] = SM.CHUCK_CLAMP_CTRL
+                set_jaw_ctrl(SM.CHUCK_CLAMP_CTRL)
                 data.ctrl[arm.grip_act] = grip_cmd(clamp_grip)
                 step_sim("卸载托力")
                 _z = float(shaft()[2])
@@ -6110,7 +6122,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
                 and release_control["trigger_time_s"] is not None):
             for i in range(360):
                 release_phase = command_handover_gripper()
-                data.ctrl[jaw_act] = SM.CHUCK_CLAMP_CTRL
+                set_jaw_ctrl(SM.CHUCK_CLAMP_CTRL)
                 phase = release_phase or "提前松爪后保持"
                 step_sim(phase)
                 mark_release_complete()
@@ -6132,7 +6144,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             for i in range(360):
                 t = (i + 1) / 360
                 s = t * t * t * (10.0 + t * (-15.0 + 6.0 * t))
-                data.ctrl[jaw_act] = SM.CHUCK_CLAMP_CTRL
+                set_jaw_ctrl(SM.CHUCK_CLAMP_CTRL)
                 grip_direct(clamp_grip + s * (GRIP_OPEN - clamp_grip))
                 step_sim("原地松爪")
                 _z = float(shaft()[2])
@@ -6290,7 +6302,7 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
     x0 = shaft()[0]
     state["diagnostic_scope"] = "pull_test"
     for i in range(700):
-        data.ctrl[jaw_act] = SM.CHUCK_CLAMP_CTRL
+        set_jaw_ctrl(SM.CHUCK_CLAMP_CTRL)
         data.xfrc_applied[shaft_body, 0] = -20.0
         step_sim("20N_axial_pull_test")
         if frame_hook is not None and i % (FRAME_EVERY * 2) == 0:
