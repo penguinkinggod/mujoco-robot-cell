@@ -278,6 +278,7 @@ _REPRODUCIBLE_ENV_KEYS = {
     "FEED_V_JAW_OFFSET_MM", "FEED_V_JAW_HALF_SPAN_MM", "FEED_CARRY_LIFT_MM",
     "FEED_CARRY_END_HOLD", "FEED_PATH_CORNER_DENSIFY", "FEED_PATH_CORNER_K",
     "FEED_PATH_CORNER_WINDOW", "FEED_PATH_QSMOOTH",
+    "FEED_PICKUP_QSMOOTH",
     "FEED_RETREAT_AXIAL", "FEED_LEVEL_ROD", "FEED_AXIS_LEAD_DEG",
     "FEED_RETREAT_ZOFF", "FEED_RETREAT_SINGLE", "FEED_RETREAT_SETTLE0",
     "FEED_SEAT_TAP_MM", "FEED_BUSHING", "FEED_BUSHING_GAP",
@@ -1806,6 +1807,13 @@ GRIP_RAMP = int(os.environ.get("GRIP_RAMP", 400))   # 夹爪闭合斜坡步数�
 FEED_ITERS = int(os.environ.get("FEED_ITERS", 3))   # 进给闭环修正轮数
 FEED_GAIN = float(os.environ.get("FEED_GAIN", 0.8))  # 闭环修正增益
 FEED_STEPS = int(os.environ.get("FEED_STEPS", 600))  # 进给每轮步数（1.2 s，慢到不激起工件摆动）
+# P5.8.31：连续进场段（move_pickup_continuous）的 Q 序列平滑遍数。默认 4。
+# 与 FEED_PATH_QSMOOTH 同因（逐点 IK 零空间跳分支）。实测下降段（890 帧
+# 500 Hz），参考 TCP x 的 2.5–3.5 Hz 能量占比：
+#   0 遍 40.2%（谱峰 2.25 Hz）→ 2 遍 23.5% → 4 遍 7.2% → 8 遍 0.7%
+# 选 4 不选 8：8 遍把参考 x 的峰峰从 0.128 撑到 0.856 mm（平滑把路点拉偏
+# 成了过冲），`coax` 从 0.219 恶化到 0.513。4 遍同时 `coax 0.219→0.166`。
+PICKUP_QSMOOTH = int(os.environ.get("FEED_PICKUP_QSMOOTH", "4"))
 MIN_FIX_STEPS = 150      # 闭环修正轮的最短时长（0.30 s）：再短伺服落不了地
 PICKUP_MAX_CORRECTIONS = 2
 PICKUP_REFINEMENT = os.environ.get(
@@ -4288,6 +4296,23 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
         keep = np.concatenate([[True], np.diff(grid) > 1e-10])
         grid = grid[keep]
         q_path = q_path[keep]
+        # P5.8.31：进场段的 Q 序列平滑。和 move_path() 的 PATH_QSMOOTH 同因
+        # ——逐点 IK 用同一初值并不能保证落在零空间同一分支，相邻路点的关节
+        # 会跳几毫弧度，CubicSpline 忠实穿过这些跳点，TCP 就带上 2.25 Hz 的
+        # 横向摆动。实测（下降段，890 帧 500 Hz）：
+        #   参考 TCP x 谱峰 2.25 Hz、2.5–3.5 Hz 占 40.2%，峰峰 0.128 mm
+        #   关节参考位置谱峰 0.56 Hz、3 Hz 占 0.1–3.5%（参考本身是干净的）
+        #   关节 0/2/4 跟踪误差谱峰 2.25 Hz、3 Hz 占 45–47%
+        # 所以 3 Hz 抖动是规划层带出来的，不是伺服极限环。进场段 x 只走
+        # 0.196 mm（全场 23.2 mm 的 0.8%），这个摆动就成了该轴的主信号。
+        if PICKUP_QSMOOTH > 0 and len(q_path) > 3:
+            _qs = q_path.copy()
+            for _p in range(PICKUP_QSMOOTH):
+                for _j in range(1, len(_qs) - 1):
+                    _qs[_j] = (0.5 * _qs[_j]
+                               + 0.25 * (_qs[_j - 1] + _qs[_j + 1]))
+            _qs[0], _qs[-1] = q_path[0], q_path[-1]
+            q_path = _qs
         splines = [CubicSpline(grid, q_path[:, j], bc_type="natural")
                    for j in range(q_path.shape[1])]
         boundaries = np.cumsum(stage_steps, dtype=float) / steps
