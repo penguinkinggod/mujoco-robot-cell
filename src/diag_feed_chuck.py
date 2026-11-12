@@ -1,4 +1,4 @@
-﻿"""diag_feed_chuck.py -- the ROBOT feeds a shaft into the three-jaw chuck.
+"""diag_feed_chuck.py -- the ROBOT feeds a shaft into the three-jaw chuck.
 
 STATUS 2026-11-05: PASS. Wired into verify_all.py CHECKS.
 
@@ -6028,6 +6028,51 @@ def main(frame_hook=None, model=None, data=None, carry_lock=True,
             clamp_phase = release_phase or "三爪稳定"
             step_sim(clamp_phase)
             observe_triple_jaw_contact()
+            # P5.8.37：按需导出三爪稳定帧的全部接触点几何。
+            # 一直只统计「接触点数 + 总力」，从没看过这些点落在孔里的什么位置。
+            # 若接触点上下不对称，料就会被顶歪 —— 这是「孔偏」的直接证据。
+            if os.environ.get("FEED_DUMP_CONTACTS") == "1":
+                _rows = []
+                _all = []
+                for _i in range(data.ncon):
+                    _c = data.contact[_i]
+                    _n1 = mujoco.mj_id2name(
+                        model, mujoco.mjtObj.mjOBJ_GEOM, _c.geom1) or "?"
+                    _n2 = mujoco.mj_id2name(
+                        model, mujoco.mjtObj.mjOBJ_GEOM, _c.geom2) or "?"
+                    _f6 = np.zeros(6)
+                    mujoco.mj_contactForce(model, data, _i, _f6)
+                    _rec = {
+                        "geom1": _n1, "geom2": _n2,
+                        "pos_m": [float(v) for v in _c.pos],
+                        "normal": [float(v) for v in _c.frame[:3]],
+                        "dist_m": float(_c.dist),
+                        "normal_force_N": float(abs(_f6[0])),
+                    }
+                    _all.append(_rec)
+                    if "jaw_geom" in (_n1 + _n2):
+                        _rows.append(_rec)
+                _dump_path = os.environ.get("FEED_DUMP_CONTACTS_PATH")
+                if _dump_path and clamp_phase == "三爪稳定":
+                    with open(_dump_path, "w", encoding="utf-8") as _fp:
+                        json.dump({
+                            "phase": clamp_phase,
+                            "sim_time_s": float(data.time),
+                            "shaft_center_m": [float(v) for v in shaft()],
+                            "shaft_axis": [float(v) for v in
+                                           data.xmat[shaft_body].reshape(
+                                               3, 3)[:, 2]],
+                            "jaw_qpos_m": [
+                                float(data.qpos[_a]) for _a in
+                                chuck_jaw_qpos_adr],
+                            "contacts": _rows,
+                            # P5.8.37：全接触对。z 向净力 -65 N 而料重只有
+                            # -1.935 N，差 34 倍 —— 必须查清还有什么在推料。
+                            "all_contacts": _all,
+                        }, _fp, ensure_ascii=False, indent=1)
+                    print("[P5.8.37] 接触点已导出 -> %s (爪 %d / 全 %d)" % (
+                        _dump_path, len(_rows), len(_all)))
+
             mark_release_complete()
             clamp_p = shaft()
             clamp_z_min = min(clamp_z_min, float(clamp_p[2]))
